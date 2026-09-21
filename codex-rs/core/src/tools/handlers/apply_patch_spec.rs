@@ -1,6 +1,9 @@
 use codex_tools::FreeformTool;
 use codex_tools::FreeformToolFormat;
+use codex_tools::JsonSchema;
+use codex_tools::ResponsesApiTool;
 use codex_tools::ToolSpec;
+use std::collections::BTreeMap;
 
 const APPLY_PATCH_LARK_GRAMMAR: &str = include_str!("../../../assets/tools/apply_patch.lark");
 
@@ -24,6 +27,37 @@ pub fn create_apply_patch_freeform_tool(include_environment_id: bool) -> ToolSpe
             syntax: "lark".to_string(),
             definition,
         },
+    })
+}
+
+/// Returns a JSON function form of `apply_patch` for local Responses API
+/// servers that support function tools but not custom/freeform tools.
+pub fn create_apply_patch_function_tool(include_environment_id: bool) -> ToolSpec {
+    let mut properties = BTreeMap::from([(
+        "patch".to_string(),
+        JsonSchema::string(Some(
+            "The complete patch text, beginning with *** Begin Patch and ending with *** End Patch."
+                .to_string(),
+        )),
+    )]);
+    let mut required = vec!["patch".to_string()];
+    if include_environment_id {
+        properties.insert(
+            "environment_id".to_string(),
+            JsonSchema::string(Some(
+                "Target environment identifier for this patch.".to_string(),
+            )),
+        );
+        required.push("environment_id".to_string());
+    }
+
+    ToolSpec::Function(ResponsesApiTool {
+        name: "apply_patch".to_string(),
+        description: "Apply a structured patch to files in the workspace.".to_string(),
+        strict: false,
+        defer_loading: None,
+        parameters: JsonSchema::object(properties, Some(required), Some(false.into())),
+        output_schema: None,
     })
 }
 

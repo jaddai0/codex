@@ -1,0 +1,44 @@
+#!/bin/zsh
+set -euo pipefail
+
+script_dir=${0:A:h}
+share_dir=${LOCAL_CODEX_SHARE_DIR:-${HOME}/.local/share/local-codex}
+runtime_home=${LOCAL_CODEX_HOME:-${HOME}/.local-codex}
+base_url=${OMLX_BASE_URL:-http://127.0.0.1:8000/v1}
+core_binary=${LOCAL_CODEX_BIN:-${share_dir}/local-codex-core}
+model_args=()
+
+if [[ -n ${LOCAL_CODEX_MODEL:-} ]]; then
+  model_args=(--model "$LOCAL_CODEX_MODEL")
+fi
+
+case "${1:-}" in
+  login|logout|cloud|cloud-tasks|update|app|remote-control)
+    print -u2 "local-codex: '${1}' is unavailable in the oMLX-only harness"
+    exit 2
+    ;;
+esac
+
+for argument in "$@"; do
+  case "$argument" in
+    --remote|--use-agent-identity-auth|model_provider=*|*model_provider=openai*)
+      print -u2 "local-codex: remote/OpenAI provider overrides are disabled"
+      exit 2
+      ;;
+  esac
+done
+
+if [[ ! -x "$core_binary" ]]; then
+  print -u2 "local-codex: core binary not found at $core_binary"
+  exit 127
+fi
+
+python3 "$share_dir/prepare_runtime.py" \
+  --home "$runtime_home" \
+  --base-url "$base_url" \
+  --persona-template "$share_dir/persona.toml" \
+  --instructions-template "$share_dir/base-instructions.md" \
+  "${model_args[@]}" >/dev/null
+
+export CODEX_HOME="$runtime_home"
+exec "$core_binary" "$@"

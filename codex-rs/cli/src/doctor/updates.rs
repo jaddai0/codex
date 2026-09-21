@@ -66,6 +66,11 @@ pub(super) async fn updates_check(config: &Config) -> DoctorCheck {
     let mut status = CheckStatus::Ok;
     let summary = "update configuration is locally consistent".to_string();
 
+    if !config.check_for_update_on_startup {
+        details.push("latest version probe: disabled by configuration".to_string());
+        return DoctorCheck::new("updates.status", "updates", status, summary).details(details);
+    }
+
     if doctor_managed_by_npm(current_exe.as_deref()) {
         details
             .push("npm update target: not inspected (PATH helpers are not executed)".to_string());
@@ -122,6 +127,9 @@ pub(super) async fn append_desktop_update(
     let Some(config) = config else {
         return;
     };
+    if !config.check_for_update_on_startup {
+        return;
+    }
     let Some(reachability_index) = checks
         .iter()
         .position(|check| check.id == "network.provider_reachability")

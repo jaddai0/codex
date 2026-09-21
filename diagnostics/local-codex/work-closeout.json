@@ -1,0 +1,90 @@
+{
+  "schema_version": "work-closeout/v1",
+  "task": "Create and install a local-only Codex CLI fork for dynamic oMLX models",
+  "constraint": {
+    "binding": "evidence",
+    "statement": "Prove native harness behavior and a zero-OpenAI runtime boundary on the installed candidate",
+    "evidence": ["diagnostics/local-codex/live-acceptance.json", "diagnostics/local-codex/upstream-test-baseline.json", "diagnostics/local-codex/constraint_record.json"]
+  },
+  "status": "complete",
+  "requirements": [
+    {
+      "id": "R1",
+      "requirement": "Fork current Codex source while preserving upstream history and provide a separate installed command.",
+      "command": "git merge-base --is-ancestor origin/main HEAD; local-codex --version; codex --version",
+      "artifact": "local-codex/README.md",
+      "status": "pass",
+      "evidence": ["The omlx-only branch descends from upstream d583e73c; stock codex remains 0.154.0 and local-codex is separately installed."],
+      "permitted_write_surface": "Fork worktree and ~/.local/bin plus ~/.local/share/local-codex",
+      "diagnostic_route": "Git identity and installed binary hashes"
+    },
+    {
+      "id": "R2",
+      "requirement": "Discover the active oMLX coding model without hardcoding a model slug.",
+      "command": "Query /admin/api/models; run prepare_runtime.py; rg for the live model slug in fork implementation.",
+      "artifact": "local-codex/prepare_runtime.py",
+      "status": "pass",
+      "evidence": ["The loaded default and 262144-token context were selected live; implementation contains no Qwen3.8 model slug."],
+      "permitted_write_surface": "Fork runtime generator and isolated generated catalog",
+      "diagnostic_route": "Live oMLX inventory and catalog inspection"
+    },
+    {
+      "id": "R3",
+      "requirement": "Remove OpenAI OAuth and incidental OpenAI network use from the installed runtime.",
+      "command": "Run blocked command matrix, non-loopback rejection, auth-state check, and process-scoped lsof during a live task.",
+      "artifact": "diagnostics/local-codex/live-acceptance.json",
+      "status": "pass",
+      "evidence": ["OAuth/cloud/update/app commands are blocked, auth.json is absent, model work used only 127.0.0.1:8000, and doctor made no external connection."],
+      "permitted_write_surface": "Fork launcher/config and isolated runtime state",
+      "diagnostic_route": "Negative command tests and live socket evidence"
+    },
+    {
+      "id": "R4",
+      "requirement": "Make shell, patch, MCP, image, and multi-agent tools operate through oMLX.",
+      "command": "Run live installed JSON canaries for each tool family using the loaded Qwen model.",
+      "artifact": "diagnostics/local-codex/live-acceptance.json",
+      "status": "pass",
+      "evidence": ["All five tool families completed; apply_patch now uses an oMLX-compatible function payload."],
+      "permitted_write_surface": "Fork tool adapter and disposable live fixtures",
+      "diagnostic_route": "Responses SSE tool loops and rollout evidence"
+    },
+    {
+      "id": "R5",
+      "requirement": "Prove manual context compaction and context clearing in the real TUI.",
+      "command": "Drive /compact and /clear through a PTY and inspect persisted rollouts.",
+      "artifact": "diagnostics/local-codex/live-acceptance.json",
+      "status": "pass",
+      "evidence": ["The compacted thread recalled its codeword; /clear created a new thread with no old codeword."],
+      "permitted_write_surface": "Isolated Local Codex session history",
+      "diagnostic_route": "Installed TUI and rollout inspection"
+    },
+    {
+      "id": "R6",
+      "requirement": "Keep the unnamed persona separate from IRIS and easy to rename.",
+      "command": "python3 -m unittest discover -s local-codex/tests -v; inspect persona.toml and generated AGENTS.md.",
+      "artifact": "local-codex/persona.toml",
+      "status": "pass",
+      "evidence": ["The neutral Local Codex placeholder lives in one editable TOML file and explicitly stays separate from IRIS."],
+      "permitted_write_surface": "Fork persona template and isolated runtime persona",
+      "diagnostic_route": "Unit and live identity checks"
+    },
+    {
+      "id": "R7",
+      "requirement": "Build, install, test, commit, push, and pass both closeout gates.",
+      "command": "Run scoped Rust/Python tests, release build/install, git checks, MLX closeout, work-closeout, commit, and push.",
+      "artifact": "diagnostics/local-codex/upstream-test-baseline.json",
+      "status": "pass",
+      "evidence": ["Owned tests and live acceptance pass; the sole broader failure reproduces on clean upstream."],
+      "permitted_write_surface": "Fork repository and user-owned GitHub fork",
+      "diagnostic_route": "Test logs, installed artifact hash, gate outputs, and Git remote state"
+    }
+  ],
+  "uncertainty": [
+    "A second coding model was not loaded; switch behavior is covered by discovery tests and absence of a compiled model slug.",
+    "OpenAI-hosted app and curated-plugin tools are intentionally unavailable because local-only takes precedence."
+  ],
+  "rejected_alternatives": [
+    "A stock config-only wrapper retained fallback model metadata and background OpenAI plugin sync.",
+    "Keeping freeform apply_patch failed because oMLX drops custom tool types."
+  ]
+}

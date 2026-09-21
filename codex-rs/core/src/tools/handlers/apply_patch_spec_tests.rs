@@ -35,3 +35,34 @@ fn create_apply_patch_freeform_tool_includes_environment_id_when_requested() {
             .contains("\"*** Environment ID: \" filename LF")
     );
 }
+
+#[test]
+fn create_apply_patch_function_tool_uses_json_patch_argument() {
+    let ToolSpec::Function(tool) = create_apply_patch_function_tool(false) else {
+        panic!("expected function tool");
+    };
+
+    assert_eq!(tool.name, "apply_patch");
+    assert_eq!(tool.parameters.required, Some(vec!["patch".to_string()]));
+    let properties = tool.parameters.properties.expect("function properties");
+    assert!(properties.contains_key("patch"));
+    assert!(!properties.contains_key("environment_id"));
+}
+
+#[test]
+fn create_apply_patch_function_tool_requires_environment_when_requested() {
+    let ToolSpec::Function(tool) = create_apply_patch_function_tool(true) else {
+        panic!("expected function tool");
+    };
+
+    assert_eq!(
+        tool.parameters.required,
+        Some(vec!["patch".to_string(), "environment_id".to_string()])
+    );
+    assert!(
+        tool.parameters
+            .properties
+            .expect("function properties")
+            .contains_key("environment_id")
+    );
+}

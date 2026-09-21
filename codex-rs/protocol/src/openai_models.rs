@@ -321,6 +321,9 @@ pub enum ConfigShellToolType {
 #[serde(rename_all = "snake_case")]
 pub enum ApplyPatchToolType {
     Freeform,
+    /// JSON function form for OpenAI-compatible local servers that do not
+    /// implement Responses API custom/freeform tools.
+    Function,
 }
 
 #[derive(

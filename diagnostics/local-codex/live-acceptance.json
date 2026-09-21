@@ -1,0 +1,31 @@
+{
+  "candidate": {
+    "binary": "/Users/dustinpainter/.local/share/local-codex/local-codex-core",
+    "launcher": "/Users/dustinpainter/.local/bin/local-codex",
+    "sha256": "12fb890165e7fb8b79357011603590b620cd4c91998e9e4bb7357501ac455edc"
+  },
+  "server": {
+    "base_url": "http://127.0.0.1:8000/v1",
+    "selection": "loaded oMLX default discovered at launcher startup",
+    "observed_context_window": 262144,
+    "hardcoded_model_search_hits": 0
+  },
+  "cases": [
+    {"id": "shell-and-patch", "status": "pass", "evidence": "Qwen read seed.txt, invoked function-shaped apply_patch, created proof.txt, read LOCAL_CODEX_PATCH_OK, and returned HARNESS_OK."},
+    {"id": "manual-compaction", "status": "pass", "artifact": "/Users/dustinpainter/.local-codex/sessions/2026/09/21/rollout-2026-09-21T12-58-48-01a0c4e7-eb6e-7f10-b379-0a925c77afaa.jsonl", "evidence": "The rollout contains a compacted event and Qwen recalled ORCHID-731 after compaction."},
+    {"id": "clear", "status": "pass", "artifact": "/Users/dustinpainter/.local-codex/sessions/2026/09/21/rollout-2026-09-21T12-59-20-01a0c4e8-6725-7ac0-b9d0-21110da42c73.jsonl", "evidence": "/clear created a second rollout containing CLEAR_OK and no ORCHID-731 history."},
+    {"id": "multi-agent", "status": "pass", "evidence": "Qwen invoked spawn_agent, waited for CHILD_OK, closed the child, and returned MULTI_AGENT_OK."},
+    {"id": "mcp", "status": "pass", "evidence": "A disposable stdio MCP server returned MCP_LOCAL_OK:HARNESS; Qwen returned MCP_OK and the server was removed afterward."},
+    {"id": "image-view", "status": "pass", "artifact": "/Users/dustinpainter/.local-codex/sessions/2026/09/21/rollout-2026-09-21T13-16-38-01a0c4f8-4007-7ee0-962d-45d68472b1f1.jsonl", "evidence": "Qwen invoked view_image on the bubble-wrap fixture and returned IMAGE_OK."},
+    {"id": "local-only-egress", "status": "pass", "evidence": "Process-scoped lsof sampling during inference and an eight-second shell task observed only connections to 127.0.0.1:8000. A separate installed doctor canary made no external connection after update and desktop-feed probes were made to respect the disabled update setting."},
+    {"id": "oauth-boundary", "status": "pass", "evidence": "login, logout, cloud, update, app, and remote-control exit 2; non-loopback OMLX_BASE_URL is rejected with one clear line; auth.json is absent."},
+    {"id": "persona-isolation", "status": "pass", "evidence": "Generated AGENTS.md identifies Local Codex as separate from IRIS; persona.toml is editable without rebuilding."}
+  ],
+  "disabled_remote_surfaces": [
+    "OpenAI OAuth commands",
+    "OpenAI apps",
+    "OpenAI curated and remote plugin catalogs",
+    "OpenAI analytics and OTEL metrics",
+    "OpenAI feedback and update checks"
+  ]
+}

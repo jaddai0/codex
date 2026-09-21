@@ -1208,9 +1208,14 @@ fn add_core_utility_tools(context: &CoreToolPlanContext<'_>, registry: &mut Tool
         ));
     }
 
-    if environment_mode.has_environment() && context.model_info.apply_patch_tool_type.is_some() {
+    if environment_mode.has_environment()
+        && let Some(apply_patch_tool_type) = context.model_info.apply_patch_tool_type.clone()
+    {
         let include_environment_id = matches!(environment_mode, ToolEnvironmentMode::Multiple);
-        registry.add(ApplyPatchHandler::new(include_environment_id));
+        registry.add(ApplyPatchHandler::new(
+            include_environment_id,
+            apply_patch_tool_type,
+        ));
     }
 
     if context

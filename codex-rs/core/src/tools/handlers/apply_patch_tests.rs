@@ -95,6 +95,60 @@ async fn pre_tool_use_payload_uses_freeform_patch_input() {
 }
 
 #[tokio::test]
+async fn pre_tool_use_payload_extracts_function_patch_input() {
+    let patch = sample_patch();
+    let payload = ToolPayload::Function {
+        arguments: serde_json::to_string(&json!({ "patch": patch }))
+            .expect("serialize function arguments"),
+    };
+    let invocation = invocation_for_payload(payload).await;
+    let handler = ApplyPatchHandler::new(false, ApplyPatchToolType::Function);
+
+    assert_eq!(
+        handler.pre_tool_use_payload(&invocation),
+        Some(PreToolUsePayload {
+            tool_name: HookToolName::apply_patch(),
+            tool_input: json!({ "command": patch }),
+        })
+    );
+}
+
+#[test]
+fn function_patch_injects_environment_header() {
+    let arguments = serde_json::to_string(&json!({
+        "patch": sample_patch(),
+        "environment_id": "local"
+    }))
+    .expect("serialize function arguments");
+
+    assert_eq!(
+        parse_function_patch(&arguments).expect("parse function patch"),
+        sample_patch().replacen(
+            "*** Begin Patch\n",
+            "*** Begin Patch\n*** Environment ID: local\n",
+            1
+        )
+    );
+}
+
+#[test]
+fn function_handler_accepts_only_function_payloads() {
+    let function_handler = ApplyPatchHandler::new(false, ApplyPatchToolType::Function);
+    let freeform_handler = ApplyPatchHandler::default();
+    let function_payload = ToolPayload::Function {
+        arguments: serde_json::json!({ "patch": sample_patch() }).to_string(),
+    };
+    let custom_payload = ToolPayload::Custom {
+        input: sample_patch().to_string(),
+    };
+
+    assert!(function_handler.matches_kind(&function_payload));
+    assert!(!function_handler.matches_kind(&custom_payload));
+    assert!(freeform_handler.matches_kind(&custom_payload));
+    assert!(!freeform_handler.matches_kind(&function_payload));
+}
+
+#[tokio::test]
 async fn post_tool_use_payload_uses_patch_input_and_tool_output() {
     let patch = sample_patch();
     let payload = ToolPayload::Custom {

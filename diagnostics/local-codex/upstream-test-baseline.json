@@ -1,0 +1,14 @@
+{
+  "owned_tests": {
+    "apply_patch_handler": "20 passed, 0 failed",
+    "protocol_openai_models": "36 passed, 0 failed",
+    "runtime_generator": "6 passed, 0 failed"
+  },
+  "broader_apply_patch_filter": {
+    "fork": "109 passed, 1 failed",
+    "upstream_clean_commit": "0 passed, 1 failed for the isolated failing case",
+    "upstream_commit": "d583e73c4d1204f1e9f654ef87065e9f0dd07ac7",
+    "known_failure": "suite::code_mode::code_mode_can_apply_patch_via_nested_tool expected two requests but observed one",
+    "classification": "pre-existing upstream failure reproduced in a detached clean worktree"
+  }
+}

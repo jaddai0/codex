@@ -1,0 +1,123 @@
+{
+  "schema_version": "mlx-toc-constraint/v1",
+  "workload": {
+    "model": "dynamically selected loaded oMLX coding model",
+    "phase": "Codex Responses API inference with local tools",
+    "hardware": "Apple silicon Mac",
+    "os": "macOS 27.2",
+    "runtime": "loopback oMLX server plus Local Codex fork",
+    "precision": "server-selected quantization",
+    "shape": "single-user coding turns with shell, patch, MCP, image, agent, and compaction events",
+    "batch": 1
+  },
+  "goal": {
+    "metric": "accepted_harness_tasks",
+    "unit": "tasks",
+    "direction": "higher",
+    "quality_floor": "loopback-only transport, no OpenAI authentication, correct context limits, and native tool behavior"
+  },
+  "baseline": {
+    "value": 1,
+    "sample_count": 4,
+    "evidence": [
+      "Stock Codex can reach the custom oMLX provider for plain text and shell calls, but apply_patch was emitted in a tool shape the live server discarded.",
+      "The unmodified runtime also attempted curated plugin network calls, so it did not meet the local-only boundary.",
+      "diagnostics/local-codex/upstream-test-baseline.json records the one inherited upstream test failure separately from fork behavior."
+    ]
+  },
+  "constraint": {
+    "kind": "operator_coverage",
+    "phase": "model-provider protocol and harness dispatch",
+    "roofline_regime": "not_applicable",
+    "evidence": [
+      "Live oMLX accepted flat function tools but silently omitted raw custom tools, including the upstream freeform patch tool.",
+      "Process socket inspection found automatic remote plugin discovery before those features were disabled.",
+      "The model context window and active-model identity had to come from the live oMLX administration API rather than a fixed model table."
+    ],
+    "shared_assumptions": [
+      "The oMLX server remains reachable through a loopback HTTP address.",
+      "A loaded coding-capable model advertises a nonzero context length through the oMLX administration API."
+    ]
+  },
+  "actions": {
+    "exploit": [
+      "Use oMLX's native Responses endpoint and Codex's local compaction path.",
+      "Discover the loaded coding model and context limit before every launch."
+    ],
+    "subordinate": [
+      "Disable update checks, doctor update probes, telemetry exporters, feedback, apps, curated plugins, remote plugins, and tool suggestions.",
+      "Keep the fork in an isolated home and preserve the stock Codex installation."
+    ],
+    "elevate": [
+      "Add a function-shaped apply_patch contract and dispatcher support while preserving upstream freeform behavior for other providers.",
+      "Generate a local-only provider, model catalog, and separate editable persona at launch."
+    ],
+    "elevate_decision": "required"
+  },
+  "candidate": {
+    "value": 9,
+    "sample_count": 9,
+    "parity": "PASS",
+    "evidence": [
+      "diagnostics/local-codex/live-acceptance.json records passing shell, patch, long-running shell, multi-agent, MCP, image, compaction, clear, and loopback-egress canaries.",
+      "Python generator tests and focused Rust patch-tool tests passed.",
+      "Process-level network observations during a live model turn and the installed doctor command showed no external connection."
+    ]
+  },
+  "decision": {
+    "verdict": "promote",
+    "basis": "capability",
+    "noise_assessment": "not_measured",
+    "accepted_tradeoffs": [
+      "OpenAI-hosted apps, curated plugins, web services, login, cloud tasks, and updates are intentionally unavailable.",
+      "The product name remains the neutral Local Codex placeholder until the user chooses a persona name."
+    ],
+    "rationale": "Promote because the local-only fork passed the required native harness behaviors with the live oMLX model while preserving the stock Codex installation."
+  },
+  "next_constraint": "Compatibility verification when switching to a materially different loaded model or oMLX protocol version.",
+  "completion": {
+    "status": "complete",
+    "requirements": [
+      {
+        "id": "LC1",
+        "requirement": "Use only the live loopback oMLX server with no OpenAI authentication or remote background services.",
+        "command": "Run a live Local Codex turn while observing process sockets and inspect the isolated auth/config files.",
+        "artifact": "diagnostics/local-codex/live-acceptance.json",
+        "status": "pass",
+        "evidence": [
+          "Only 127.0.0.1 oMLX traffic was observed during model work; doctor made no external connection; auth.json is absent; remote features and telemetry exporters are disabled."
+        ]
+      },
+      {
+        "id": "LC2",
+        "requirement": "Select loaded coding models dynamically and preserve their real context limits.",
+        "command": "Run prepare_runtime.py against the active oMLX administration API and inspect generated model/config files.",
+        "artifact": "local-codex/prepare_runtime.py",
+        "status": "pass",
+        "evidence": [
+          "The active Qwen model and 262144-token context were discovered live, and the implementation contains no model slug."
+        ]
+      },
+      {
+        "id": "LC3",
+        "requirement": "Operate native coding tools, compaction, and clearing through the model-facing harness.",
+        "command": "Run the recorded live shell, patch, long-shell, child-agent, MCP, image, compact, and clear canaries.",
+        "artifact": "diagnostics/local-codex/live-acceptance.json",
+        "status": "pass",
+        "evidence": [
+          "All nine acceptance surfaces passed against the loaded local model."
+        ]
+      },
+      {
+        "id": "LC4",
+        "requirement": "Keep the persona independent from IRIS and easy to rename.",
+        "command": "Generate runtime instructions from persona.toml, run the persona unit test, and inspect compacted context.",
+        "artifact": "local-codex/persona.toml",
+        "status": "pass",
+        "evidence": [
+          "The runtime persona explicitly excludes IRIS identity and changing the name requires editing one TOML field."
+        ]
+      }
+    ]
+  }
+}
