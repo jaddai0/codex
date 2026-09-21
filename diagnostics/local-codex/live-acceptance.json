@@ -19,7 +19,8 @@
     {"id": "image-view", "status": "pass", "artifact": "/Users/dustinpainter/.local-codex/sessions/2026/09/21/rollout-2026-09-21T13-16-38-01a0c4f8-4007-7ee0-962d-45d68472b1f1.jsonl", "evidence": "Qwen invoked view_image on the bubble-wrap fixture and returned IMAGE_OK."},
     {"id": "local-only-egress", "status": "pass", "evidence": "Process-scoped lsof sampling during inference and an eight-second shell task observed only connections to 127.0.0.1:8000. A separate installed doctor canary made no external connection after update and desktop-feed probes were made to respect the disabled update setting."},
     {"id": "oauth-boundary", "status": "pass", "evidence": "login, logout, cloud, update, app, and remote-control exit 2; non-loopback OMLX_BASE_URL is rejected with one clear line; auth.json is absent."},
-    {"id": "persona-isolation", "status": "pass", "evidence": "Generated AGENTS.md identifies Local Codex as separate from IRIS; persona.toml is editable without rebuilding."}
+    {"id": "persona-isolation", "status": "pass", "evidence": "Generated AGENTS.md identifies Mavis as the coding/developer persona and keeps her separate from Iris; persona.toml is editable without rebuilding."},
+    {"id": "mavis-command", "status": "pass", "evidence": "The installed mavis command launches the fork from an unrelated project directory; local-codex remains available as a compatibility command."}
   ],
   "disabled_remote_surfaces": [
     "OpenAI OAuth commands",

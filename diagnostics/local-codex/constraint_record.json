@@ -55,8 +55,8 @@
     "elevate_decision": "required"
   },
   "candidate": {
-    "value": 9,
-    "sample_count": 9,
+    "value": 10,
+    "sample_count": 10,
     "parity": "PASS",
     "evidence": [
       "diagnostics/local-codex/live-acceptance.json records passing shell, patch, long-running shell, multi-agent, MCP, image, compaction, clear, and loopback-egress canaries.",
@@ -70,7 +70,7 @@
     "noise_assessment": "not_measured",
     "accepted_tradeoffs": [
       "OpenAI-hosted apps, curated plugins, web services, login, cloud tasks, and updates are intentionally unavailable.",
-      "The product name remains the neutral Local Codex placeholder until the user chooses a persona name."
+      "The compatibility command and isolated state directory retain the local-codex name so existing sessions and scripts continue to work."
     ],
     "rationale": "Promote because the local-only fork passed the required native harness behaviors with the live oMLX model while preserving the stock Codex installation."
   },
@@ -115,7 +115,7 @@
         "artifact": "local-codex/persona.toml",
         "status": "pass",
         "evidence": [
-          "The runtime persona explicitly excludes IRIS identity and changing the name requires editing one TOML field."
+          "The runtime persona names Mavis as the coding/developer persona, explicitly excludes Iris identity, and changing the name requires editing one TOML field."
         ]
       }
     ]

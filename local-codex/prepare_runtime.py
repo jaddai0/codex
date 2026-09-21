@@ -191,13 +191,13 @@ def ensure_persona(home: Path, template: Path) -> None:
         atomic_write(persona_path, template.read_text(encoding="utf-8"))
     with persona_path.open("rb") as handle:
         persona = tomllib.load(handle)
-    name = str(persona.get("name") or "Local Codex").strip()
+    name = str(persona.get("name") or "Mavis").strip()
     instructions = str(persona.get("instructions") or "").strip()
     rendered = (
         "# Local coding persona\n\n"
         f"Your current working name is {name}.\n"
         "You are a private local coding agent. Your model runs through the local oMLX server. "
-        "You are separate from IRIS and must not claim to be IRIS.\n"
+        "You are separate from Iris and must not claim to be Iris.\n"
     )
     if instructions:
         rendered += f"\n{instructions}\n"
@@ -301,5 +301,5 @@ if __name__ == "__main__":
     try:
         raise SystemExit(main())
     except (OSError, RuntimeError, ValueError) as error:
-        print(f"local-codex: {error}", file=sys.stderr)
+        print(f"mavis: {error}", file=sys.stderr)
         raise SystemExit(2) from None

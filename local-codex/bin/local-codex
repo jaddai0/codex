@@ -14,7 +14,7 @@ fi
 
 case "${1:-}" in
   login|logout|cloud|cloud-tasks|update|app|remote-control)
-    print -u2 "local-codex: '${1}' is unavailable in the oMLX-only harness"
+    print -u2 "mavis: '${1}' is unavailable in the oMLX-only harness"
     exit 2
     ;;
 esac
@@ -22,14 +22,14 @@ esac
 for argument in "$@"; do
   case "$argument" in
     --remote|--use-agent-identity-auth|model_provider=*|*model_provider=openai*)
-      print -u2 "local-codex: remote/OpenAI provider overrides are disabled"
+      print -u2 "mavis: remote/OpenAI provider overrides are disabled"
       exit 2
       ;;
   esac
 done
 
 if [[ ! -x "$core_binary" ]]; then
-  print -u2 "local-codex: core binary not found at $core_binary"
+  print -u2 "mavis: core binary not found at $core_binary"
   exit 127
 fi
 

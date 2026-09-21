@@ -60,11 +60,11 @@
     },
     {
       "id": "R6",
-      "requirement": "Keep the unnamed persona separate from IRIS and easy to rename.",
+      "requirement": "Keep Mavis separate from Iris and easy to rename.",
       "command": "python3 -m unittest discover -s local-codex/tests -v; inspect persona.toml and generated AGENTS.md.",
       "artifact": "local-codex/persona.toml",
       "status": "pass",
-      "evidence": ["The neutral Local Codex placeholder lives in one editable TOML file and explicitly stays separate from IRIS."],
+      "evidence": ["Mavis is named in one editable TOML file as the coding/developer persona and explicitly stays separate from Iris."],
       "permitted_write_surface": "Fork persona template and isolated runtime persona",
       "diagnostic_route": "Unit and live identity checks"
     },

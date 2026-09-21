@@ -1,4 +1,4 @@
-# Local Codex
+# Mavis
 
 This fork keeps Codex's local coding harness and sends model traffic only to a loopback oMLX server. It uses a separate home at `~/.local-codex`, does not reuse OpenAI OAuth state, disables analytics, telemetry, feedback, and update checks, and blocks OpenAI login/cloud commands in the installed launcher.
 
@@ -12,9 +12,9 @@ because they violate the local-only boundary. External MCP servers still need
 their own setup; the launcher does not inherit servers or credentials from
 `~/.codex`.
 
-Run `./local-codex/install.sh`, then start it with `local-codex`.
+Run `./local-codex/install.sh`, then open any project directory in Terminal and start it with `mavis`. The older `local-codex` command remains as a compatibility alias.
 
-The persona is stored separately at `~/.local-codex/persona.toml`. Change only the `name` value when a name is chosen; the launcher regenerates `~/.local-codex/AGENTS.md` on the next start.
+Mavis's persona is stored separately at `~/.local-codex/persona.toml`. Change only the `name` value to rename the coding persona; the launcher regenerates `~/.local-codex/AGENTS.md` on the next start. Mavis remains explicitly separate from Iris.
 
 Environment variables:
 

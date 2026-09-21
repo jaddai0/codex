@@ -13,6 +13,14 @@ SPEC.loader.exec_module(prepare_runtime)
 
 
 class PrepareRuntimeTests(unittest.TestCase):
+    def test_shipped_persona_is_mavis(self):
+        persona = (MODULE_PATH.parent / "persona.toml").read_text(encoding="utf-8")
+        self.assertIn('name = "Mavis"', persona)
+
+    def test_installer_exposes_mavis_command(self):
+        installer = (MODULE_PATH.parent / "install.sh").read_text(encoding="utf-8")
+        self.assertIn('"$install_bin/mavis"', installer)
+
     def test_rejects_non_loopback_server(self):
         with self.assertRaisesRegex(ValueError, "localhost"):
             prepare_runtime.local_base_url("https://api.openai.com/v1")
@@ -61,7 +69,7 @@ class PrepareRuntimeTests(unittest.TestCase):
             prepare_runtime.ensure_persona(home, template)
             rendered = (home / "AGENTS.md").read_text(encoding="utf-8")
             self.assertIn("working name is Nova", rendered)
-            self.assertIn("separate from IRIS", rendered)
+            self.assertIn("separate from Iris", rendered)
             self.assertIn("Stay concise.", rendered)
 
     def test_catalog_serializes_as_json(self):
