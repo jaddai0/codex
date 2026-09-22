@@ -4,14 +4,16 @@ from __future__ import annotations
 
 from copy import deepcopy
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable
 
+from .experiments import ExperimentStore
 from .storage import read_json, require_safe_id, sha256_file, write_json
 
 
 class ProfileStore:
-    def __init__(self, home: Path):
+    def __init__(self, home: Path, gateway_status_reader: Callable[[str], dict[str, Any]] | None = None):
         self.root = Path(home) / "profiles"
+        self.experiments = ExperimentStore(Path(home), gateway_status_reader=gateway_status_reader)
 
     def _role_root(self, role: str) -> Path:
         return self.root / require_safe_id(role, "profile role")
@@ -58,13 +60,23 @@ class ProfileStore:
         if home / "verifications" not in verifier_path.parents:
             raise ValueError("verifier receipt must be retained under the Mavis verification store")
         experiment = read_json(experiment_path)
-        verification = read_json(verifier_path)
-        if experiment.get("schema_version") != "mavis.experiment/v1" or experiment.get("promotion_decision") != "promote":
-            raise ValueError("profile activation requires a promoted experiment")
-        if verification.get("schema_version") != "mavis.verifier/v1" or verification.get("verdict") != "accepted":
-            raise ValueError("profile activation requires an accepted verifier receipt")
+        if experiment.get("schema_version") != "mavis.experiment-lifecycle/v1":
+            raise ValueError("profile activation requires a promoted lifecycle record")
+        experiment_id = require_safe_id(str(experiment.get("experiment_id") or ""), "experiment id")
+        if experiment_path != self.experiments._record_path(experiment_id).resolve():
+            raise ValueError("profile activation requires the canonical lifecycle record")
+        experiment = self.experiments.assert_promoted(experiment_id)
+        if experiment["scope"] != role:
+            raise ValueError("promoted experiment belongs to another profile role")
+        if verifier_path != Path(experiment["review"]["path"]).resolve() or sha256_file(verifier_path) != experiment["review"]["sha256"]:
+            raise ValueError("profile verifier receipt does not match promoted experiment")
         if str(experiment.get("experiment_id")) not in profile.get("experiments", []):
             raise ValueError("promoted experiment is not bound to this profile")
+        candidate = self.experiments._read_snapshot(experiment["candidate"])
+        profile_config = {"prompts": profile.get("prompts"), "tool_settings": profile.get("tool_settings"),
+                          "retrieval": (profile.get("context_policy") or {}).get("retrieval", {})}
+        if candidate != profile_config:
+            raise ValueError("profile configuration differs from promoted candidate")
         previous = self.active_version(role)
         if previous is not None:
             previous_path = role_root / f"v{previous}.json"

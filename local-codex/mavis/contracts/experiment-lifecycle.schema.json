@@ -1,0 +1,31 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://local.invalid/mavis/experiment-lifecycle/v1",
+  "title": "Mavis experiment lifecycle record",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["schema_version", "experiment_id", "scope", "kind", "hypothesis", "baseline", "candidate", "workload", "evaluation_split", "workload_digest", "evaluation_split_digest", "state", "comparison", "review", "created_at", "updated_at", "history"],
+  "properties": {
+    "schema_version": {"const": "mavis.experiment-lifecycle/v1"},
+    "experiment_id": {"type": "string", "minLength": 1},
+    "scope": {"type": "string", "minLength": 1},
+    "kind": {"enum": ["prompts", "tool_settings", "retrieval"]},
+    "hypothesis": {"type": "string", "minLength": 1},
+    "baseline": {"$ref": "#/$defs/snapshot"},
+    "candidate": {"$ref": "#/$defs/snapshot"},
+    "workload": {"type": "object"},
+    "evaluation_split": {"type": "object", "required": ["held_out", "minimum_gain"]},
+    "workload_digest": {"$ref": "#/$defs/hash"},
+    "evaluation_split_digest": {"$ref": "#/$defs/hash"},
+    "state": {"enum": ["candidate", "compared", "reviewed", "staged", "promoted", "rejected", "rolled-back"]},
+    "comparison": {"type": ["object", "null"]},
+    "review": {"type": ["object", "null"]},
+    "created_at": {"type": "string"},
+    "updated_at": {"type": "string"},
+    "history": {"type": "array", "items": {"type": "object"}}
+  },
+  "$defs": {
+    "hash": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
+    "snapshot": {"type": "object", "additionalProperties": false, "required": ["path", "sha256", "digest"], "properties": {"path": {"type": "string"}, "sha256": {"$ref": "#/$defs/hash"}, "digest": {"$ref": "#/$defs/hash"}}}
+  }
+}
