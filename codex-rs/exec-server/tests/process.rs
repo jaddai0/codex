@@ -88,6 +88,7 @@ async fn exec_server_starts_process_over_websocket() -> anyhow::Result<()> {
         ExecResponse {
             process_id: ProcessId::from("proc-1"),
             sandbox_type: Some(ProcessSandboxType::None),
+            mavis_raw_output_active: false,
         }
     );
 
@@ -241,6 +242,7 @@ async fn exec_server_runs_ordinary_requests_serially_by_default() -> anyhow::Res
         ExecResponse {
             process_id: ProcessId::from("proc-serial-queued"),
             sandbox_type: Some(ProcessSandboxType::None),
+            mavis_raw_output_active: false,
         }
     );
 
@@ -357,6 +359,7 @@ async fn exec_server_keeps_control_requests_live_during_long_reads_and_queued_re
         ExecResponse {
             process_id: ProcessId::from("proc-concurrent"),
             sandbox_type: Some(ProcessSandboxType::None),
+            mavis_raw_output_active: false,
         }
     );
     for _ in 1..32 {
@@ -514,6 +517,7 @@ async fn exec_server_defaults_omitted_pipe_stdin_to_closed_stdin() -> anyhow::Re
         ExecResponse {
             process_id: ProcessId::from("proc-default-stdin"),
             sandbox_type: Some(ProcessSandboxType::None),
+            mavis_raw_output_active: false,
         }
     );
 

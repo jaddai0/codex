@@ -476,6 +476,8 @@ impl UnifiedExecProcess {
     pub(super) async fn from_exec_server_started(
         started: StartedExecProcess,
     ) -> Result<Self, UnifiedExecError> {
+        let mavis_required = std::env::var("MAVIS_RAW_OUTPUT_REQUIRED").as_deref() == Ok("1");
+        ensure_mavis_exec_server_output_spool(&started, mavis_required).await?;
         let process_handle = ProcessHandle::ExecServer(Arc::clone(&started.process));
         // Older peers do not report this field. In that case, skip local
         // classification rather than attributing a violation to a guessed backend.
@@ -782,6 +784,19 @@ impl UnifiedExecProcess {
         let _ = self.state_tx.send_replace(state.exited(exit_code));
         self.output.cancellation_token.cancel();
     }
+}
+
+pub(super) async fn ensure_mavis_exec_server_output_spool(
+    started: &StartedExecProcess,
+    required: bool,
+) -> Result<(), UnifiedExecError> {
+    if required && !started.mavis_raw_output_active {
+        let _ = started.process.terminate().await;
+        return Err(UnifiedExecError::process_failed(
+            "exec-server did not confirm Mavis raw output spool".to_string(),
+        ));
+    }
+    Ok(())
 }
 
 impl Drop for UnifiedExecProcess {

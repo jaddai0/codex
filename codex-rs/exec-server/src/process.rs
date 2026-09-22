@@ -22,6 +22,7 @@ pub struct StartedExecProcess {
     pub process: Arc<dyn ExecProcess>,
     /// `None` means the exec-server peer did not report its sandbox type.
     pub sandbox_type: Option<SandboxType>,
+    pub mavis_raw_output_active: bool,
 }
 
 pub(crate) fn sandbox_type_from_protocol(

@@ -278,7 +278,7 @@ impl From<DetectedShell> for ShellInfo {
     }
 }
 
-/// Optional tool attribution for executor telemetry, not authorization.
+/// Optional tool attribution and executor behavior requested by the controller.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ExecMetadata {
@@ -286,6 +286,13 @@ pub struct ExecMetadata {
     pub thread_id: Option<ThreadId>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub tool_call_id: Option<String>,
+    /// Require the executor to durably spool output before its replay limit.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub mavis_raw_output_required: bool,
+}
+
+fn is_false(value: &bool) -> bool {
+    !*value
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -422,6 +429,9 @@ pub struct ExecResponse {
     /// report [`ProcessSandboxType::None`] when the process was not sandboxed.
     #[serde(default)]
     pub sandbox_type: Option<ProcessSandboxType>,
+    /// True only after executor-side raw output storage opened successfully.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub mavis_raw_output_active: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -1164,6 +1174,15 @@ mod tests {
     use super::ExecMetadata;
     use super::ExecParams;
     use super::ExecResponse;
+
+    #[test]
+    fn older_exec_response_does_not_claim_mavis_spooling() {
+        let response: ExecResponse = serde_json::from_value(serde_json::json!({
+            "processId": "older-executor"
+        }))
+        .unwrap();
+        assert!(!response.mavis_raw_output_active);
+    }
     use super::FsOpenParams;
     use super::FsReadFileParams;
     use super::HttpRequestParams;
@@ -1202,6 +1221,7 @@ mod tests {
             metadata: Some(ExecMetadata {
                 thread_id: Some(codex_protocol::ThreadId::new()),
                 tool_call_id: Some("call-1".to_string()),
+                mavis_raw_output_required: false,
             }),
             argv: vec!["true".to_string()],
             cwd,

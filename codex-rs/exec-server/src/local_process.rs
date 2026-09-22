@@ -43,6 +43,7 @@ use crate::ExecServerError;
 use crate::ExecServerRuntimePaths;
 use crate::ProcessId;
 use crate::StartedExecProcess;
+use crate::mavis_output_spool::MavisOutputSpool;
 use crate::network_policy_decisions::network_policy_decider;
 use crate::process::ExecProcessEventLog;
 use crate::process::sandbox_type_from_protocol;
@@ -108,6 +109,8 @@ struct RunningProcess {
     pipe_stdin: bool,
     accepted_stdin_write_ids: Arc<Mutex<AcceptedStdinWriteIds>>,
     output: VecDeque<RetainedOutputChunk>,
+    mavis_output_spool: Option<MavisOutputSpool>,
+    output_failure: Option<String>,
     retained_bytes: usize,
     next_seq: u64,
     exit_code: Option<i32>,
@@ -413,6 +416,27 @@ impl LocalProcess {
             );
         }
 
+        let mavis_output_spool = match MavisOutputSpool::maybe_open(
+            metadata.is_some_and(|metadata| metadata.mavis_raw_output_required),
+            process_id.as_str(),
+        ) {
+            Ok(spool) => spool,
+            Err(err) => {
+                let mut process_map = self.inner.processes.lock().await;
+                if matches!(
+                    process_map.get(&process_id),
+                    Some(ProcessEntry::Starting(current)) if Arc::ptr_eq(current, &start)
+                ) {
+                    process_map.remove(&process_id);
+                }
+                return Err(internal_error(format!("Mavis raw output spool: {err}")));
+            }
+        };
+        if let Some(spool) = &mavis_output_spool {
+            tracing::info!(process_id = %process_id, path = %spool.path().display(), "Mavis exec-server raw output spool opened");
+        }
+        let mavis_raw_output_active = mavis_output_spool.is_some();
+
         let spawned_result = codex_sandboxing::spawn_process(codex_sandboxing::SpawnRequest {
             command: &prepared.command,
             cwd: prepared.cwd.as_path(),
@@ -470,6 +494,8 @@ impl LocalProcess {
                         Mutex::new(AcceptedStdinWriteIds::default()),
                     ),
                     output: VecDeque::new(),
+                    mavis_output_spool,
+                    output_failure: None,
                     retained_bytes: 0,
                     next_seq: 1,
                     exit_code: None,
@@ -526,6 +552,7 @@ impl LocalProcess {
             ExecResponse {
                 process_id,
                 sandbox_type,
+                mavis_raw_output_active,
             },
             wake_tx,
             events,
@@ -593,7 +620,7 @@ impl LocalProcess {
                         exited: process.exit_code.is_some(),
                         exit_code: process.exit_code,
                         closed: process.closed,
-                        failure: None,
+                        failure: process.output_failure.clone(),
                         sandbox_denied: process.sandbox_denied,
                     },
                     Arc::clone(&process.output_notify),
@@ -788,6 +815,7 @@ impl LocalProcess {
                 events,
             }),
             sandbox_type,
+            mavis_raw_output_active: response.mavis_raw_output_active,
         })
     }
 }
@@ -981,6 +1009,16 @@ async fn stream_output(
             let ProcessEntry::Running(process) = entry else {
                 break;
             };
+            if let Some(spool) = &mut process.mavis_output_spool
+                && let Err(err) = spool.append(&chunk)
+            {
+                let message = format!("Mavis raw output spool failed: {err}");
+                process.output_failure = Some(message.clone());
+                process.events.publish(ExecProcessEvent::Failed(message));
+                process.session.terminate();
+                output_notify.notify_waiters();
+                break;
+            }
             let seq = process.next_seq;
             process.next_seq += 1;
             process.retained_bytes += chunk.len();
@@ -1697,6 +1735,139 @@ mod tests {
     }
 
     #[tokio::test]
+    #[serial_test::serial]
+    async fn mavis_exec_start_confirms_private_source_spool() {
+        let temp = tempfile::tempdir().unwrap();
+        let previous_home = std::env::var_os("MAVIS_HOME");
+        // This test alone requests Mavis storage; restore the environment below.
+        unsafe { std::env::set_var("MAVIS_HOME", temp.path()) };
+        let backend = LocalProcess::default();
+        let mut params = test_exec_params(HashMap::new());
+        params.process_id = ProcessId::from("mavis-start-check");
+        params.metadata = Some(codex_exec_server_protocol::ExecMetadata {
+            mavis_raw_output_required: true,
+            ..Default::default()
+        });
+        let result = backend
+            .start_process(params, ProcessTelemetry::default())
+            .await;
+        match previous_home {
+            Some(home) => unsafe { std::env::set_var("MAVIS_HOME", home) },
+            None => unsafe { std::env::remove_var("MAVIS_HOME") },
+        }
+        let (response, _, _) = result.unwrap();
+        assert!(response.mavis_raw_output_active);
+        let dir = temp.path().join("tool-output").join("exec-server");
+        let manifests = std::fs::read_dir(dir)
+            .unwrap()
+            .filter_map(Result::ok)
+            .filter(|entry| entry.path().extension().is_some_and(|ext| ext == "json"))
+            .collect::<Vec<_>>();
+        assert_eq!(manifests.len(), 1);
+        let manifest: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(manifests[0].path()).unwrap()).unwrap();
+        assert_eq!(manifest["process_id"], "mavis-start-check");
+        backend.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn mavis_spool_preserves_failure_evicted_from_exec_server_replay() {
+        let backend = LocalProcess::default();
+        let mut process = spawn_test_process(&backend, "mavis-burst").await;
+        let temp = tempfile::tempdir().unwrap();
+        {
+            let mut processes = backend.inner.processes.lock().await;
+            let Some(ProcessEntry::Running(running)) = processes.get_mut(&process.process_id)
+            else {
+                panic!("process should be running");
+            };
+            running.mavis_output_spool = Some(
+                MavisOutputSpool::open_in(
+                    temp.path().join("tool-output"),
+                    process.process_id.as_str(),
+                )
+                .unwrap(),
+            );
+        }
+        process.stdout_tx.send(vec![b'a'; 700_000]).await.unwrap();
+        process
+            .stdout_tx
+            .send(b"\nFAILURE: buried exec-server diagnostic\n".to_vec())
+            .await
+            .unwrap();
+        process.stdout_tx.send(vec![b'z'; 1_200_000]).await.unwrap();
+        timeout(Duration::from_secs(5), async {
+            loop {
+                let processes = backend.inner.processes.lock().await;
+                let Some(ProcessEntry::Running(running)) = processes.get(&process.process_id)
+                else {
+                    panic!("process should be running");
+                };
+                if running.next_seq == 4 {
+                    break;
+                }
+                drop(processes);
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("all output should be consumed");
+
+        let path = {
+            let processes = backend.inner.processes.lock().await;
+            let Some(ProcessEntry::Running(running)) = processes.get(&process.process_id) else {
+                panic!("process should be running");
+            };
+            running.mavis_output_spool.as_ref().unwrap().path().clone()
+        };
+        let manifest: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(path.with_extension("json")).unwrap()).unwrap();
+        assert_eq!(manifest["process_id"], "mavis-burst");
+        assert_eq!(manifest["raw_output_path"], path.to_string_lossy().as_ref());
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            assert_eq!(
+                std::fs::metadata(&path).unwrap().permissions().mode() & 0o777,
+                0o600
+            );
+            assert_eq!(
+                std::fs::metadata(path.parent().unwrap())
+                    .unwrap()
+                    .permissions()
+                    .mode()
+                    & 0o777,
+                0o700
+            );
+        }
+        let raw = std::fs::read(path).unwrap();
+        let needle = b"FAILURE: buried exec-server diagnostic";
+        assert!(raw.windows(needle.len()).any(|window| window == needle));
+        let replay = backend
+            .exec_read(ReadParams {
+                process_id: process.process_id.clone(),
+                after_seq: None,
+                max_bytes: None,
+                wait_ms: Some(0),
+            })
+            .await
+            .unwrap();
+        let retained = replay
+            .chunks
+            .into_iter()
+            .flat_map(|chunk| chunk.chunk.into_inner())
+            .collect::<Vec<_>>();
+        assert!(
+            !retained
+                .windows(needle.len())
+                .any(|window| window == needle)
+        );
+        process.exit(0);
+        drop(process);
+        backend.shutdown().await;
+    }
+
+    #[tokio::test]
     async fn process_read_replay_is_bounded_by_chunk_count() {
         let backend = LocalProcess::default();
         let process = spawn_test_process(&backend, "proc-chunk-count").await;
@@ -1990,6 +2161,8 @@ mod tests {
                 pipe_stdin: false,
                 accepted_stdin_write_ids: Arc::new(Mutex::new(AcceptedStdinWriteIds::default())),
                 output: VecDeque::new(),
+                mavis_output_spool: None,
+                output_failure: None,
                 retained_bytes: 0,
                 next_seq: 1,
                 exit_code: None,

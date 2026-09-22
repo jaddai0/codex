@@ -1,4 +1,5 @@
 use super::process::UnifiedExecProcess;
+use super::process::ensure_mavis_exec_server_output_spool;
 use crate::unified_exec::UnifiedExecError;
 use codex_exec_server::ExecProcess;
 use codex_exec_server::ExecProcessEventReceiver;
@@ -102,11 +103,42 @@ pub(super) async fn remote_process(
             wake_tx,
         }),
         sandbox_type: Some(sandbox_type),
+        mavis_raw_output_active: false,
     };
 
     UnifiedExecProcess::from_exec_server_started(started)
         .await
         .expect("remote process should start")
+}
+
+#[tokio::test]
+async fn mavis_remote_path_requires_executor_spool_acknowledgement() {
+    let (wake_tx, _wake_rx) = watch::channel(0);
+    let process = Arc::new(MockExecProcess {
+        process_id: "mavis-remote-check".to_string().into(),
+        write_response: WriteResponse {
+            status: WriteStatus::Accepted,
+        },
+        read_responses: Mutex::new(VecDeque::new()),
+        terminate_error: None,
+        wake_tx,
+    });
+    let mut started = StartedExecProcess {
+        process,
+        sandbox_type: Some(codex_sandboxing::SandboxType::None),
+        mavis_raw_output_active: false,
+    };
+    let error = ensure_mavis_exec_server_output_spool(&started, true)
+        .await
+        .expect_err("Mavis must reject an older or unspooled executor");
+    assert!(matches!(error, UnifiedExecError::ProcessFailed { .. }));
+    ensure_mavis_exec_server_output_spool(&started, false)
+        .await
+        .expect("ordinary Codex does not require a Mavis spool");
+    started.mavis_raw_output_active = true;
+    ensure_mavis_exec_server_output_spool(&started, true)
+        .await
+        .expect("Mavis accepts a confirmed executor spool");
 }
 
 #[tokio::test]

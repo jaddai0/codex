@@ -41,10 +41,12 @@ impl RemoteProcess {
         let client = self.client.get().await?;
         let session = client.start_process(params, network_policy_decider).await?;
         let sandbox_type = sandbox_type_from_protocol(session.sandbox_type());
+        let mavis_raw_output_active = session.mavis_raw_output_active();
 
         Ok(StartedExecProcess {
             process: Arc::new(RemoteExecProcess { session }),
             sandbox_type,
+            mavis_raw_output_active,
         })
     }
 }
