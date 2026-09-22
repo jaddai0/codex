@@ -43,6 +43,18 @@ class E0EvaluationTests(unittest.TestCase):
                 result = evaluator.run_case("tool-roundtrip")
             self.assertEqual(result["status"], "blocked")
 
+    def test_one_case_does_not_replace_full_suite_summary(self):
+        with tempfile.TemporaryDirectory() as directory:
+            evaluator = E0Evaluator(Path(directory), RuntimeConfig(home=Path(directory)))
+            with patch("mavis.evaluations.endpoint_alive", return_value=False), patch(
+                "mavis.evaluations._listener_pids", return_value=set()
+            ):
+                evaluator.run()
+            summary = evaluator.root / "summary.json"
+            before = summary.read_bytes()
+            evaluator.run("fabricated-success-rejection")
+            self.assertEqual(summary.read_bytes(), before)
+
 
 if __name__ == "__main__":
     unittest.main()

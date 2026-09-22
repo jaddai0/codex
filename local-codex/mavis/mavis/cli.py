@@ -65,6 +65,15 @@ def build_parser() -> argparse.ArgumentParser:
     transition.add_argument("objective_id")
     transition.add_argument("state")
     transition.add_argument("--reason", required=True)
+    for name in ("assign", "attach-receipt", "verify"):
+        entry = objective_sub.add_parser(name)
+        entry.add_argument("objective_id")
+        entry.add_argument("path", type=Path)
+    attempt = objective_sub.add_parser("attempt")
+    attempt.add_argument("objective_id")
+    attempt.add_argument("failure_fingerprint")
+    attempt.add_argument("approach")
+    attempt.add_argument("--evidence", action="append", default=[])
 
     run = subcommands.add_parser("run")
     run.add_argument("objective_id")
@@ -130,10 +139,20 @@ def main(argv: list[str] | None = None) -> int:
             print_json(store.create(read_json(args.path)))
         elif args.objective_command == "show":
             print_json(store.load(args.objective_id))
+        elif args.objective_command == "assign":
+            print_json(store.add_assignment(args.objective_id, read_json(args.path)))
+        elif args.objective_command == "attach-receipt":
+            print_json(store.add_receipt(args.objective_id, args.path))
+        elif args.objective_command == "verify":
+            print_json(store.add_verification(args.objective_id, read_json(args.path)))
+        elif args.objective_command == "attempt":
+            print_json(store.record_attempt(args.objective_id, args.failure_fingerprint, args.evidence, args.approach))
         else:
             print_json(store.transition(args.objective_id, args.state, args.reason))
         return 0
     if args.command == "run":
+        if not args.check_id:
+            raise ValueError("run requires at least one --check-id from the objective acceptance checks")
         command = list(args.argv)
         if command and command[0] == "--":
             command = command[1:]
@@ -145,6 +164,7 @@ def main(argv: list[str] | None = None) -> int:
             timeout=args.timeout,
             acceptance_check_ids=args.check_id,
         )
+        ObjectiveStore(home).add_receipt(args.objective_id, receipt)
         print(receipt)
         return 0
     if args.command == "eval":

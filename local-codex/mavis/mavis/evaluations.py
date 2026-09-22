@@ -99,8 +99,9 @@ class E0Evaluator:
         )
 
     def run(self, case: str | None = None) -> dict[str, Any]:
-        selected = [case] if case else list(E0_CASES)
-        results = [self.run_case(item) for item in selected]
+        if case is not None:
+            return self.run_case(case)
+        results = [self.run_case(item) for item in E0_CASES]
         passed = len(results) == len(E0_CASES) and all(item["status"] == "pass" for item in results)
         summary = {
             "schema_version": "mavis.evaluation-suite/v1",
@@ -111,7 +112,7 @@ class E0Evaluator:
             "observed_at": _now(),
         }
         write_json(self.root / "summary.json", summary)
-        return summary if case is None else results[0]
+        return summary
 
     def _tool_roundtrip(self) -> dict[str, Any]:
         if not endpoint_alive(self.config.endpoint):
