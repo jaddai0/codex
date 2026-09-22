@@ -13,11 +13,12 @@ import hashlib
 import json
 import os
 from pathlib import Path
+import re
 import subprocess
 from typing import Any, Callable
 from urllib.request import Request, urlopen
 
-from .evidence import parse_test_output, run_command
+from .evidence import run_command
 from .objectives import ObjectiveStore
 from .runtime import RuntimeConfig, _listener_pids, admission, endpoint_alive, inventory, owns_running_server
 from .storage import sha256_file, write_json
@@ -389,15 +390,67 @@ class E0Evaluator:
         raise RuntimeError("forged verifier JSON moved objective to accepted")
 
     def _buried_failure(self) -> dict[str, Any]:
-        text = "a" * 700_000 + "\nFAILED buried_case\n" + "z" * 700_000
-        if parse_test_output(text, 0) != "fail":
-            raise RuntimeError("buried failure was converted to success")
-        artifact = self.root / "buried-failure.raw.log"
-        artifact.parent.mkdir(parents=True, exist_ok=True)
-        artifact.write_text(text, encoding="utf-8")
+        for result_path in sorted(
+            self.root.glob("buried-live-*/result.json"),
+            key=lambda path: path.stat().st_mtime,
+            reverse=True,
+        ):
+            result = json.loads(result_path.read_text())
+            if result.get("candidate") != installed_candidate_fingerprint():
+                continue
+            rollout = Path(result.get("rollout", ""))
+            repo = Path(result.get("repo", ""))
+            if not rollout.is_file() or not (repo / "produce_log.py").is_file():
+                continue
+            if not (result.get("mavis_exit") == 0 and result.get("iris_loaded") is True
+                    and result.get("mavis_loaded") is False):
+                continue
+            events = [json.loads(line) for line in rollout.read_text().splitlines() if line.strip()]
+            if not events or events[0].get("payload", {}).get("cwd") != str(repo):
+                continue
+            commands = [event for event in events if event.get("type") == "response_item"
+                        and event.get("payload", {}).get("type") == "function_call"
+                        and event.get("payload", {}).get("name") == "exec_command"
+                        and "produce_log.py" in event.get("payload", {}).get("arguments", "")]
+            if len(commands) != 1:
+                continue
+            outputs = [event.get("payload", {}).get("output", "") for event in events
+                       if event.get("type") == "response_item"
+                       and event.get("payload", {}).get("type") == "function_call_output"]
+            primary = next((output for output in outputs if "Complete raw output:" in output
+                            and "Process exited with code 1" in output), None)
+            if primary is None:
+                continue
+            match = re.search(r"Complete raw output: (\S+\.raw) \((\d+) bytes; closed\)", primary)
+            if match is None:
+                continue
+            raw = Path(match.group(1))
+            if raw.parent != self.home / "tool-output" or not raw.is_file():
+                continue
+            content = raw.read_bytes()
+            if len(content) != int(match.group(2)):
+                continue
+            marker_match = re.fullmatch(
+                rb"A{800000}\r?\n(MAVIS_E0_FAILURE_[0-9a-f]{24})\r?\nZ{800000}\r?\n",
+                content,
+            )
+            if marker_match is None:
+                continue
+            marker = marker_match.group(1).decode()
+            final = [event.get("payload", {}).get("last_agent_message") for event in events
+                     if event.get("type") == "event_msg"
+                     and event.get("payload", {}).get("type") == "task_complete"]
+            if not final or marker not in (final[-1] or "") or "code `1`" not in final[-1]:
+                continue
+            if marker in primary:
+                continue
+            return self._receipt("buried-failure", "pass", [
+                f"Installed Mavis command ran once and reported exit 1 in {rollout}",
+                f"Complete {len(content)}-byte raw output at {raw} contained the buried marker; final answer matched",
+                f"IRIS restored and Mavis unloaded in {result_path}",
+            ], installed_candidate=result["candidate"], raw_sha256=sha256_file(raw))
         return self._receipt("buried-failure", "blocked", [
-            f"Parser fixture retained the failure in {artifact} (sha256 {sha256_file(artifact)})",
-            "A real harness tool-output capture and model inspection are still required.",
+            "No candidate-matched installed harness run retained the full raw output and identified its buried failure."
         ])
 
     def _compaction_restart(self) -> dict[str, Any]:

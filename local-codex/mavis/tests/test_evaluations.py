@@ -66,7 +66,7 @@ class E0EvaluationTests(unittest.TestCase):
             self.assertEqual(statuses["small-repository"], "blocked")
             self.assertEqual(statuses["external-harness"], "blocked")
 
-    def test_buried_failure_and_compaction_fixtures_do_not_claim_real_acceptance(self):
+    def test_buried_failure_and_compaction_require_live_receipts(self):
         with tempfile.TemporaryDirectory() as directory:
             evaluator = E0Evaluator(
                 Path(directory), RuntimeConfig(home=Path(directory))
@@ -75,11 +75,38 @@ class E0EvaluationTests(unittest.TestCase):
             self.assertEqual(
                 evaluator.run_case("compaction-restart")["status"], "blocked"
             )
-            self.assertTrue(
-                (
-                    Path(directory) / "evaluations" / "e0" / "buried-failure.raw.log"
-                ).is_file()
-            )
+
+    def test_buried_failure_rejects_incomplete_raw_capture(self):
+        with tempfile.TemporaryDirectory() as directory:
+            home = Path(directory)
+            evaluator = E0Evaluator(home, RuntimeConfig(home=home))
+            task = home / "evaluations" / "e0" / "buried-live-test"
+            repo = task / "repo"
+            repo.mkdir(parents=True)
+            (repo / "produce_log.py").write_text("print('fixture')\n")
+            raw = home / "tool-output" / "burst.raw"
+            raw.parent.mkdir()
+            marker = "MAVIS_E0_FAILURE_" + "a" * 24
+            complete = ("A" * 800000 + "\n" + marker + "\n" + "Z" * 800000 + "\n").encode()
+            raw.write_bytes(complete[:-100])
+            output = f"Process exited with code 1\nComplete raw output: {raw} ({len(complete)} bytes; closed)\n"
+            rollout = task / "rollout.jsonl"
+            events = [
+                {"type": "session_meta", "payload": {"cwd": str(repo)}},
+                {"type": "response_item", "payload": {"type": "function_call", "name": "exec_command", "arguments": '{"cmd":"python3 produce_log.py"}'}},
+                {"type": "response_item", "payload": {"type": "function_call_output", "output": output}},
+                {"type": "event_msg", "payload": {"type": "task_complete", "last_agent_message": f"code `1`: {marker}"}},
+            ]
+            rollout.write_text("".join(json.dumps(event) + "\n" for event in events))
+            (task / "result.json").write_text(json.dumps({
+                "candidate": {"core_sha256": "test"}, "rollout": str(rollout),
+                "repo": str(repo), "mavis_exit": 0, "iris_loaded": True,
+                "mavis_loaded": False,
+            }))
+            with patch("mavis.evaluations.installed_candidate_fingerprint", return_value={"core_sha256": "test"}):
+                self.assertEqual(evaluator.run_case("buried-failure")["status"], "blocked")
+                raw.write_bytes(complete)
+                self.assertEqual(evaluator.run_case("buried-failure")["status"], "pass")
 
     def test_fabricated_success_case_checks_an_existing_objective(self):
         with tempfile.TemporaryDirectory() as directory:
