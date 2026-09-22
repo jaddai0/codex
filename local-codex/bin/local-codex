@@ -4,7 +4,7 @@ set -euo pipefail
 script_dir=${0:A:h}
 share_dir=${LOCAL_CODEX_SHARE_DIR:-${HOME}/.local/share/local-codex}
 runtime_home=${LOCAL_CODEX_HOME:-${HOME}/.local-codex}
-base_url=${OMLX_BASE_URL:-http://127.0.0.1:8000/v1}
+base_url=${OMLX_BASE_URL:-http://127.0.0.1:8001/v1}
 core_binary=${LOCAL_CODEX_BIN:-${share_dir}/local-codex-core}
 model_args=()
 
@@ -32,6 +32,15 @@ if [[ ! -x "$core_binary" ]]; then
   print -u2 "mavis: core binary not found at $core_binary"
   exit 127
 fi
+
+MAVIS_HOME=${MAVIS_HOME:-${HOME}/.local-codex/mavis-service} \
+PYTHONPATH="${share_dir}${PYTHONPATH:+:${PYTHONPATH}}" \
+python3 -m mavis runtime ensure \
+  --endpoint "$base_url" \
+  --iris-endpoint "${IRIS_OMLX_BASE_URL:-http://127.0.0.1:8000/v1}" \
+  --model "${LOCAL_CODEX_MODEL:-Qwen3.8-Flash-Next-Abliterated-MLX-4bit}" \
+  --model-dir "${MAVIS_MODEL_DIR:-${HOME}/models/vlms}" \
+  --omlx-binary "${MAVIS_OMLX_BIN:-${HOME}/.venvs/omlx-dev/bin/omlx}" >/dev/null
 
 python3 "$share_dir/prepare_runtime.py" \
   --home "$runtime_home" \

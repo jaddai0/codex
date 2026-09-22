@@ -8,7 +8,8 @@ accounting, and external harness adapters belong in the canonical
 ## Boundaries
 
 - Never reuse or modify IRIS's oMLX base path, port, caches, logs, prompts, or
-  process. IRIS owns port 8000. Mavis defaults to port 8001 and `~/.mavis`.
+  process. IRIS owns port 8000. Mavis defaults to port 8001 and
+  `~/.local-codex/mavis-service` (`~/.mavis` is a MiniMax alias here).
 - Reuse model weights read-only. All mutable oMLX state must live below the
   Mavis home.
 - Check aggregate memory and active local generations before loading a model.

@@ -18,6 +18,8 @@ Mavis's persona is stored separately at `~/.local-codex/persona.toml`. Change on
 
 Environment variables:
 
-- `OMLX_BASE_URL` defaults to `http://127.0.0.1:8000/v1` and must remain loopback-only.
+- `OMLX_BASE_URL` defaults to Mavis's isolated `http://127.0.0.1:8001/v1` and must remain loopback-only. IRIS remains on port 8000.
 - `LOCAL_CODEX_MODEL` selects any coding-capable model reported by oMLX.
 - `LOCAL_CODEX_HOME` changes the isolated harness home.
+- `MAVIS_HOME` changes Mavis service state (default `~/.local-codex/mavis-service`; `~/.mavis` is intentionally not used because it is an existing MiniMax alias on this machine).
+- `MAVIS_OMLX_BIN` and `MAVIS_MODEL_DIR` override the isolated oMLX executable and shared read-only weight directory.

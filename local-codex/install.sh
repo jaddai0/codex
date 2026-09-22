@@ -15,5 +15,12 @@ install -m 0755 "$repo_root/local-codex/bin/local-codex" "$install_bin/local-cod
 install -m 0755 "$repo_root/local-codex/prepare_runtime.py" "$install_share/prepare_runtime.py"
 install -m 0644 "$repo_root/local-codex/persona.toml" "$install_share/persona.toml"
 install -m 0644 "$repo_root/codex-rs/models-manager/prompt.md" "$install_share/base-instructions.md"
+rm -rf "$install_share/mavis"
+cp -R "$repo_root/local-codex/mavis/mavis" "$install_share/mavis"
+find "$install_share/mavis" -type d -exec chmod 0755 {} +
+find "$install_share/mavis" -type f -exec chmod 0644 {} +
 
-print "Installed $install_bin/mavis (with local-codex compatibility command)"
+desktop_launcher=${MAVIS_DESKTOP_LAUNCHER:-${HOME}/Desktop/Mavis.command}
+install -m 0755 "$repo_root/local-codex/mavis/Mavis.command" "$desktop_launcher"
+
+print "Installed $install_bin/mavis and $desktop_launcher (with local-codex compatibility command)"

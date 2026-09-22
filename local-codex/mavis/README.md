@@ -5,7 +5,7 @@ system. `LEDGER.json` maps each delivery phase to its acceptance surface;
 `contracts/` contains the six versioned machine contracts; `handoff/` contains
 worker and verifier templates; and `baseline/` freezes the pre-change state.
 
-Runtime data is stored outside Git under `~/.mavis` and project `.mavis/`
+Runtime data is stored outside Git under `~/.local-codex/mavis-service` and project `.mavis/`
 directories. IRIS remains on its existing oMLX service. The Mavis service uses
 an isolated base path and endpoint and refuses to replace a process it does not
 own.

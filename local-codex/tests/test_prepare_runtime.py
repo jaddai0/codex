@@ -20,6 +20,17 @@ class PrepareRuntimeTests(unittest.TestCase):
     def test_installer_exposes_mavis_command(self):
         installer = (MODULE_PATH.parent / "install.sh").read_text(encoding="utf-8")
         self.assertIn('"$install_bin/mavis"', installer)
+        self.assertIn('Desktop/Mavis.command', installer)
+
+    def test_launcher_uses_isolated_mavis_runtime(self):
+        launcher = (MODULE_PATH.parent / "bin" / "local-codex").read_text(
+            encoding="utf-8"
+        )
+        self.assertIn("http://127.0.0.1:8001/v1", launcher)
+        self.assertIn("python3 -m mavis runtime ensure", launcher)
+        self.assertIn("http://127.0.0.1:8000/v1", launcher)
+        self.assertIn(".local-codex/mavis-service", launcher)
+        self.assertNotIn("${HOME}/.mavis", launcher)
 
     def test_rejects_non_loopback_server(self):
         with self.assertRaisesRegex(ValueError, "localhost"):
