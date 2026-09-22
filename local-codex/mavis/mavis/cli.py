@@ -8,6 +8,7 @@ import os
 from pathlib import Path
 
 from .evidence import run_command
+from .evaluations import E0_CASES, E0Evaluator
 from .objectives import ObjectiveStore
 from .runtime import RuntimeConfig, admission, ensure_runtime, endpoint_alive, inventory, owns_running_server, stop_server
 from .storage import read_json
@@ -67,12 +68,23 @@ def build_parser() -> argparse.ArgumentParser:
     run.add_argument("objective_id")
     run.add_argument("--cwd", type=Path, required=True)
     run.add_argument("--timeout", type=float)
+    run.add_argument("--check-id", action="append", default=[])
     run.add_argument("argv", nargs=argparse.REMAINDER)
 
     search = subcommands.add_parser("archive-search")
     search.add_argument("conversation_id")
     search.add_argument("query")
     search.add_argument("--limit", type=int, default=20)
+
+    evaluate = subcommands.add_parser("eval")
+    evaluate_sub = evaluate.add_subparsers(dest="eval_suite", required=True)
+    e0 = evaluate_sub.add_parser("e0")
+    e0.add_argument("--case", choices=E0_CASES)
+    e0.add_argument("--endpoint", default="http://127.0.0.1:8001/v1")
+    e0.add_argument("--iris-endpoint", default="http://127.0.0.1:8000/v1")
+    e0.add_argument("--model", default="Qwen3.8-Flash-Next-Abliterated-MLX-4bit")
+    e0.add_argument("--model-dir", default="/Users/dustinpainter/models/vlms")
+    e0.add_argument("--omlx-binary", default="/Users/dustinpainter/.venvs/omlx-dev/bin/omlx")
     return parser
 
 
@@ -104,9 +116,20 @@ def main(argv: list[str] | None = None) -> int:
         command = list(args.argv)
         if command and command[0] == "--":
             command = command[1:]
-        receipt = run_command(home, args.objective_id, command, args.cwd, timeout=args.timeout)
+        receipt = run_command(
+            home,
+            args.objective_id,
+            command,
+            args.cwd,
+            timeout=args.timeout,
+            acceptance_check_ids=args.check_id,
+        )
         print(receipt)
         return 0
+    if args.command == "eval":
+        result = E0Evaluator(home, runtime_config(args)).run(args.case)
+        print_json(result)
+        return 0 if result["status"] == "pass" else 1
     archive = TranscriptArchive(home, args.conversation_id)
     print_json(archive.search(args.query, args.limit))
     return 0

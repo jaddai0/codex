@@ -13,5 +13,10 @@
     "failure masking"
   ],
   "required_receipts": ["receipt-path"],
+  "verifier": {
+    "provider": "codex",
+    "model": "gpt-5.6-terra",
+    "harness": "codex"
+  },
   "verdict": "awaiting verification"
 }

@@ -18,5 +18,8 @@
     "version": {"type": "integer", "minimum": 1},
     "previous_version": {"type": ["integer", "null"]},
     "status": {"enum": ["candidate", "active", "previous", "rejected"]}
+    ,"candidate_inheritance": {"type": "object"}
+    ,"accepted_experiment": {"type": "object", "required": ["path", "sha256"]}
+    ,"verifier_receipt": {"type": "object", "required": ["path", "sha256"]}
   }
 }

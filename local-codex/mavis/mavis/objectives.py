@@ -7,7 +7,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
-from .storage import read_json, require_safe_id, write_json
+from .storage import read_json, require_safe_id, sha256_file, write_json
 
 
 STATES = {
@@ -87,10 +87,7 @@ class ObjectiveStore:
         return record
 
     def add_assignment(self, objective_id: str, assignment: dict[str, Any]) -> dict[str, Any]:
-        if assignment.get("schema_version") != "mavis.worker-assignment/v1":
-            raise ValueError("unsupported worker assignment schema")
-        if not assignment.get("owner") or not assignment.get("requirements"):
-            raise ValueError("assignment must record owner and requirements")
+        _validate_assignment(assignment, objective_id)
         record = self.load(objective_id)
         record["assignments"].append(deepcopy(assignment))
         self.save(record)
@@ -98,10 +95,15 @@ class ObjectiveStore:
 
     def add_receipt(self, objective_id: str, receipt_path: Path) -> dict[str, Any]:
         record = self.load(objective_id)
-        receipt = read_json(receipt_path)
-        if receipt.get("schema_version") != "mavis.evidence-receipt/v1":
-            raise ValueError("unsupported evidence receipt schema")
-        record["evidence_receipts"].append(str(Path(receipt_path).resolve()))
+        resolved = Path(receipt_path).resolve()
+        evidence_root = (self.root.parent / "evidence" / objective_id).resolve()
+        if evidence_root not in resolved.parents:
+            raise ValueError("evidence receipt must be host-recorded under the objective evidence root")
+        receipt = read_json(resolved)
+        _validate_receipt(receipt, objective_id, resolved)
+        record["evidence_receipts"].append(
+            {"path": str(resolved), "sha256": sha256_file(resolved)}
+        )
         self.save(record)
         return record
 
@@ -132,11 +134,10 @@ class ObjectiveStore:
 
     def add_verification(self, objective_id: str, verification: dict[str, Any]) -> dict[str, Any]:
         record = self.load(objective_id)
-        worker_owners = {
-            str(item.get("owner", {}).get("provider")) for item in record["assignments"]
-        }
-        verifier = str(verification.get("verifier", {}).get("provider") or "")
-        if not verifier or verifier in worker_owners:
+        _validate_verification(verification, objective_id)
+        worker_owners = {_owner_identity(item.get("owner", {})) for item in record["assignments"]}
+        verifier = _owner_identity(verification.get("verifier", {}))
+        if verifier in worker_owners:
             raise ValueError("verifier must be independent from implementation owners")
         record["verifications"].append(deepcopy(verification))
         self.save(record)
@@ -144,15 +145,131 @@ class ObjectiveStore:
 
     @staticmethod
     def _assert_acceptance(record: dict[str, Any]) -> None:
-        receipts = [read_json(Path(path)) for path in record["evidence_receipts"]]
+        receipts = []
+        for retained in record["evidence_receipts"]:
+            if not isinstance(retained, dict) or set(retained) != {"path", "sha256"}:
+                raise ValueError("evidence receipt retention record is invalid")
+            path = Path(retained["path"])
+            if sha256_file(path) != retained["sha256"]:
+                raise ValueError("retained evidence receipt hash changed after recording")
+            receipt = read_json(path)
+            _validate_receipt(receipt, str(record["objective_id"]), path)
+            receipts.append(receipt)
         if not receipts or any(item.get("verdict") != "pass" for item in receipts):
             raise ValueError("all retained evidence receipts must pass before acceptance")
         verifications = record.get("verifications") or []
         if not verifications or verifications[-1].get("verdict") != "accepted":
             raise ValueError("independent verification must accept the current milestone")
-        expected_revision = verifications[-1].get("revision")
-        if expected_revision and any(
-            receipt.get("changed_revision") not in {None, expected_revision}
-            for receipt in receipts
-        ):
+        verification = verifications[-1]
+        _validate_verification(verification, str(record["objective_id"]))
+        expected_revision = verification["revision"]
+        if any(receipt.get("changed_revision") != expected_revision for receipt in receipts):
             raise ValueError("verification revision does not match evidence receipts")
+        required_checks = {
+            str(check.get("id")) for check in record["acceptance_checks"] if check.get("id")
+        }
+        covered_checks = {
+            check_id for receipt in receipts for check_id in receipt["acceptance_check_ids"]
+        }
+        if not required_checks or not required_checks.issubset(covered_checks):
+            raise ValueError("retained evidence does not cover every acceptance check")
+        retained_paths = {item["path"] for item in record["evidence_receipts"]}
+        if set(verification["required_receipts"]) != retained_paths:
+            raise ValueError("verification is not bound to the exact retained receipts")
+        required_requirements = {str(item["id"]) for item in record["requirements"]}
+        if set(verification["requirements"]) != required_requirements:
+            raise ValueError("verification does not cover every objective requirement")
+
+
+def _require_keys(payload: dict[str, Any], required: set[str], label: str) -> None:
+    missing = sorted(required - set(payload))
+    if missing:
+        raise ValueError(f"{label} missing required fields: {', '.join(missing)}")
+
+
+def _owner_identity(owner: object) -> tuple[str, str, str]:
+    if not isinstance(owner, dict):
+        raise ValueError("owner identity must be an object")
+    identity = tuple(str(owner.get(key) or "") for key in ("provider", "model", "harness"))
+    if any(not value for value in identity):
+        raise ValueError("owner identity requires provider, model, and harness")
+    return identity
+
+
+def _validate_assignment(assignment: dict[str, Any], objective_id: str) -> None:
+    required = {
+        "schema_version", "assignment_id", "objective_id", "requirements",
+        "starting_revision", "owner", "checkout", "allowed_effects",
+        "expected_artifacts", "escalate_when", "state",
+    }
+    _require_keys(assignment, required, "worker assignment")
+    if assignment["schema_version"] != "mavis.worker-assignment/v1":
+        raise ValueError("unsupported worker assignment schema")
+    if assignment["objective_id"] != objective_id:
+        raise ValueError("worker assignment objective does not match")
+    require_safe_id(str(assignment["assignment_id"]), "assignment id")
+    _owner_identity(assignment["owner"])
+    if not assignment["requirements"] or not assignment["expected_artifacts"] or not assignment["escalate_when"]:
+        raise ValueError("assignment lists must not be empty")
+    checkout = assignment["checkout"]
+    if not isinstance(checkout, dict) or not checkout.get("path") or not checkout.get("owned_paths"):
+        raise ValueError("assignment checkout must bind a path and owned paths")
+
+
+def _validate_receipt(receipt: dict[str, Any], objective_id: str, receipt_path: Path) -> None:
+    required = {
+        "schema_version", "receipt_id", "objective_id", "command", "cwd",
+        "exit_status", "started_at", "finished_at", "raw_output",
+        "changed_revision", "artifact_hashes", "acceptance_check_ids",
+        "producer", "verdict",
+    }
+    _require_keys(receipt, required, "evidence receipt")
+    if receipt["schema_version"] != "mavis.evidence-receipt/v1" or receipt["producer"] != "mavis-host-command/v1":
+        raise ValueError("unsupported evidence receipt producer or schema")
+    if receipt["objective_id"] != objective_id:
+        raise ValueError("evidence receipt objective does not match")
+    if not isinstance(receipt["command"], list) or not receipt["command"]:
+        raise ValueError("evidence receipt command is missing")
+    if not isinstance(receipt["exit_status"], int):
+        raise ValueError("evidence receipt exit status is invalid")
+    if not isinstance(receipt["changed_revision"], str) or len(receipt["changed_revision"]) < 7:
+        raise ValueError("evidence receipt must bind a git revision")
+    if not receipt["acceptance_check_ids"]:
+        raise ValueError("evidence receipt must cover an acceptance check")
+    raw = receipt["raw_output"]
+    evidence_dir = receipt_path.parent.resolve()
+    if not isinstance(raw, dict) or Path(str(raw.get("path"))).resolve() != evidence_dir:
+        raise ValueError("raw output path is not bound to the receipt directory")
+    stdout_path, stderr_path = evidence_dir / "stdout.log", evidence_dir / "stderr.log"
+    if not stdout_path.is_file() or not stderr_path.is_file():
+        raise ValueError("raw output files are missing")
+    actual_hash = sha256_file(stdout_path) + ":" + sha256_file(stderr_path)
+    actual_bytes = stdout_path.stat().st_size + stderr_path.stat().st_size
+    if raw.get("sha256") != actual_hash or raw.get("bytes") != actual_bytes:
+        raise ValueError("raw output hash or byte count does not match")
+    for artifact, expected_hash in receipt["artifact_hashes"].items():
+        path = Path(artifact)
+        if not path.is_file() or sha256_file(path) != expected_hash:
+            raise ValueError(f"artifact hash does not match: {artifact}")
+
+
+def _validate_verification(verification: dict[str, Any], objective_id: str) -> None:
+    required = {
+        "schema_version", "verification_id", "objective_id", "revision",
+        "requirements", "protected_fixtures", "checks", "required_receipts",
+        "verifier", "verdict",
+    }
+    _require_keys(verification, required, "verification")
+    if verification["schema_version"] != "mavis.verifier/v1":
+        raise ValueError("unsupported verification schema")
+    if verification["objective_id"] != objective_id:
+        raise ValueError("verification objective does not match")
+    require_safe_id(str(verification["verification_id"]), "verification id")
+    _owner_identity(verification["verifier"])
+    if not isinstance(verification["revision"], str) or len(verification["revision"]) < 7:
+        raise ValueError("verification must bind a git revision")
+    if verification["verdict"] not in {"accepted", "rejected"}:
+        raise ValueError("verification verdict must be accepted or rejected")
+    for key in ("requirements", "checks", "required_receipts"):
+        if not isinstance(verification[key], list) or not verification[key]:
+            raise ValueError(f"verification {key} must not be empty")

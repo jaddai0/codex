@@ -93,6 +93,20 @@ class RuntimeTests(unittest.TestCase):
             ), patch("mavis.runtime.endpoint_alive", return_value=True):
                 result = admission(config, now=10000)
             self.assertFalse(result["allowed"])
+            self.assertIn("IRIS already owns", result["reasons"][0])
+
+    def test_concurrent_override_still_requires_proven_idle(self):
+        with tempfile.TemporaryDirectory() as directory:
+            config = RuntimeConfig(
+                home=Path(directory), reserve_bytes=10, allow_concurrent_local=True
+            )
+            own = [{"id": config.model, "estimated_size": 100}]
+            iris = [{"id": "main", "model_type": "llm", "loaded": True, "last_access": 9990}]
+            with patch("mavis.runtime.inventory", side_effect=[own, iris]), patch(
+                "mavis.runtime.available_memory_bytes", return_value=1000
+            ), patch("mavis.runtime.endpoint_alive", return_value=True):
+                result = admission(config, now=10000)
+            self.assertFalse(result["allowed"])
             self.assertIn("not proven idle", result["reasons"][0])
 
     def test_admission_requires_model_plus_reserve(self):

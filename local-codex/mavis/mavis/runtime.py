@@ -31,6 +31,7 @@ class RuntimeConfig:
     model: str = DEFAULT_MODEL
     idle_seconds: int = 900
     reserve_bytes: int = 64 * 1024**3
+    allow_concurrent_local: bool = False
 
     @property
     def base_path(self) -> Path:
@@ -269,6 +270,11 @@ def admission(config: RuntimeConfig, *, now: float | None = None) -> dict[str, A
         for record in inventory(config.iris_endpoint):
             if not record.get("loaded") or record.get("model_type") == "embedding":
                 continue
+            if not config.allow_concurrent_local:
+                reasons.append(
+                    "IRIS already owns an active local generation model; concurrent local inference has no accepted safety evidence"
+                )
+                break
             last_access = record.get("last_access")
             if last_access is None or now - float(last_access) < config.idle_seconds:
                 reasons.append("IRIS local generation model is not proven idle for 15 minutes")

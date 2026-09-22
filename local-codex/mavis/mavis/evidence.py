@@ -60,6 +60,7 @@ def run_command(
     cwd: Path,
     *,
     artifact_paths: Iterable[Path] = (),
+    acceptance_check_ids: Iterable[str] = (),
     timeout: float | None = None,
 ) -> Path:
     require_safe_id(objective_id, "objective id")
@@ -105,6 +106,10 @@ def run_command(
         },
         "changed_revision": git_revision(Path(cwd)),
         "artifact_hashes": artifact_hashes,
+        "acceptance_check_ids": sorted(
+            {require_safe_id(item, "acceptance check id") for item in acceptance_check_ids}
+        ),
+        "producer": "mavis-host-command/v1",
         "verdict": parse_test_output(combined, exit_status, timed_out),
     }
     receipt_path = evidence_dir / "receipt.json"
