@@ -417,6 +417,7 @@ fn exec_command_tool_output_formats_truncated_response() {
         chunk_id: "abc123".to_string(),
         wall_time: std::time::Duration::from_millis(1250),
         raw_output: b"token one token two token three token four token five".to_vec(),
+        raw_output_reference: None,
         truncation_policy: TruncationPolicy::Tokens(10_000),
         max_output_tokens: Some(4),
         process_id: None,
@@ -456,6 +457,42 @@ fn exec_command_tool_output_formats_truncated_response() {
 }
 
 #[test]
+fn exec_command_tool_output_exposes_raw_reference_only_when_present() {
+    let payload = ToolPayload::Function {
+        arguments: "{}".to_string(),
+    };
+    let output = ExecCommandToolOutput {
+        event_call_id: "call-raw".to_string(),
+        chunk_id: "chunk-raw".to_string(),
+        wall_time: std::time::Duration::ZERO,
+        raw_output: b"visible".to_vec(),
+        raw_output_reference: Some(crate::unified_exec::RawOutputReference {
+            path: std::path::PathBuf::from("/private/mavis/tool-output/abc.raw"),
+            bytes: 1_400_000,
+            complete: true,
+        }),
+        truncation_policy: TruncationPolicy::Tokens(10_000),
+        max_output_tokens: None,
+        process_id: None,
+        exit_code: Some(1),
+        original_token_count: Some(2),
+        output_omitted_bytes: None,
+        hook_command: None,
+    };
+    let response = output.to_response_item("call-raw", &payload);
+    let ResponseInputItem::FunctionCallOutput { output: body, .. } = response else {
+        panic!("expected FunctionCallOutput");
+    };
+    assert!(body.body.to_text().unwrap().contains(
+        "Complete raw output: /private/mavis/tool-output/abc.raw (1400000 bytes; closed)"
+    ));
+    assert_eq!(
+        output.code_mode_result(&payload)["raw_output_ref"]["bytes"],
+        1_400_000
+    );
+}
+
+#[test]
 fn exec_command_tool_output_reserves_metadata_budget_and_preserves_policy_units() {
     let payload = ToolPayload::Function {
         arguments: "{}".to_string(),
@@ -474,6 +511,7 @@ fn exec_command_tool_output_reserves_metadata_budget_and_preserves_policy_units(
             chunk_id: "abc123".to_string(),
             wall_time: std::time::Duration::from_millis(/*millis*/ 1250),
             raw_output: raw_output.clone(),
+            raw_output_reference: None,
             truncation_policy: policy,
             max_output_tokens: None,
             process_id: None,
@@ -518,6 +556,7 @@ fn exec_command_tool_output_preserves_omission_metadata_when_truncated() {
         chunk_id: "abc123".to_string(),
         wall_time: std::time::Duration::from_millis(/*millis*/ 1250),
         raw_output,
+        raw_output_reference: None,
         truncation_policy: TruncationPolicy::Tokens(10_000),
         max_output_tokens: Some(4),
         process_id: None,

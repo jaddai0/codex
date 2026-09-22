@@ -394,6 +394,7 @@ impl ExecCommandHandler {
                 chunk_id: String::new(),
                 wall_time: std::time::Duration::ZERO,
                 raw_output: output.into_text().into_bytes(),
+                raw_output_reference: None,
                 truncation_policy: step_context.settings.model_info.truncation_policy.into(),
                 max_output_tokens,
                 process_id: None,
@@ -459,6 +460,7 @@ impl ExecCommandHandler {
                     chunk_id: generate_chunk_id(),
                     wall_time: output.duration,
                     raw_output: output_text.into_bytes(),
+                    raw_output_reference: None,
                     truncation_policy: step_context.settings.model_info.truncation_policy.into(),
                     max_output_tokens,
                     // Sandbox denial is terminal, so there is no live

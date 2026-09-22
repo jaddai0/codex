@@ -826,6 +826,7 @@ impl UnifiedExecProcessManager {
             chunk_id,
             wall_time,
             raw_output: collected,
+            raw_output_reference: process.raw_output_reference()?,
             truncation_policy: context
                 .step_context
                 .settings
@@ -1098,6 +1099,7 @@ impl UnifiedExecProcessManager {
             chunk_id,
             wall_time,
             raw_output: collected,
+            raw_output_reference: process.raw_output_reference()?,
             truncation_policy: request.truncation_policy,
             max_output_tokens: request.max_output_tokens,
             process_id,

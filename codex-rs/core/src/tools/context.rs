@@ -383,6 +383,7 @@ pub struct ExecCommandToolOutput {
     pub wall_time: Duration,
     /// Raw bytes returned for this unified exec call before any truncation.
     pub raw_output: Vec<u8>,
+    pub raw_output_reference: Option<crate::unified_exec::RawOutputReference>,
     pub truncation_policy: TruncationPolicy,
     pub max_output_tokens: Option<usize>,
     pub process_id: Option<i32>,
@@ -457,6 +458,8 @@ impl ToolOutput for ExecCommandToolOutput {
             session_id: Option<i32>,
             #[serde(skip_serializing_if = "Option::is_none")]
             original_token_count: Option<usize>,
+            #[serde(skip_serializing_if = "Option::is_none")]
+            raw_output_ref: Option<crate::unified_exec::RawOutputReference>,
             output: String,
         }
 
@@ -466,6 +469,7 @@ impl ToolOutput for ExecCommandToolOutput {
             exit_code: self.exit_code,
             session_id: self.process_id,
             original_token_count: self.original_token_count,
+            raw_output_ref: self.raw_output_reference.clone(),
             output: match self.max_output_tokens {
                 Some(max_tokens) => self.truncated_output(max_tokens),
                 None => String::from_utf8_lossy(&self.raw_output).to_string(),
@@ -541,6 +545,19 @@ impl ExecCommandToolOutput {
 
         if let Some(original_token_count) = self.original_token_count {
             sections.push(format!("Original token count: {original_token_count}"));
+        }
+
+        if let Some(reference) = &self.raw_output_reference {
+            sections.push(format!(
+                "Complete raw output: {} ({} bytes; {})",
+                reference.path.display(),
+                reference.bytes,
+                if reference.complete {
+                    "closed"
+                } else {
+                    "still streaming"
+                }
+            ));
         }
 
         sections.push("Output:".to_string());

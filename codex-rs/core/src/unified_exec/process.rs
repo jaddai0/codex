@@ -1,11 +1,13 @@
 #![allow(clippy::module_inception)]
 
 use std::sync::Arc;
+use std::sync::Mutex as StdMutex;
 use std::sync::atomic::AtomicBool;
 use std::sync::atomic::Ordering;
 use tokio::sync::Mutex;
 use tokio::sync::Notify;
 use tokio::sync::broadcast;
+use tokio::sync::mpsc;
 use tokio::sync::oneshot::error::TryRecvError;
 use tokio::sync::watch;
 use tokio::task::JoinHandle;
@@ -34,9 +36,54 @@ use super::UNIFIED_EXEC_OUTPUT_MAX_TOKENS;
 use super::UnifiedExecError;
 use super::head_tail_buffer::HeadTailBuffer;
 use super::process_state::ProcessState;
+use super::raw_output_spool::RawOutputReference;
+use super::raw_output_spool::RawOutputSpool;
 use crate::shell_snapshot::ShellSnapshotFile;
 
 const EARLY_EXIT_GRACE_PERIOD: Duration = Duration::from_millis(150);
+
+fn append_raw_output(
+    spool: &Option<Arc<StdMutex<RawOutputSpool>>>,
+    chunk: &[u8],
+) -> std::io::Result<()> {
+    let Some(spool) = spool else {
+        return Ok(());
+    };
+    let mut spool = spool
+        .lock()
+        .map_err(|_| std::io::Error::other("raw output spool lock poisoned"))?;
+    spool.append(chunk)
+}
+
+enum LocalOutputReceiver {
+    Ordinary(broadcast::Receiver<Vec<u8>>),
+    Mavis(mpsc::Receiver<Vec<u8>>),
+}
+
+fn combine_mavis_output_receivers(
+    mut stdout_rx: mpsc::Receiver<Vec<u8>>,
+    mut stderr_rx: mpsc::Receiver<Vec<u8>>,
+) -> mpsc::Receiver<Vec<u8>> {
+    let (combined_tx, combined_rx) = mpsc::channel(64);
+    tokio::spawn(async move {
+        let mut stdout_open = true;
+        let mut stderr_open = true;
+        loop {
+            tokio::select! {
+                stdout = stdout_rx.recv(), if stdout_open => match stdout {
+                    Some(chunk) => if combined_tx.send(chunk).await.is_err() { break; },
+                    None => stdout_open = false,
+                },
+                stderr = stderr_rx.recv(), if stderr_open => match stderr {
+                    Some(chunk) => if combined_tx.send(chunk).await.is_err() { break; },
+                    None => stderr_open = false,
+                },
+                else => break,
+            }
+        }
+    });
+    combined_rx
+}
 pub(crate) trait SpawnLifecycle: std::fmt::Debug + Send + Sync {
     /// Returns file descriptors that must stay open across the child `exec()`.
     ///
@@ -92,6 +139,7 @@ pub(crate) struct UnifiedExecProcess {
     process_handle: ProcessHandle,
     output_tx: broadcast::Sender<Vec<u8>>,
     output: OutputHandles,
+    raw_output_spool: Option<Arc<StdMutex<RawOutputSpool>>>,
     output_drained: Arc<Notify>,
     interaction_lock: Arc<Mutex<()>>,
     state_tx: watch::Sender<ProcessState>,
@@ -119,7 +167,10 @@ impl UnifiedExecProcess {
         process_handle: ProcessHandle,
         sandbox_type: SandboxType,
         spawn_lifecycle: Option<SpawnLifecycleHandle>,
-    ) -> Self {
+    ) -> Result<Self, UnifiedExecError> {
+        let raw_output_spool = RawOutputSpool::maybe_open()
+            .map_err(|err| UnifiedExecError::create_process(format!("raw output spool: {err}")))?
+            .map(|spool| Arc::new(StdMutex::new(spool)));
         let output = OutputHandles {
             output_buffer: Arc::new(Mutex::new(HeadTailBuffer::default())),
             output_notify: Arc::new(Notify::new()),
@@ -131,10 +182,11 @@ impl UnifiedExecProcess {
         let (output_tx, _) = broadcast::channel(64);
         let (state_tx, state_rx) = watch::channel(ProcessState::default());
 
-        Self {
+        Ok(Self {
             process_handle,
             output_tx,
             output,
+            raw_output_spool,
             output_drained,
             interaction_lock: Arc::new(Mutex::new(())),
             state_tx,
@@ -144,7 +196,23 @@ impl UnifiedExecProcess {
             timed_out: AtomicBool::new(false),
             _spawn_lifecycle: spawn_lifecycle,
             _shell_snapshot: None,
-        }
+        })
+    }
+
+    pub(super) fn raw_output_reference(
+        &self,
+    ) -> Result<Option<RawOutputReference>, UnifiedExecError> {
+        let Some(spool) = &self.raw_output_spool else {
+            return Ok(None);
+        };
+        let mut spool = spool.lock().map_err(|_| {
+            UnifiedExecError::process_failed("raw output spool lock poisoned".to_string())
+        })?;
+        let complete =
+            self.output.output_closed.load(Ordering::Acquire) && self.failure_message().is_none();
+        spool.reference(complete).map(Some).map_err(|err| {
+            UnifiedExecError::process_failed(format!("raw output spool sync: {err}"))
+        })
     }
 
     pub(super) async fn write(&self, data: &[u8]) -> Result<(), UnifiedExecError> {
@@ -351,16 +419,24 @@ impl UnifiedExecProcess {
             stderr_rx,
             mut exit_rx,
         } = spawned;
-        let output_rx = codex_utils_pty::combine_output_receivers(stdout_rx, stderr_rx);
         let mut managed = Self::new(
             ProcessHandle::Local(Box::new(process_handle)),
             sandbox_type,
             Some(spawn_lifecycle),
-        );
+        )?;
+        let output_rx = if managed.raw_output_spool.is_some() {
+            LocalOutputReceiver::Mavis(combine_mavis_output_receivers(stdout_rx, stderr_rx))
+        } else {
+            LocalOutputReceiver::Ordinary(codex_utils_pty::combine_output_receivers(
+                stdout_rx, stderr_rx,
+            ))
+        };
         managed.output_task = Some(Self::spawn_local_output_task(
             output_rx,
             managed.output_handles().clone(),
             managed.output_tx.clone(),
+            managed.state_tx.clone(),
+            managed.raw_output_spool.clone(),
         ));
 
         match exit_rx.try_recv() {
@@ -404,13 +480,14 @@ impl UnifiedExecProcess {
         // Older peers do not report this field. In that case, skip local
         // classification rather than attributing a violation to a guessed backend.
         let sandbox_type = started.sandbox_type.unwrap_or(SandboxType::None);
-        let mut managed = Self::new(process_handle, sandbox_type, /*spawn_lifecycle*/ None);
+        let mut managed = Self::new(process_handle, sandbox_type, /*spawn_lifecycle*/ None)?;
         let output_handles = managed.output_handles().clone();
         managed.output_task = Some(Self::spawn_exec_server_output_task(
             started,
             output_handles,
             managed.output_tx.clone(),
             managed.state_tx.clone(),
+            managed.raw_output_spool.clone(),
         ));
 
         let mut state_rx = managed.state_rx.clone();
@@ -439,6 +516,7 @@ impl UnifiedExecProcess {
         output_handles: OutputHandles,
         output_tx: broadcast::Sender<Vec<u8>>,
         state_tx: watch::Sender<ProcessState>,
+        raw_output_spool: Option<Arc<StdMutex<RawOutputSpool>>>,
     ) -> JoinHandle<()> {
         let OutputHandles {
             output_buffer,
@@ -455,10 +533,20 @@ impl UnifiedExecProcess {
                 output_closed_notify: Arc::clone(&output_closed_notify),
             };
             let mut last_seq: u64 = 0;
-            loop {
+            'output_loop: loop {
                 let event = match events.recv().await {
                     Ok(event) => Some(event),
-                    Err(broadcast::error::RecvError::Lagged(_)) => None,
+                    Err(broadcast::error::RecvError::Lagged(_)) => {
+                        if raw_output_spool.is_some() {
+                            let state = state_tx.borrow().clone();
+                            let _ = state_tx.send_replace(
+                                state.failed("raw output event stream lagged".to_string()),
+                            );
+                            cancellation_token.cancel();
+                            break;
+                        }
+                        None
+                    }
                     Err(broadcast::error::RecvError::Closed) => {
                         let state = state_tx.borrow().clone();
                         let _ = state_tx.send_replace(
@@ -515,8 +603,35 @@ impl UnifiedExecProcess {
                         failure,
                         sandbox_denied,
                     } = response;
-                    for chunk in chunks.into_iter().filter(|chunk| chunk.seq > last_seq) {
+                    if raw_output_spool.is_some()
+                        && chunks.is_empty()
+                        && matches!(event.as_ref(), Some(ExecProcessEvent::Output(chunk)) if chunk.seq > last_seq.saturating_add(1))
+                    {
+                        let state = state_tx.borrow().clone();
+                        let _ = state_tx.send_replace(state.failed(
+                            "raw output stream has an unrecoverable sequence gap".to_string(),
+                        ));
+                        cancellation_token.cancel();
+                        break;
+                    }
+                    let prior_seq = last_seq;
+                    for chunk in chunks.into_iter().filter(|chunk| chunk.seq > prior_seq) {
+                        if raw_output_spool.is_some() && chunk.seq > last_seq.saturating_add(1) {
+                            let state = state_tx.borrow().clone();
+                            let _ = state_tx.send_replace(state.failed(
+                                "raw output stream has an unrecoverable sequence gap".to_string(),
+                            ));
+                            cancellation_token.cancel();
+                            break 'output_loop;
+                        }
+                        last_seq = chunk.seq;
                         let bytes = chunk.chunk.into_inner();
+                        if let Err(err) = append_raw_output(&raw_output_spool, &bytes) {
+                            let state = state_tx.borrow().clone();
+                            let _ = state_tx.send_replace(state.failed(err.to_string()));
+                            cancellation_token.cancel();
+                            break 'output_loop;
+                        }
                         let mut guard = output_buffer.lock().await;
                         guard.push_chunk(&bytes);
                         drop(guard);
@@ -560,6 +675,12 @@ impl UnifiedExecProcess {
                         }
                         last_seq = chunk.seq;
                         let bytes = chunk.chunk.into_inner();
+                        if let Err(err) = append_raw_output(&raw_output_spool, &bytes) {
+                            let state = state_tx.borrow().clone();
+                            let _ = state_tx.send_replace(state.failed(err.to_string()));
+                            cancellation_token.cancel();
+                            break;
+                        }
                         let mut guard = output_buffer.lock().await;
                         guard.push_chunk(&bytes);
                         drop(guard);
@@ -602,9 +723,11 @@ impl UnifiedExecProcess {
     }
 
     fn spawn_local_output_task(
-        mut receiver: tokio::sync::broadcast::Receiver<Vec<u8>>,
+        mut receiver: LocalOutputReceiver,
         output_handles: OutputHandles,
         output_tx: broadcast::Sender<Vec<u8>>,
+        state_tx: watch::Sender<ProcessState>,
+        raw_output_spool: Option<Arc<StdMutex<RawOutputSpool>>>,
     ) -> JoinHandle<()> {
         let OutputHandles {
             output_buffer,
@@ -619,16 +742,32 @@ impl UnifiedExecProcess {
                 output_closed_notify: Arc::clone(&output_closed_notify),
             };
             loop {
-                match receiver.recv().await {
-                    Ok(chunk) => {
+                let next = match &mut receiver {
+                    LocalOutputReceiver::Ordinary(receiver) => receiver.recv().await.map(Some),
+                    LocalOutputReceiver::Mavis(receiver) => Ok(receiver.recv().await),
+                };
+                match next {
+                    Ok(Some(chunk)) => {
+                        if let Err(err) = append_raw_output(&raw_output_spool, &chunk) {
+                            let state = state_tx.borrow().clone();
+                            let _ = state_tx.send_replace(state.failed(err.to_string()));
+                            break;
+                        }
                         let mut guard = output_buffer.lock().await;
                         guard.push_chunk(&chunk);
                         drop(guard);
                         let _ = output_tx.send(chunk);
                         output_notify.notify_waiters();
                     }
-                    Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => continue,
-                    Err(tokio::sync::broadcast::error::RecvError::Closed) => {
+                    Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {
+                        if raw_output_spool.is_some() {
+                            let state = state_tx.borrow().clone();
+                            let _ = state_tx
+                                .send_replace(state.failed("raw output stream lagged".to_string()));
+                            break;
+                        }
+                    }
+                    Ok(None) | Err(tokio::sync::broadcast::error::RecvError::Closed) => {
                         output_closed.store(true, Ordering::Release);
                         output_closed_notify.notify_waiters();
                         break;
@@ -648,5 +787,59 @@ impl UnifiedExecProcess {
 impl Drop for UnifiedExecProcess {
     fn drop(&mut self) {
         self.terminate();
+    }
+}
+
+#[cfg(test)]
+mod raw_output_tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn local_output_task_spools_full_stream_before_cap() {
+        let temp = tempfile::tempdir().unwrap();
+        let spool = Arc::new(StdMutex::new(
+            RawOutputSpool::open_in(temp.path().join("tool-output")).unwrap(),
+        ));
+        let output = OutputHandles::<UNIFIED_EXEC_OUTPUT_MAX_BYTES> {
+            output_buffer: Arc::new(Mutex::new(HeadTailBuffer::default())),
+            output_notify: Arc::new(Notify::new()),
+            output_closed: Arc::new(AtomicBool::new(false)),
+            output_closed_notify: Arc::new(Notify::new()),
+            cancellation_token: CancellationToken::new(),
+        };
+        let (source_tx, source_rx) = mpsc::channel(64);
+        let (forward_tx, _) = broadcast::channel(64);
+        let (state_tx, state_rx) = watch::channel(ProcessState::default());
+        let task = UnifiedExecProcess::spawn_local_output_task(
+            LocalOutputReceiver::Mavis(source_rx),
+            output.clone(),
+            forward_tx,
+            state_tx,
+            Some(Arc::clone(&spool)),
+        );
+        source_tx.send(vec![b'a'; 700_000]).await.unwrap();
+        source_tx
+            .send(b"\nFAILURE: buried diagnostic\n".to_vec())
+            .await
+            .unwrap();
+        source_tx.send(vec![b'z'; 700_000]).await.unwrap();
+        drop(source_tx);
+        task.await.unwrap();
+
+        assert!(state_rx.borrow().failure_message.is_none());
+        assert!(output.output_closed.load(Ordering::Acquire));
+        let reference = spool.lock().unwrap().reference(true).unwrap();
+        let raw = std::fs::read(reference.path).unwrap();
+        let needle = b"FAILURE: buried diagnostic";
+        assert!(raw.windows(needle.len()).any(|window| window == needle));
+        assert!(
+            !output
+                .output_buffer
+                .lock()
+                .await
+                .to_bytes()
+                .windows(needle.len())
+                .any(|window| window == needle)
+        );
     }
 }
