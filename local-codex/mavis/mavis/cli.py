@@ -111,11 +111,19 @@ def build_parser() -> argparse.ArgumentParser:
     index.add_argument("--project", type=Path, required=True)
     index_sub = index.add_subparsers(dest="index_command", required=True)
     index_sub.add_parser("refresh")
+    index_sub.add_parser("status")
     index_search = index_sub.add_parser("search")
     index_search.add_argument("query")
     index_search.add_argument("--limit", type=int, default=20)
+    index_search.add_argument("--offset", type=int, default=0)
     index_symbol = index_sub.add_parser("symbol")
     index_symbol.add_argument("name")
+    index_symbol.add_argument("--limit", type=int, default=20)
+    index_symbol.add_argument("--offset", type=int, default=0)
+    index_dependency = index_sub.add_parser("dependency")
+    index_dependency.add_argument("name")
+    index_dependency.add_argument("--limit", type=int, default=20)
+    index_dependency.add_argument("--offset", type=int, default=0)
 
     evaluate = subcommands.add_parser("eval")
     evaluate_sub = evaluate.add_subparsers(dest="eval_suite", required=True)
@@ -287,10 +295,14 @@ def main(argv: list[str] | None = None) -> int:
         index = ProjectIndex(args.project, home)
         if args.index_command == "refresh":
             print_json(index.refresh())
+        elif args.index_command == "status":
+            print_json(index.status())
         elif args.index_command == "search":
-            print_json(index.search(args.query, args.limit))
+            print_json(index.search(args.query, args.limit, args.offset))
+        elif args.index_command == "symbol":
+            print_json(index.symbol(args.name, args.limit, args.offset))
         else:
-            print_json(index.symbol(args.name))
+            print_json(index.dependency(args.name, args.limit, args.offset))
         return 0
     if args.command == "maintenance":
         queue = MaintenanceQueue(home)

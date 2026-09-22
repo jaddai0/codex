@@ -10,7 +10,7 @@ from pathlib import Path
 import re
 import sqlite3
 import subprocess
-from typing import Any, Iterable
+from typing import Any, Iterator
 
 
 TEXT_SUFFIXES = {
@@ -20,11 +20,15 @@ TEXT_SUFFIXES = {
 }
 MAX_INDEX_BYTES = 2 * 1024 * 1024
 SYMBOL_RE = re.compile(
-    r"^\s*(?:async\s+)?(?:def|class|fn|func|function|interface|struct|enum|protocol)\s+([A-Za-z_][A-Za-z0-9_]*)",
+    r"^\s*(?:(?:export\s+(?:default\s+)?)|(?:pub(?:\([^)]*\))?\s+))?"
+    r"(?:async\s+)?(?:def|class|fn|func|function|interface|struct|enum|protocol|trait)"
+    r"\s+([A-Za-z_][A-Za-z0-9_]*)",
     re.MULTILINE,
 )
 DEPENDENCY_RE = re.compile(
-    r"^\s*(?:from\s+([\w.]+)\s+import|import\s+([\w./@-]+)|use\s+([\w:]+)|require\(['\"]([^'\"]+))",
+    r"^\s*(?:import\b[^\n]*?\bfrom\s+['\"]([^'\"]+)|"
+    r"(?:import|export)\s+['\"]([^'\"]+)|from\s+([\w.]+)\s+import|"
+    r"import\s+([\w.]+)|use\s+([\w:]+)|[^\n]*?\brequire\(['\"]([^'\"]+))",
     re.MULTILINE,
 )
 
@@ -116,20 +120,47 @@ class ProjectIndex:
             return f"detached-{revision.stdout.strip()}"
         return name
 
+    def revision(self) -> str:
+        result = _git(self.project_root, "rev-parse", "HEAD")
+        if result.returncode != 0:
+            raise RuntimeError("project root has no readable Git revision")
+        return result.stdout.strip()
+
     def _candidate_paths(self) -> list[str]:
         result = _git(
             self.project_root,
-            "ls-files", "--cached", "--others", "--exclude-standard",
+            "ls-files", "-z", "--cached", "--others", "--exclude-standard",
         )
         if result.returncode != 0:
             raise RuntimeError(result.stderr.strip() or "git ls-files failed")
-        return sorted(
-            path for path in result.stdout.splitlines()
+        shared_relative = None
+        if self.shared_home.is_relative_to(self.project_root):
+            shared_relative = self.shared_home.relative_to(self.project_root).as_posix()
+        return sorted({
+            path for path in result.stdout.split("\0")
             if path and not path.startswith(".mavis/")
-        )
+            and (not shared_relative or path != shared_relative
+                 and not path.startswith(shared_relative + "/"))
+        })
+
+    def _read_live(self, relative: str) -> tuple[bytes, str] | None:
+        path = self.project_root / relative
+        try:
+            resolved = path.resolve(strict=True)
+            if (path.is_symlink() or not resolved.is_relative_to(self.project_root) or not path.is_file()
+                    or path.suffix.lower() not in TEXT_SUFFIXES
+                    or path.stat().st_size > MAX_INDEX_BYTES):
+                return None
+            raw = path.read_bytes()
+            if len(raw) > MAX_INDEX_BYTES:
+                return None
+            return raw, raw.decode("utf-8", errors="replace")
+        except (OSError, RuntimeError):
+            return None
 
     def refresh(self) -> dict[str, Any]:
         branch = self.branch()
+        head = self.revision()
         connection = self._connect()
         started = _now()
         job = connection.execute(
@@ -140,9 +171,17 @@ class ProjectIndex:
         changed = unchanged = skipped = 0
         seen: set[str] = set()
         try:
+            previous = {
+                row["path"]: row["sha256"] for row in connection.execute(
+                    "SELECT path,sha256 FROM files WHERE branch=?", (branch,)
+                )
+            }
+            current_hashes: dict[str, str] = {}
             for relative in self._candidate_paths():
                 path = self.project_root / relative
-                if path.is_symlink() or not path.is_file() or path.suffix.lower() not in TEXT_SUFFIXES:
+                if (path.is_symlink() or not path.is_file()
+                        or not path.resolve(strict=True).is_relative_to(self.project_root)
+                        or path.suffix.lower() not in TEXT_SUFFIXES):
                     skipped += 1
                     continue
                 size = path.stat().st_size
@@ -152,6 +191,7 @@ class ProjectIndex:
                 raw = path.read_bytes()
                 digest = _digest(raw)
                 seen.add(relative)
+                current_hashes[relative] = digest
                 row = connection.execute(
                     "SELECT sha256 FROM files WHERE branch=? AND path=?",
                     (branch, relative),
@@ -174,16 +214,19 @@ class ProjectIndex:
                     (branch, relative, digest, size, content, json.dumps(symbols), json.dumps(dependencies), _now()),
                 )
                 changed += 1
-            existing = {
-                row["path"] for row in connection.execute(
-                    "SELECT path FROM files WHERE branch=?", (branch,)
-                )
-            }
-            deleted = sorted(existing - seen)
+            deleted = sorted(previous.keys() - seen)
+            added_by_hash = {digest: path for path, digest in current_hashes.items()
+                             if path not in previous}
+            renamed = sorted(
+                ({"from": path, "to": added_by_hash[previous[path]]}
+                 for path in deleted if previous[path] in added_by_hash),
+                key=lambda item: (item["from"], item["to"]),
+            )
             for relative in deleted:
                 connection.execute("DELETE FROM files WHERE branch=? AND path=?", (branch, relative))
             detail = json.dumps(
-                {"changed": changed, "unchanged": unchanged, "deleted": deleted, "skipped": skipped},
+                {"head": head, "changed": changed, "unchanged": unchanged,
+                 "deleted": deleted, "renamed": renamed, "skipped": skipped},
                 sort_keys=True,
             )
             connection.execute(
@@ -191,7 +234,9 @@ class ProjectIndex:
                 (_now(), detail, job),
             )
             connection.commit()
-            return {"branch": branch, "changed": changed, "unchanged": unchanged, "deleted": deleted, "skipped": skipped}
+            return {"branch": branch, "head": head, "changed": changed,
+                    "unchanged": unchanged, "deleted": deleted,
+                    "renamed": renamed, "skipped": skipped}
         except Exception as exc:
             connection.rollback()
             connection.execute(
@@ -206,17 +251,48 @@ class ProjectIndex:
     def changed_paths(self) -> list[str]:
         result = _git(self.project_root, "status", "--porcelain=v1", "-z")
         if result.returncode != 0:
-            return []
-        paths: list[str] = []
-        for entry in result.stdout.split("\0"):
+            raise RuntimeError(result.stderr.strip() or "git status failed")
+        entries = result.stdout.split("\0")
+        paths: set[str] = set()
+        position = 0
+        while position < len(entries):
+            entry = entries[position]
+            position += 1
             if len(entry) < 4:
                 continue
-            value = entry[3:]
-            if " -> " in value:
-                value = value.split(" -> ", 1)[1]
-            if value and not value.startswith(".mavis/"):
-                paths.append(value)
-        return sorted(set(paths))
+            status, relative = entry[:2], entry[3:]
+            if relative and not relative.startswith(".mavis/"):
+                paths.add(relative)
+            if "R" in status or "C" in status:
+                if position < len(entries):
+                    prior = entries[position]
+                    position += 1
+                    if prior and not prior.startswith(".mavis/"):
+                        paths.add(prior)
+        return sorted(paths)
+
+    def status(self) -> dict[str, Any]:
+        branch = self.branch()
+        head = self.revision()
+        connection = self._connect()
+        try:
+            latest = connection.execute(
+                "SELECT job_id,started_at,finished_at,status,detail FROM jobs "
+                "WHERE branch=? ORDER BY job_id DESC LIMIT 1", (branch,),
+            ).fetchone()
+            if latest is None:
+                return {"branch": branch, "head": head, "snapshot_current": False,
+                        "latest_job": None}
+            job = dict(latest)
+            try:
+                indexed_head = json.loads(job["detail"]).get("head")
+            except (ValueError, TypeError, AttributeError):
+                indexed_head = None
+            return {"branch": branch, "head": head,
+                    "snapshot_current": job["status"] == "complete" and indexed_head == head,
+                    "latest_job": job}
+        finally:
+            connection.close()
 
     @staticmethod
     def _line_hits(content: str, query: str, path: str, scope: str, source: str) -> list[SearchHit]:
@@ -228,52 +304,128 @@ class ProjectIndex:
                 hits.append(SearchHit(scope, path, number, line[:1000], 100 if exact else 50, source))
         return hits
 
-    def search(self, query: str, limit: int = 20) -> list[dict[str, Any]]:
+    @staticmethod
+    def _page(limit: int, offset: int) -> None:
+        if not 1 <= limit <= 200 or offset < 0:
+            raise ValueError("limit must be 1..200 and offset must be nonnegative")
+
+    def _project_documents(self) -> Iterator[tuple[str, str, str]]:
+        """Yield current files; a stale or failed snapshot never supplies answers."""
+        branch = self.branch()
+        head = self.revision()
+        candidates = set(self._candidate_paths())
+        connection = self._connect()
+        try:
+            latest = connection.execute(
+                "SELECT status,detail FROM jobs WHERE branch=? ORDER BY job_id DESC LIMIT 1",
+                (branch,),
+            ).fetchone()
+            try:
+                indexed_head = json.loads(latest["detail"]).get("head") if latest else None
+            except (ValueError, TypeError):
+                indexed_head = None
+            if not latest or latest["status"] != "complete" or indexed_head != head:
+                rows: dict[str, sqlite3.Row] = {}
+                fallback = True
+            else:
+                rows = {row["path"]: row for row in connection.execute(
+                    "SELECT path,sha256,content FROM files WHERE branch=?", (branch,)
+                )}
+                fallback = False
+        finally:
+            connection.close()
+
+        changed = set(self.changed_paths())
+        for relative in sorted(candidates):
+            live = self._read_live(relative)
+            if live is None:
+                continue
+            raw, content = live
+            row = rows.get(relative)
+            if relative in changed:
+                source = "changed-file"
+            elif fallback or row is None or row["sha256"] != _digest(raw):
+                source = "live-fallback"
+            else:
+                source = "index"
+                content = row["content"]
+            yield relative, content, source
+
+    def _verified_global_hits(self, query: str) -> list[SearchHit]:
+        directory = self.shared_home / "knowledge"
+        if not directory.is_dir():
+            return []
+        hits: list[SearchHit] = []
+        for path in sorted(directory.glob("*.json")):
+            if path.is_symlink():
+                continue
+            try:
+                record = json.loads(path.read_text(encoding="utf-8"))
+                if (record.get("schema_version") != "mavis.memory-record/v1"
+                        or record.get("scope") != "global-coding"
+                        or record.get("verification_state") != "verified"):
+                    continue
+                references = record.get("source_references")
+                if not isinstance(references, list) or not references:
+                    continue
+                if any(
+                    not isinstance(item, dict)
+                    or not isinstance(item.get("path"), str)
+                    or not isinstance(item.get("sha256"), str)
+                    or not Path(item["path"]).is_file()
+                    or _digest(Path(item["path"]).read_bytes()) != item["sha256"]
+                    for item in references
+                ):
+                    continue
+                claim = record.get("claim")
+                if isinstance(claim, str):
+                    hits.extend(self._line_hits(claim, query, str(path), "global-coding", "verified-global"))
+            except (OSError, ValueError, TypeError):
+                continue
+        return hits
+
+    def search(self, query: str, limit: int = 20, offset: int = 0) -> list[dict[str, Any]]:
         if not query.strip():
             raise ValueError("query must not be empty")
-        branch = self.branch()
+        self._page(limit, offset)
         hits: list[SearchHit] = []
-        changed = set(self.changed_paths())
-        for relative in changed:
-            path = self.project_root / relative
-            if not path.is_symlink() and path.is_file() and path.stat().st_size <= MAX_INDEX_BYTES:
-                hits.extend(self._line_hits(path.read_text(errors="replace"), query, relative, "project", "changed-file"))
-        connection = self._connect()
-        try:
-            rows = connection.execute(
-                "SELECT path,content,symbols,dependencies FROM files WHERE branch=? AND lower(content) LIKE ?",
-                (branch, f"%{query.casefold()}%"),
-            )
-            for row in rows:
-                if row["path"] in changed:
-                    continue
-                hits.extend(self._line_hits(row["content"], query, row["path"], "project", "index"))
-        finally:
-            connection.close()
-        dedup: dict[tuple[str, int, str], SearchHit] = {}
+        for relative, content, source in self._project_documents():
+            hits.extend(self._line_hits(content, query, relative, "project", source))
+        dedup: dict[tuple[str, str, int, str], SearchHit] = {}
         for hit in hits:
-            key = (hit.path, hit.line, hit.text)
+            key = (hit.scope, hit.path, hit.line, hit.text)
             if key not in dedup or hit.score > dedup[key].score:
                 dedup[key] = hit
-        ranked = sorted(dedup.values(), key=lambda item: (-item.score, item.path, item.line))
-        return [item.as_dict() for item in ranked[:limit]]
+        project_ranked = sorted(dedup.values(), key=lambda item: (-item.score, item.path, item.line))
+        global_ranked = sorted(self._verified_global_hits(query),
+                               key=lambda item: (-item.score, item.path, item.line))
+        return [item.as_dict() for item in (project_ranked + global_ranked)[offset:offset + limit]]
 
-    def symbol(self, name: str) -> list[dict[str, Any]]:
-        connection = self._connect()
-        try:
-            rows = connection.execute(
-                "SELECT path,symbols,dependencies FROM files WHERE branch=?",
-                (self.branch(),),
-            )
-            results = []
-            for row in rows:
-                symbols = json.loads(row["symbols"])
-                dependencies = json.loads(row["dependencies"])
-                if name in symbols or name in dependencies:
-                    results.append({"path": row["path"], "defines": name in symbols, "depends_on": name in dependencies})
-            return results
-        finally:
-            connection.close()
+    def symbol(self, name: str, limit: int = 20, offset: int = 0) -> list[dict[str, Any]]:
+        self._page(limit, offset)
+        results = []
+        for path, content, source in self._project_documents():
+            definitions = [match for match in SYMBOL_RE.finditer(content) if match.group(1) == name]
+            dependencies = [match for match in DEPENDENCY_RE.finditer(content)
+                            if name in (item for item in match.groups() if item)]
+            if definitions or dependencies:
+                match = (definitions or dependencies)[0]
+                results.append({"path": path, "line": content.count("\n", 0, match.start()) + 1,
+                                "defines": bool(definitions), "depends_on": bool(dependencies),
+                                "source": source})
+        return results[offset:offset + limit]
+
+    def dependency(self, name: str, limit: int = 20, offset: int = 0) -> list[dict[str, Any]]:
+        self._page(limit, offset)
+        results = []
+        for path, content, source in self._project_documents():
+            for match in DEPENDENCY_RE.finditer(content):
+                dependency = next((item for item in match.groups() if item), None)
+                if dependency == name:
+                    results.append({"path": path,
+                                    "line": content.count("\n", 0, match.start()) + 1,
+                                    "dependency": dependency, "source": source})
+        return results[offset:offset + limit]
 
     def bind_embedding_version(self, scope: str, model: str, version: str, dimensions: int) -> None:
         connection = self._connect()
