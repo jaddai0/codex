@@ -51,4 +51,7 @@ python3 "$share_dir/prepare_runtime.py" \
   "${model_args[@]}" >/dev/null
 
 export CODEX_HOME="$runtime_home"
+export MAVIS_HOME=${MAVIS_HOME:-${HOME}/.local-codex/mavis-service}
+export MAVIS_PRECOMPACT_REQUIRED=1
+export PYTHONPATH="${share_dir}${PYTHONPATH:+:${PYTHONPATH}}"
 exec "$core_binary" "$@"

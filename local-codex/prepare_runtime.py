@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import os
 from pathlib import Path
@@ -16,6 +17,29 @@ from urllib.request import Request, urlopen
 
 ALLOWED_HOSTS = {"127.0.0.1", "localhost", "::1"}
 SUPPORTED_MODEL_TYPES = {"llm", "vlm"}
+MAVIS_ARCHIVE_COMMAND = "python3 -m mavis pre-compact"
+MAVIS_ARCHIVE_STATUS = "Mavis transcript archive v1"
+
+
+def mavis_archive_hook_hash() -> str:
+    # Mirrors Codex's normalized TOML hook identity: absent fields are omitted,
+    # and the command timeout defaults to 600 seconds.
+    identity = {
+        "event_name": "pre_compact",
+        "hooks": [
+            {
+                "type": "command",
+                "command": MAVIS_ARCHIVE_COMMAND,
+                "timeout": 600,
+                "async": False,
+                "statusMessage": MAVIS_ARCHIVE_STATUS,
+            }
+        ],
+    }
+    canonical = json.dumps(identity, sort_keys=True, separators=(",", ":")).encode(
+        "utf-8"
+    )
+    return "sha256:" + hashlib.sha256(canonical).hexdigest()
 
 
 def local_base_url(raw: str) -> str:
@@ -208,6 +232,8 @@ def write_profile(
     home: Path, base_url: str, selected: str, gateway_root: Path | None = None
 ) -> None:
     catalog_path = home / "omlx-models.json"
+    hook_key = f"{(home / 'config.toml').resolve()}:pre_compact:0:0"
+    hook_hash = mavis_archive_hook_hash()
     profile = f"""model = {json.dumps(selected)}
 model_provider = "omlx"
 model_catalog_json = {json.dumps(str(catalog_path))}
@@ -233,6 +259,16 @@ shell_snapshot = true
 tool_suggest = false
 unified_exec = true
 
+[[hooks.PreCompact]]
+
+[[hooks.PreCompact.hooks]]
+type = "command"
+command = {json.dumps(MAVIS_ARCHIVE_COMMAND)}
+statusMessage = {json.dumps(MAVIS_ARCHIVE_STATUS)}
+
+[hooks.state.{json.dumps(hook_key)}]
+trusted_hash = {json.dumps(hook_hash)}
+
 [model_providers.omlx]
 name = "Local oMLX"
 base_url = {json.dumps(base_url)}
@@ -244,7 +280,9 @@ supports_standalone_web_search = false
     if gateway_root is not None:
         gateway_script = gateway_root.resolve() / "bin" / "mcp-server.sh"
         if not gateway_script.is_file() or not os.access(gateway_script, os.X_OK):
-            raise FileNotFoundError(f"trusted Mavis gateway launcher is unavailable: {gateway_script}")
+            raise FileNotFoundError(
+                f"trusted Mavis gateway launcher is unavailable: {gateway_script}"
+            )
         profile += (
             "\n[mcp_servers.model-gateway]\n"
             f"command = {json.dumps(str(gateway_script))}\n"
@@ -273,7 +311,9 @@ supports_standalone_web_search = false
             if offsets:
                 suffix = current[min(offsets) :].lstrip("\n")
     if gateway_root is not None and "[mcp_servers.model-gateway]" in suffix:
-        raise ValueError("existing Mavis gateway registration needs review before replacement")
+        raise ValueError(
+            "existing Mavis gateway registration needs review before replacement"
+        )
     managed = f"{start_marker}\n{profile}{end_marker}\n"
     if suffix:
         managed += f"\n{suffix}"
