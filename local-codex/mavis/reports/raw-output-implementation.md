@@ -33,3 +33,7 @@ For native local PTY output, the Mavis path replaces the intermediate lossy broa
 - Exec-server retains only a bounded replay window. The new failure checks prevent a known gap from being labeled complete, but a large burst can fail capture there. A future exec-server transport spool or backpressured stream is needed for a full guarantee on remote or exec-server-backed sessions.
 - This stores raw output files and supplies stable transcript references. Mavis evidence ingestion can resolve the paths later; this slice does not index or prune them. These files may contain sensitive command output, so retention policy remains a separate requirement.
 - Sandbox-denial conversion and spawn-time errors may return an error before a normal `ExecCommandToolOutput` reference is emitted. The raw file remains, but transcript linkage for those error paths is not covered by this slice.
+
+## Closeout status
+
+`work-closeout check /tmp/mavis-raw-output-ledger.json --stage closeout` returned `FAIL`: this slice is **partial** against universal exec-server capture because that transport retains only 1 MiB of replay. The local Mavis PTY path and transcript reference are verified. Existing `unified_exec_persists_across_requests` and `unified_exec_uses_remote_exec_server_when_configured` tests each passed after the change; these prove compatibility, not lossless remote burst capture.
