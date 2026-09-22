@@ -106,7 +106,7 @@ pub(super) async fn remote_process(
         mavis_raw_output_active: false,
     };
 
-    UnifiedExecProcess::from_exec_server_started(started)
+    UnifiedExecProcess::from_exec_server_started(started, None)
         .await
         .expect("remote process should start")
 }

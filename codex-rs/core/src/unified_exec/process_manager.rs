@@ -1332,6 +1332,9 @@ impl UnifiedExecProcessManager {
         environment: &codex_exec_server::Environment,
     ) -> Result<UnifiedExecProcess, UnifiedExecError> {
         let inherited_fds = spawn_lifecycle.inherited_fds();
+        // Open capture storage before either local or remote process can run.
+        let raw_output_spool = super::raw_output_spool::RawOutputSpool::maybe_open()
+            .map_err(|err| UnifiedExecError::create_process(format!("raw output spool: {err}")))?;
 
         if environment.is_remote() || request.exec_server_shell_snapshot.is_some() {
             if !inherited_fds.is_empty() {
@@ -1367,7 +1370,7 @@ impl UnifiedExecProcessManager {
             }
             .map_err(|err| UnifiedExecError::create_process(err.to_string()))?;
             spawn_lifecycle.after_spawn();
-            return UnifiedExecProcess::from_exec_server_started(started).await;
+            return UnifiedExecProcess::from_exec_server_started(started, raw_output_spool).await;
         }
 
         // TODO(anp): Keep PathUri through the local PTY/process launch boundary.
@@ -1439,7 +1442,13 @@ impl UnifiedExecProcessManager {
         spawn_lifecycle.after_spawn();
         let spawned =
             spawn_result.map_err(|err| UnifiedExecError::create_process(err.to_string()))?;
-        UnifiedExecProcess::from_spawned(spawned, request.sandbox, spawn_lifecycle).await
+        UnifiedExecProcess::from_spawned(
+            spawned,
+            request.sandbox,
+            spawn_lifecycle,
+            raw_output_spool,
+        )
+        .await
     }
 
     #[tracing::instrument(

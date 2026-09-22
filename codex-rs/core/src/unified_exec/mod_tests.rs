@@ -40,6 +40,38 @@ async fn test_session_and_turn() -> (Arc<Session>, Arc<TurnContext>) {
     (Arc::new(session), Arc::new(turn))
 }
 
+#[tokio::test]
+#[serial_test::serial]
+async fn mavis_spool_failure_prevents_command_launch() {
+    let temp = tempfile::tempdir().unwrap();
+    let marker = temp.path().join("command-ran");
+    let prior_required = std::env::var_os("MAVIS_RAW_OUTPUT_REQUIRED");
+    let prior_home = std::env::var_os("MAVIS_HOME");
+    unsafe {
+        std::env::set_var("MAVIS_RAW_OUTPUT_REQUIRED", "1");
+        std::env::set_var("MAVIS_HOME", "relative-mavis-home");
+    }
+    let (session, turn) = test_session_and_turn().await;
+    let result = exec_command(
+        &session,
+        &turn,
+        &format!("touch {}", marker.display()),
+        1_000,
+        None,
+    )
+    .await;
+    match prior_required {
+        Some(value) => unsafe { std::env::set_var("MAVIS_RAW_OUTPUT_REQUIRED", value) },
+        None => unsafe { std::env::remove_var("MAVIS_RAW_OUTPUT_REQUIRED") },
+    }
+    match prior_home {
+        Some(value) => unsafe { std::env::set_var("MAVIS_HOME", value) },
+        None => unsafe { std::env::remove_var("MAVIS_HOME") },
+    }
+    assert!(result.is_err());
+    assert!(!marker.exists());
+}
+
 async fn exec_command(
     session: &Arc<Session>,
     turn: &Arc<TurnContext>,
@@ -305,16 +337,19 @@ async fn blocking_terminate_unified_process(
 ) -> anyhow::Result<Arc<UnifiedExecProcess>> {
     let (wake_tx, _wake_rx) = watch::channel(0);
     Ok(Arc::new(
-        UnifiedExecProcess::from_exec_server_started(StartedExecProcess {
-            process: Arc::new(BlockingTerminateExecProcess {
-                process_id: process_id.to_string().into(),
-                terminate_started,
-                allow_terminate,
-                wake_tx,
-            }),
-            sandbox_type: Some(codex_sandboxing::SandboxType::None),
-            mavis_raw_output_active: false,
-        })
+        UnifiedExecProcess::from_exec_server_started(
+            StartedExecProcess {
+                process: Arc::new(BlockingTerminateExecProcess {
+                    process_id: process_id.to_string().into(),
+                    terminate_started,
+                    allow_terminate,
+                    wake_tx,
+                }),
+                sandbox_type: Some(codex_sandboxing::SandboxType::None),
+                mavis_raw_output_active: false,
+            },
+            None,
+        )
         .await?,
     ))
 }

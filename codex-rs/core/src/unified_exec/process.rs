@@ -55,6 +55,29 @@ fn append_raw_output(
     spool.append(chunk)
 }
 
+fn replay_has_unrecoverable_output_gap(
+    last_seq: u64,
+    chunk_sequences: impl IntoIterator<Item = u64>,
+    next_seq: u64,
+    unseen_exit: bool,
+    unseen_close: bool,
+) -> bool {
+    let mut expected = last_seq.saturating_add(1);
+    let mut missing = 0_u64;
+    for seq in chunk_sequences {
+        if seq >= expected {
+            missing = missing.saturating_add(seq - expected);
+            expected = seq.saturating_add(1);
+        }
+    }
+    // The executor's next_seq includes terminal events, which never carry
+    // output. An exit can precede a final output chunk, so count gaps across
+    // the whole replay rather than requiring adjacent chunk sequences.
+    missing = missing.saturating_add(next_seq.saturating_sub(expected));
+    let terminal_events = u64::from(unseen_exit) + u64::from(unseen_close);
+    missing > terminal_events
+}
+
 enum LocalOutputReceiver {
     Ordinary(broadcast::Receiver<Vec<u8>>),
     Mavis(mpsc::Receiver<Vec<u8>>),
@@ -167,10 +190,9 @@ impl UnifiedExecProcess {
         process_handle: ProcessHandle,
         sandbox_type: SandboxType,
         spawn_lifecycle: Option<SpawnLifecycleHandle>,
-    ) -> Result<Self, UnifiedExecError> {
-        let raw_output_spool = RawOutputSpool::maybe_open()
-            .map_err(|err| UnifiedExecError::create_process(format!("raw output spool: {err}")))?
-            .map(|spool| Arc::new(StdMutex::new(spool)));
+        raw_output_spool: Option<RawOutputSpool>,
+    ) -> Self {
+        let raw_output_spool = raw_output_spool.map(|spool| Arc::new(StdMutex::new(spool)));
         let output = OutputHandles {
             output_buffer: Arc::new(Mutex::new(HeadTailBuffer::default())),
             output_notify: Arc::new(Notify::new()),
@@ -182,7 +204,7 @@ impl UnifiedExecProcess {
         let (output_tx, _) = broadcast::channel(64);
         let (state_tx, state_rx) = watch::channel(ProcessState::default());
 
-        Ok(Self {
+        Self {
             process_handle,
             output_tx,
             output,
@@ -196,7 +218,7 @@ impl UnifiedExecProcess {
             timed_out: AtomicBool::new(false),
             _spawn_lifecycle: spawn_lifecycle,
             _shell_snapshot: None,
-        })
+        }
     }
 
     pub(super) fn raw_output_reference(
@@ -412,6 +434,7 @@ impl UnifiedExecProcess {
         spawned: SpawnedPty,
         sandbox_type: SandboxType,
         spawn_lifecycle: SpawnLifecycleHandle,
+        raw_output_spool: Option<RawOutputSpool>,
     ) -> Result<Self, UnifiedExecError> {
         let SpawnedPty {
             session: process_handle,
@@ -423,7 +446,8 @@ impl UnifiedExecProcess {
             ProcessHandle::Local(Box::new(process_handle)),
             sandbox_type,
             Some(spawn_lifecycle),
-        )?;
+            raw_output_spool,
+        );
         let output_rx = if managed.raw_output_spool.is_some() {
             LocalOutputReceiver::Mavis(combine_mavis_output_receivers(stdout_rx, stderr_rx))
         } else {
@@ -475,6 +499,7 @@ impl UnifiedExecProcess {
 
     pub(super) async fn from_exec_server_started(
         started: StartedExecProcess,
+        raw_output_spool: Option<RawOutputSpool>,
     ) -> Result<Self, UnifiedExecError> {
         let mavis_required = std::env::var("MAVIS_RAW_OUTPUT_REQUIRED").as_deref() == Ok("1");
         ensure_mavis_exec_server_output_spool(&started, mavis_required).await?;
@@ -482,7 +507,12 @@ impl UnifiedExecProcess {
         // Older peers do not report this field. In that case, skip local
         // classification rather than attributing a violation to a guessed backend.
         let sandbox_type = started.sandbox_type.unwrap_or(SandboxType::None);
-        let mut managed = Self::new(process_handle, sandbox_type, /*spawn_lifecycle*/ None)?;
+        let mut managed = Self::new(
+            process_handle,
+            sandbox_type,
+            /*spawn_lifecycle*/ None,
+            raw_output_spool,
+        );
         let output_handles = managed.output_handles().clone();
         managed.output_task = Some(Self::spawn_exec_server_output_task(
             started,
@@ -606,8 +636,13 @@ impl UnifiedExecProcess {
                         sandbox_denied,
                     } = response;
                     if raw_output_spool.is_some()
-                        && chunks.is_empty()
-                        && matches!(event.as_ref(), Some(ExecProcessEvent::Output(chunk)) if chunk.seq > last_seq.saturating_add(1))
+                        && replay_has_unrecoverable_output_gap(
+                            last_seq,
+                            chunks.iter().map(|chunk| chunk.seq),
+                            next_seq,
+                            exited && !state_tx.borrow().has_exited,
+                            closed && !output_closed.load(Ordering::Acquire),
+                        )
                     {
                         let state = state_tx.borrow().clone();
                         let _ = state_tx.send_replace(state.failed(
@@ -618,14 +653,6 @@ impl UnifiedExecProcess {
                     }
                     let prior_seq = last_seq;
                     for chunk in chunks.into_iter().filter(|chunk| chunk.seq > prior_seq) {
-                        if raw_output_spool.is_some() && chunk.seq > last_seq.saturating_add(1) {
-                            let state = state_tx.borrow().clone();
-                            let _ = state_tx.send_replace(state.failed(
-                                "raw output stream has an unrecoverable sequence gap".to_string(),
-                            ));
-                            cancellation_token.cancel();
-                            break 'output_loop;
-                        }
                         last_seq = chunk.seq;
                         let bytes = chunk.chunk.into_inner();
                         if let Err(err) = append_raw_output(&raw_output_spool, &bytes) {
@@ -808,6 +835,18 @@ impl Drop for UnifiedExecProcess {
 #[cfg(test)]
 mod raw_output_tests {
     use super::*;
+
+    #[test]
+    fn terminal_only_replay_cannot_hide_evicted_output() {
+        // Output seq 1 was evicted; only Exited seq 2 and Closed seq 3 remain.
+        assert!(replay_has_unrecoverable_output_gap(0, [], 4, true, true));
+        // A contiguous output followed by two terminal events is complete.
+        assert!(!replay_has_unrecoverable_output_gap(0, [1], 4, true, true));
+        // Exit seq 1 may arrive before the final output chunk seq 2.
+        assert!(!replay_has_unrecoverable_output_gap(0, [2], 3, true, false));
+        // If Exited was already observed, it cannot excuse a later missing chunk.
+        assert!(replay_has_unrecoverable_output_gap(2, [], 5, false, true));
+    }
 
     #[tokio::test]
     async fn local_output_task_spools_full_stream_before_cap() {
