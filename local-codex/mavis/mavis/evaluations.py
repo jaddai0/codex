@@ -102,6 +102,7 @@ class E0Evaluator:
             "small-repository": lambda: self._small_repository("small-repository"),
             "dirty-work-preservation": lambda: self._small_repository("dirty-work-preservation"),
             "seeded-failure-repair": lambda: self._small_repository("seeded-failure-repair"),
+            "external-harness": self._external_harness,
             "fabricated-success-rejection": self._fabricated_success,
             "buried-failure": self._buried_failure,
             "compaction-restart": self._compaction_restart,
@@ -181,6 +182,28 @@ class E0Evaluator:
                 f"Separate native Terra review accepted; logs sha256 {sha256_file(mavis_log)} and {sha256_file(terra_log)}",
             ], manifest=str(manifest_path), review=str(terra_result))
         return self._receipt(case, "blocked", ["No complete installed Mavis repair and independent Terra review found"])
+
+    def _external_harness(self) -> dict[str, Any]:
+        """Revalidate a native gateway worker and distinct Terra closure."""
+        store = ObjectiveStore(self.home)
+        paths = sorted(
+            store.root.glob("e0-gateway-bound-*.json"),
+            key=lambda path: path.stat().st_mtime,
+            reverse=True,
+        )
+        for path in paths:
+            record = json.loads(path.read_text())
+            if record.get("state") != "accepted":
+                continue
+            store._assert_acceptance(record)
+            retained = record["gateway_verifications"][-1]
+            gateway_receipt = json.loads(Path(retained["path"]).read_text())
+            status = gateway_receipt["gateway_status"]
+            return self._receipt("external-harness", "pass", [
+                f"Native worker {status['job_id']} completed with host receipt and an accepted separate Terra job {status['acceptance']['verifier_job_id']}",
+                f"Mavis objective {record['objective_id']} revalidated against the live configured gateway and exact host evidence",
+            ], objective_id=record["objective_id"], gateway_receipt=retained["path"])
+        return self._receipt("external-harness", "blocked", ["No accepted native gateway worker bound to a Mavis objective was found"])
 
     def run(self, case: str | None = None) -> dict[str, Any]:
         if case is not None:
