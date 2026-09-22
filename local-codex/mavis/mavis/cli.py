@@ -5,6 +5,7 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import sys
 from pathlib import Path
 
 from .evidence import run_command
@@ -12,16 +13,22 @@ from .evaluations import E0_CASES, E0Evaluator
 from .maintenance import MaintenanceQueue
 from .objectives import ObjectiveStore
 from .retrieval import ProjectIndex
-from .runtime import RuntimeConfig, admission, ensure_runtime, endpoint_alive, inventory, owns_running_server, stop_server
+from .runtime import (
+    RuntimeConfig,
+    admission,
+    ensure_runtime,
+    endpoint_alive,
+    inventory,
+    owns_running_server,
+    stop_server,
+)
 from .storage import read_json
 from .transcripts import TranscriptArchive
 
 
 def home_from_env() -> Path:
     return Path(
-        os.environ.get(
-            "MAVIS_HOME", Path.home() / ".local-codex" / "mavis-service"
-        )
+        os.environ.get("MAVIS_HOME", Path.home() / ".local-codex" / "mavis-service")
     ).expanduser()
 
 
@@ -49,9 +56,13 @@ def build_parser() -> argparse.ArgumentParser:
         command = runtime_sub.add_parser(name)
         command.add_argument("--endpoint", default="http://127.0.0.1:8001/v1")
         command.add_argument("--iris-endpoint", default="http://127.0.0.1:8000/v1")
-        command.add_argument("--model", default="Qwen3.8-Flash-Next-Abliterated-MLX-4bit")
+        command.add_argument(
+            "--model", default="Qwen3.8-Flash-Next-Abliterated-MLX-4bit"
+        )
         command.add_argument("--model-dir", default="/Users/dustinpainter/models/vlms")
-        command.add_argument("--omlx-binary", default="/Users/dustinpainter/.venvs/omlx-dev/bin/omlx")
+        command.add_argument(
+            "--omlx-binary", default="/Users/dustinpainter/.venvs/omlx-dev/bin/omlx"
+        )
         if name == "ensure":
             command.add_argument("--no-load", action="store_true")
 
@@ -87,6 +98,8 @@ def build_parser() -> argparse.ArgumentParser:
     search.add_argument("query")
     search.add_argument("--limit", type=int, default=20)
 
+    subcommands.add_parser("pre-compact")
+
     index = subcommands.add_parser("project-index")
     index.add_argument("--project", type=Path, required=True)
     index_sub = index.add_subparsers(dest="index_command", required=True)
@@ -105,12 +118,18 @@ def build_parser() -> argparse.ArgumentParser:
     e0.add_argument("--iris-endpoint", default="http://127.0.0.1:8000/v1")
     e0.add_argument("--model", default="Qwen3.8-Flash-Next-Abliterated-MLX-4bit")
     e0.add_argument("--model-dir", default="/Users/dustinpainter/models/vlms")
-    e0.add_argument("--omlx-binary", default="/Users/dustinpainter/.venvs/omlx-dev/bin/omlx")
+    e0.add_argument(
+        "--omlx-binary", default="/Users/dustinpainter/.venvs/omlx-dev/bin/omlx"
+    )
 
     maintenance = subcommands.add_parser("maintenance")
-    maintenance_sub = maintenance.add_subparsers(dest="maintenance_command", required=True)
+    maintenance_sub = maintenance.add_subparsers(
+        dest="maintenance_command", required=True
+    )
     enqueue = maintenance_sub.add_parser("enqueue")
-    enqueue.add_argument("interval", choices=("immediate", "daily", "weekly", "monthly"))
+    enqueue.add_argument(
+        "interval", choices=("immediate", "daily", "weekly", "monthly")
+    )
     enqueue.add_argument("kind")
     enqueue.add_argument("--payload", default="{}")
     maintenance_list = maintenance_sub.add_parser("list")
@@ -121,12 +140,70 @@ def build_parser() -> argparse.ArgumentParser:
 def main(argv: list[str] | None = None) -> int:
     args = build_parser().parse_args(argv)
     home = home_from_env()
+    if args.command == "pre-compact":
+        payload = json.load(sys.stdin)
+        if (
+            not isinstance(payload, dict)
+            or payload.get("hook_event_name") != "PreCompact"
+        ):
+            raise ValueError("expected PreCompact hook input")
+        session_id = payload.get("session_id")
+        path = payload.get("transcript_path")
+        codex_home = os.environ.get("CODEX_HOME")
+        if (
+            not isinstance(session_id, str)
+            or not isinstance(path, str)
+            or not codex_home
+        ):
+            raise ValueError(
+                "PreCompact needs session_id, transcript_path, and CODEX_HOME"
+            )
+        source = Path(path).resolve(strict=True)
+        if not source.is_relative_to(Path(codex_home).resolve(strict=True)):
+            raise ValueError("transcript path is outside the Mavis Codex home")
+        with source.open("r", encoding="utf-8") as handle:
+            first = json.loads(handle.readline())
+        if (
+            first.get("type") != "session_meta"
+            or first.get("payload", {}).get("id") != session_id
+        ):
+            raise ValueError("transcript session ID does not match hook input")
+        archive = TranscriptArchive(home, session_id)
+        segment = archive.import_rollout(source)
+        archive.write_handoff(
+            {
+                "goals": [],
+                "accepted_decisions": [],
+                "completed_requirements": [],
+                "current_changes": [],
+                "recent_work": [
+                    {
+                        "turn_id": payload.get("turn_id"),
+                        "trigger": payload.get("trigger"),
+                    }
+                ],
+                "unresolved_failures": [
+                    "Objective state has not been added to this handoff; consult the archived transcript."
+                ],
+                "evidence_links": [str(segment or archive.manifest_path)],
+            }
+        )
+        print_json({"continue": True})
+        return 0
     if args.command == "runtime":
         config = runtime_config(args)
         if args.runtime_command == "ensure":
             print_json(ensure_runtime(config, load=not args.no_load))
         elif args.runtime_command == "status":
-            print_json({"alive": endpoint_alive(config.endpoint), "owned": owns_running_server(config), "models": inventory(config.endpoint) if endpoint_alive(config.endpoint) else []})
+            print_json(
+                {
+                    "alive": endpoint_alive(config.endpoint),
+                    "owned": owns_running_server(config),
+                    "models": inventory(config.endpoint)
+                    if endpoint_alive(config.endpoint)
+                    else [],
+                }
+            )
         elif args.runtime_command == "admission":
             print_json(admission(config))
         else:
@@ -146,13 +223,22 @@ def main(argv: list[str] | None = None) -> int:
         elif args.objective_command == "verify":
             print_json(store.add_verification(args.objective_id, read_json(args.path)))
         elif args.objective_command == "attempt":
-            print_json(store.record_attempt(args.objective_id, args.failure_fingerprint, args.evidence, args.approach))
+            print_json(
+                store.record_attempt(
+                    args.objective_id,
+                    args.failure_fingerprint,
+                    args.evidence,
+                    args.approach,
+                )
+            )
         else:
             print_json(store.transition(args.objective_id, args.state, args.reason))
         return 0
     if args.command == "run":
         if not args.check_id:
-            raise ValueError("run requires at least one --check-id from the objective acceptance checks")
+            raise ValueError(
+                "run requires at least one --check-id from the objective acceptance checks"
+            )
         command = list(args.argv)
         if command and command[0] == "--":
             command = command[1:]

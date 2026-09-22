@@ -539,6 +539,15 @@ pub(crate) async fn run_pre_compact_hooks(
     turn_context: &Arc<TurnContext>,
     trigger: CompactionTrigger,
 ) -> PreCompactHookOutcome {
+    // The launcher sets this explicit gate; MAVIS_HOME alone may be inherited by ordinary Codex.
+    let mavis_session =
+        mavis_compaction_required(std::env::var("MAVIS_PRECOMPACT_REQUIRED").ok().as_deref());
+    if mavis_session
+        && (sess.hook_transcript_path().await.is_none() || sess.flush_rollout().await.is_err())
+    {
+        tracing::error!("Mavis transcript could not be made durable before compaction");
+        return PreCompactHookOutcome::Stopped;
+    }
     let request = codex_hooks::PreCompactRequest {
         session_id: sess.session_id().into(),
         turn_id: turn_context.sub_id.clone(),
@@ -553,12 +562,37 @@ pub(crate) async fn run_pre_compact_hooks(
     emit_hook_started_events(sess, turn_context, preview_runs).await;
 
     let outcome = sess.hooks().run_pre_compact(request).await;
+    let mavis_archive_failed = mavis_session
+        && !mavis_archive_hook_completed(
+            &outcome.hook_events,
+            &turn_context.config.codex_home.join("config.toml"),
+        );
     emit_hook_completed_events(sess, turn_context, outcome.hook_events).await;
-    if outcome.should_stop {
+    if outcome.should_stop || mavis_archive_failed {
         PreCompactHookOutcome::Stopped
     } else {
         PreCompactHookOutcome::Continue
     }
+}
+
+fn mavis_compaction_required(marker: Option<&str>) -> bool {
+    marker == Some("1")
+}
+
+fn mavis_archive_hook_completed(
+    events: &[codex_protocol::protocol::HookCompletedEvent],
+    config_path: &std::path::Path,
+) -> bool {
+    events.iter().any(|event| {
+        let run = &event.run;
+        run.event_name == codex_protocol::protocol::HookEventName::PreCompact
+            && run.handler_type == codex_protocol::protocol::HookHandlerType::Command
+            && run.execution_mode == codex_protocol::protocol::HookExecutionMode::Sync
+            && run.source == codex_protocol::protocol::HookSource::User
+            && run.source_path.as_path() == config_path
+            && run.status_message.as_deref() == Some("Mavis transcript archive v1")
+            && run.status == codex_protocol::protocol::HookRunStatus::Completed
+    })
 }
 
 pub(crate) enum PreCompactHookOutcome {
@@ -1060,6 +1094,7 @@ fn compaction_trigger_label(value: CompactionTrigger) -> &'static str {
 
 #[cfg(test)]
 mod tests {
+    use std::path::Path;
     use std::sync::Arc;
 
     use codex_otel::HOOK_RUN_DURATION_METRIC;
@@ -1067,12 +1102,16 @@ mod tests {
     use codex_otel::MetricsClient;
     use codex_otel::MetricsConfig;
     use codex_protocol::models::ContentItem;
+    use codex_protocol::protocol::HookCompletedEvent;
     use codex_protocol::protocol::HookEventName;
     use codex_protocol::protocol::HookExecutionMode;
     use codex_protocol::protocol::HookHandlerType;
     use codex_protocol::protocol::HookRunStatus;
+    use codex_protocol::protocol::HookRunSummary;
     use codex_protocol::protocol::HookScope;
     use codex_protocol::protocol::HookSource;
+    use codex_utils_absolute_path::test_support::PathBufExt;
+    use codex_utils_absolute_path::test_support::test_path_buf;
     use opentelemetry_sdk::metrics::InMemoryMetricExporter;
     use opentelemetry_sdk::metrics::data::AggregatedMetrics;
     use opentelemetry_sdk::metrics::data::HistogramDataPoint;
@@ -1085,13 +1124,97 @@ mod tests {
     use super::emit_hook_started_events;
     use super::hook_run_analytics_payload;
     use super::hook_run_metric_tags;
+    use super::mavis_archive_hook_completed;
+    use super::mavis_compaction_required;
     use crate::session::tests::make_session_and_context;
     use crate::session::tests::make_session_and_context_with_rx;
-    use codex_protocol::protocol::HookCompletedEvent;
-    use codex_protocol::protocol::HookRunSummary;
-    use codex_utils_absolute_path::test_support::PathBufExt;
-    use codex_utils_absolute_path::test_support::test_path_buf;
 
+    #[test]
+    fn incidental_mavis_home_does_not_enable_compaction_gate() {
+        // This decision depends only on the launcher's explicit marker.
+        assert!(!mavis_compaction_required(None));
+        assert!(!mavis_compaction_required(Some("0")));
+        assert!(mavis_compaction_required(Some("1")));
+    }
+
+    #[test]
+    fn managed_mavis_hook_hash_matches_profile_generator() {
+        #[derive(serde::Serialize)]
+        struct Identity {
+            event_name: &'static str,
+            #[serde(flatten)]
+            group: codex_config::MatcherGroup,
+        }
+        let identity = Identity {
+            event_name: "pre_compact",
+            group: codex_config::MatcherGroup {
+                matcher: None,
+                hooks: vec![codex_config::HookHandlerConfig::Command {
+                    command: "python3 -m mavis pre-compact".to_string(),
+                    command_windows: None,
+                    timeout_sec: Some(600),
+                    r#async: false,
+                    status_message: Some("Mavis transcript archive v1".to_string()),
+                    additional_context_limit: None,
+                }],
+            },
+        };
+        let value = toml::Value::try_from(identity).expect("Mavis hook identity");
+        assert_eq!(
+            codex_config::version_for_toml(&value),
+            "sha256:337c9d7e3e10c6215a95e9bcc7506e6c60f625c1f8880b96ccfd07c10d4856e7"
+        );
+    }
+
+    #[test]
+    fn only_managed_mavis_archive_hook_satisfies_compaction_gate() {
+        let config = Path::new("/tmp/mavis/config.toml");
+        let mut unrelated = sample_hook_run(HookRunStatus::Completed, HookSource::User);
+        unrelated.event_name = HookEventName::PreCompact;
+        unrelated.source_path = test_path_buf("/tmp/mavis/config.toml").abs();
+        unrelated.status_message = Some("Another successful hook".to_string());
+        let unrelated_event = HookCompletedEvent {
+            turn_id: None,
+            run: unrelated.clone(),
+        };
+        assert!(!mavis_archive_hook_completed(
+            &[unrelated_event.clone()],
+            config
+        ));
+
+        let mut archive = unrelated;
+        archive.status_message = Some("Mavis transcript archive v1".to_string());
+        let archive_event = HookCompletedEvent {
+            turn_id: None,
+            run: archive.clone(),
+        };
+        assert!(mavis_archive_hook_completed(
+            &[unrelated_event.clone(), archive_event],
+            config
+        ));
+
+        let mut wrong_source = archive.clone();
+        wrong_source.source_path = test_path_buf("/tmp/other/config.toml").abs();
+        assert!(!mavis_archive_hook_completed(
+            &[HookCompletedEvent {
+                turn_id: None,
+                run: wrong_source
+            }],
+            config,
+        ));
+
+        archive.status = HookRunStatus::Failed;
+        assert!(!mavis_archive_hook_completed(
+            &[
+                unrelated_event,
+                HookCompletedEvent {
+                    turn_id: None,
+                    run: archive
+                }
+            ],
+            config,
+        ));
+    }
     #[test]
     fn additional_context_messages_stay_separate_and_ordered() {
         let messages = additional_context_messages(vec![

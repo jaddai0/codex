@@ -21,7 +21,7 @@ class PrepareRuntimeTests(unittest.TestCase):
     def test_installer_exposes_mavis_command(self):
         installer = (MODULE_PATH.parent / "install.sh").read_text(encoding="utf-8")
         self.assertIn('"$install_bin/mavis"', installer)
-        self.assertIn('Desktop/Mavis.command', installer)
+        self.assertIn("Desktop/Mavis.command", installer)
 
     def test_launcher_uses_isolated_mavis_runtime(self):
         launcher = (MODULE_PATH.parent / "bin" / "local-codex").read_text(
@@ -111,6 +111,17 @@ class PrepareRuntimeTests(unittest.TestCase):
             self.assertIn("remote_plugin = false", profile)
             self.assertIn("check_for_update_on_startup = false", profile)
             self.assertIn("requires_openai_auth = false", profile)
+            self.assertIn('command = "python3 -m mavis pre-compact"', profile)
+            parsed = tomllib.loads(profile)
+            self.assertEqual(
+                parsed["hooks"]["PreCompact"][0]["hooks"][0]["command"],
+                "python3 -m mavis pre-compact",
+            )
+            key = f"{(home / 'config.toml').resolve()}:pre_compact:0:0"
+            self.assertEqual(
+                parsed["hooks"]["state"][key]["trusted_hash"],
+                prepare_runtime.mavis_archive_hook_hash(),
+            )
 
     def test_profile_preserves_local_user_sections(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -135,8 +146,12 @@ class PrepareRuntimeTests(unittest.TestCase):
             script.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
             script.chmod(0o755)
             home = root / "home"
-            prepare_runtime.write_profile(home, "http://127.0.0.1:8001/v1", "local", gateway)
-            prepare_runtime.write_profile(home, "http://127.0.0.1:8001/v1", "local", gateway)
+            prepare_runtime.write_profile(
+                home, "http://127.0.0.1:8001/v1", "local", gateway
+            )
+            prepare_runtime.write_profile(
+                home, "http://127.0.0.1:8001/v1", "local", gateway
+            )
             profile = (home / "config.toml").read_text(encoding="utf-8")
             self.assertEqual(profile.count("[mcp_servers.model-gateway]"), 1)
             self.assertIn(f'command = "{script.resolve()}"', profile)
