@@ -46,3 +46,5 @@ The next integration step is a maintenance runner that executes E1 shards, store
 ## Repository delivery
 
 The source slice is committed on `codex/mavis-phase3-experiments`. `gh repo view jaddai0/codex --json visibility` reports `PUBLIC`. The coordinator clarified that this public Codex fork is the authorized ordinary-push destination. The reviewed change contains only source, synthetic tests, a schema, and documentation; it contains no credentials, private logs, model weights, or personal data.
+
+The reviewed branch was pushed to `fork/codex/mavis-phase3-experiments` on the public `jaddai0/codex` repository. No pull request or merge was created.
