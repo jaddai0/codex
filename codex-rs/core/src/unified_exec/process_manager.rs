@@ -651,7 +651,7 @@ impl UnifiedExecProcessManager {
         let deadline = start
             .checked_add(wait)
             .ok_or_else(|| UnifiedExecError::process_failed("timeout_ms is too large".into()))?;
-        let collected_output = Self::collect_output_until_deadline(
+        let mut collected_output = Self::collect_output_until_deadline(
             process.output_handles(),
             Some(context.session.subscribe_elicitation_pause_state()),
             deadline,
@@ -666,15 +666,22 @@ impl UnifiedExecProcessManager {
                 process.fail_and_terminate(err.to_string());
             }
         }
+        self.finish_mavis_output_after_exit(
+            request.process_id,
+            &process,
+            process.output_handles(),
+            &mut collected_output,
+        )
+        .await?;
         let wall_time = Instant::now().saturating_duration_since(start);
 
-        let original_token_count = usize::try_from(approx_tokens_from_byte_count(
+        let mut original_token_count = usize::try_from(approx_tokens_from_byte_count(
             collected_output.total_bytes(),
         ))
         .unwrap_or(usize::MAX);
-        let output_omitted_bytes = NonZeroUsize::new(collected_output.omitted_bytes());
-        let collected = collected_output.to_bytes_with_omission_marker();
-        let text = String::from_utf8_lossy(&collected).to_string();
+        let mut output_omitted_bytes = NonZeroUsize::new(collected_output.omitted_bytes());
+        let mut collected = collected_output.to_bytes_with_omission_marker();
+        let mut text = String::from_utf8_lossy(&collected).to_string();
         let chunk_id = generate_chunk_id();
         if deferred_network_approval
             .as_ref()
@@ -733,6 +740,20 @@ impl UnifiedExecProcessManager {
                     ..
                 } => (Some(process_id), exit_code),
                 ProcessStatus::Exited { exit_code, entry } => {
+                    self.finish_mavis_output_after_exit(
+                        request.process_id,
+                        &process,
+                        process.output_handles(),
+                        &mut collected_output,
+                    )
+                    .await?;
+                    original_token_count = usize::try_from(approx_tokens_from_byte_count(
+                        collected_output.total_bytes(),
+                    ))
+                    .unwrap_or(usize::MAX);
+                    output_omitted_bytes = NonZeroUsize::new(collected_output.omitted_bytes());
+                    collected = collected_output.to_bytes_with_omission_marker();
+                    text = String::from_utf8_lossy(&collected).to_string();
                     if let Err(message) =
                         finish_deferred_network_approval_after_process_exit_for_session(
                             Some(&context.session),
@@ -776,6 +797,20 @@ impl UnifiedExecProcessManager {
                 }
             }
         } else {
+            self.finish_mavis_output_after_exit(
+                request.process_id,
+                &process,
+                process.output_handles(),
+                &mut collected_output,
+            )
+            .await?;
+            original_token_count = usize::try_from(approx_tokens_from_byte_count(
+                collected_output.total_bytes(),
+            ))
+            .unwrap_or(usize::MAX);
+            output_omitted_bytes = NonZeroUsize::new(collected_output.omitted_bytes());
+            collected = collected_output.to_bytes_with_omission_marker();
+            text = String::from_utf8_lossy(&collected).to_string();
             // Short-lived command: emit the completed command item immediately
             // using the same helper as the background watcher.
             let finish_result = finish_deferred_network_approval_after_process_exit_for_session(
@@ -1035,16 +1070,23 @@ impl UnifiedExecProcessManager {
         };
         let start = Instant::now();
         let deadline = start + Duration::from_millis(yield_time_ms);
-        let collected_output =
+        let mut collected_output =
             Self::collect_output_until_deadline(&output, pause_state, deadline).await;
+        self.finish_mavis_output_after_exit(
+            request.process_id,
+            &process,
+            &output,
+            &mut collected_output,
+        )
+        .await?;
         let wall_time = Instant::now().saturating_duration_since(start);
 
-        let original_token_count = usize::try_from(approx_tokens_from_byte_count(
+        let mut original_token_count = usize::try_from(approx_tokens_from_byte_count(
             collected_output.total_bytes(),
         ))
         .unwrap_or(usize::MAX);
-        let output_omitted_bytes = NonZeroUsize::new(collected_output.omitted_bytes());
-        let collected = collected_output.to_bytes_with_omission_marker();
+        let mut output_omitted_bytes = NonZeroUsize::new(collected_output.omitted_bytes());
+        let mut collected = collected_output.to_bytes_with_omission_marker();
         let chunk_id = generate_chunk_id();
         if network_approval
             .as_ref()
@@ -1085,6 +1127,19 @@ impl UnifiedExecProcessManager {
                 process_id,
             } => (Some(process_id), exit_code, call_id),
             ProcessStatus::Exited { exit_code, entry } => {
+                self.finish_mavis_output_after_exit(
+                    request.process_id,
+                    &process,
+                    &output,
+                    &mut collected_output,
+                )
+                .await?;
+                original_token_count = usize::try_from(approx_tokens_from_byte_count(
+                    collected_output.total_bytes(),
+                ))
+                .unwrap_or(usize::MAX);
+                output_omitted_bytes = NonZeroUsize::new(collected_output.omitted_bytes());
+                collected = collected_output.to_bytes_with_omission_marker();
                 let call_id = entry.call_id.clone();
                 if let Err(message) =
                     finish_network_approval_after_process_exit_for_entry(&entry).await
@@ -1095,6 +1150,19 @@ impl UnifiedExecProcessManager {
             }
             ProcessStatus::Unknown => {
                 if process.has_exited() {
+                    self.finish_mavis_output_after_exit(
+                        request.process_id,
+                        &process,
+                        &output,
+                        &mut collected_output,
+                    )
+                    .await?;
+                    original_token_count = usize::try_from(approx_tokens_from_byte_count(
+                        collected_output.total_bytes(),
+                    ))
+                    .unwrap_or(usize::MAX);
+                    output_omitted_bytes = NonZeroUsize::new(collected_output.omitted_bytes());
+                    collected = collected_output.to_bytes_with_omission_marker();
                     (None, process.exit_code(), call_id)
                 } else {
                     return Err(UnifiedExecError::UnknownProcessId {
@@ -1581,6 +1649,29 @@ impl UnifiedExecProcessManager {
         };
         tracing::Span::current().record("outcome", outcome);
         result
+    }
+
+    /// Finish a Mavis spool before its exited process can be released.
+    async fn finish_mavis_output_after_exit<const MAX_BYTES: usize>(
+        &self,
+        process_id: i32,
+        process: &UnifiedExecProcess,
+        output: &OutputHandles<MAX_BYTES>,
+        collected: &mut HeadTailBuffer<MAX_BYTES>,
+    ) -> Result<(), UnifiedExecError> {
+        let finished = match process.wait_for_raw_output_drain_if_exited().await {
+            Ok(finished) => finished,
+            Err(err) => {
+                process.fail_and_terminate(err.to_string());
+                self.release_process_id(process_id).await;
+                return Err(err);
+            }
+        };
+        if finished {
+            let mut guard = output.output_buffer.lock().await;
+            collected.push_buffer(std::mem::take(&mut *guard));
+        }
+        Ok(())
     }
 
     #[tracing::instrument(

@@ -41,6 +41,7 @@ use super::raw_output_spool::RawOutputSpool;
 use crate::shell_snapshot::ShellSnapshotFile;
 
 const EARLY_EXIT_GRACE_PERIOD: Duration = Duration::from_millis(150);
+const MAVIS_POST_EXIT_DRAIN_TIMEOUT: Duration = Duration::from_secs(30);
 
 fn append_raw_output(
     spool: &Option<Arc<StdMutex<RawOutputSpool>>>,
@@ -163,6 +164,7 @@ pub(crate) struct UnifiedExecProcess {
     output_tx: broadcast::Sender<Vec<u8>>,
     output: OutputHandles,
     raw_output_spool: Option<Arc<StdMutex<RawOutputSpool>>>,
+    raw_output_aborted: AtomicBool,
     output_drained: Arc<Notify>,
     interaction_lock: Arc<Mutex<()>>,
     state_tx: watch::Sender<ProcessState>,
@@ -209,6 +211,7 @@ impl UnifiedExecProcess {
             output_tx,
             output,
             raw_output_spool,
+            raw_output_aborted: AtomicBool::new(false),
             output_drained,
             interaction_lock: Arc::new(Mutex::new(())),
             state_tx,
@@ -230,11 +233,45 @@ impl UnifiedExecProcess {
         let mut spool = spool.lock().map_err(|_| {
             UnifiedExecError::process_failed("raw output spool lock poisoned".to_string())
         })?;
-        let complete =
-            self.output.output_closed.load(Ordering::Acquire) && self.failure_message().is_none();
+        let complete = self.output.output_closed.load(Ordering::Acquire)
+            && !self.raw_output_aborted.load(Ordering::Acquire)
+            && self.failure_message().is_none();
         spool.reference(complete).map(Some).map_err(|err| {
             UnifiedExecError::process_failed(format!("raw output spool sync: {err}"))
         })
+    }
+
+    /// An exited Mavis command must keep its output reader alive until all
+    /// pipe bytes have reached the durable spool. A descendant that keeps a
+    /// pipe open eventually fails this command instead of yielding a partial
+    /// reference that can no longer be completed.
+    pub(super) async fn wait_for_raw_output_drain_if_exited(
+        &self,
+    ) -> Result<bool, UnifiedExecError> {
+        if self.raw_output_spool.is_none() || !self.has_exited() {
+            return Ok(false);
+        }
+        let closed = self.output.output_closed_notify.notified();
+        tokio::pin!(closed);
+        closed.as_mut().enable();
+        if !self.output.output_closed.load(Ordering::Acquire)
+            && tokio::time::timeout(MAVIS_POST_EXIT_DRAIN_TIMEOUT, closed.as_mut())
+                .await
+                .is_err()
+        {
+            return Err(UnifiedExecError::process_failed(
+                "Mavis raw output did not finish draining after process exit".to_string(),
+            ));
+        }
+        if let Some(message) = self.failure_message() {
+            return Err(UnifiedExecError::process_failed(message));
+        }
+        if !self.output.output_closed.load(Ordering::Acquire) {
+            return Err(UnifiedExecError::process_failed(
+                "Mavis raw output reader closed without completing".to_string(),
+            ));
+        }
+        Ok(true)
     }
 
     pub(super) async fn write(&self, data: &[u8]) -> Result<(), UnifiedExecError> {
@@ -312,6 +349,7 @@ impl UnifiedExecProcess {
     }
 
     fn finish_termination(&self) {
+        self.raw_output_aborted.store(true, Ordering::Release);
         self.output.cancellation_token.cancel();
         if let Some(output_task) = &self.output_task {
             output_task.abort();
