@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from pathlib import Path
+import os
 import subprocess
 import uuid
 
@@ -61,7 +62,8 @@ def prepare_small_repository(home: Path) -> Path:
     )
     test_command = ["python3", "-m", "unittest", "discover", "-s", "tests", "-q"]
     baseline = subprocess.run(
-        test_command, cwd=repo, capture_output=True, text=True, check=False
+        test_command, cwd=repo, capture_output=True, text=True, check=False,
+        env={**os.environ, "PYTHONDONTWRITEBYTECODE": "1"},
     )
     if baseline.returncode == 0 or "test_discount_reduces_price" not in baseline.stderr:
         raise RuntimeError(
