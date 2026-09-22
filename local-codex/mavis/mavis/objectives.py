@@ -4,10 +4,14 @@ from __future__ import annotations
 
 from copy import deepcopy
 from datetime import datetime, timezone
+import hashlib
+import json
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable
+from uuid import uuid4
 
 from .evidence import parse_test_output
+from .gateway import GatewayUnavailable, harness_job_status
 from .storage import read_json, require_safe_id, sha256_file, write_json
 
 
@@ -44,8 +48,14 @@ def _now() -> str:
 
 
 class ObjectiveStore:
-    def __init__(self, home: Path):
-        self.root = Path(home) / "objectives"
+    def __init__(
+        self,
+        home: Path,
+        gateway_status_reader: Callable[[str], dict[str, Any]] | None = None,
+    ):
+        self.home = Path(home)
+        self.root = self.home / "objectives"
+        self.gateway_status_reader = gateway_status_reader or harness_job_status
 
     def _path(self, objective_id: str) -> Path:
         return self.root / f"{require_safe_id(objective_id, 'objective id')}.json"
@@ -69,6 +79,7 @@ class ObjectiveStore:
         record["assignments"] = []
         record["evidence_receipts"] = []
         record["verifications"] = []
+        record["gateway_verifications"] = []
         write_json(path, record)
         return record
 
@@ -226,10 +237,50 @@ class ObjectiveStore:
         self.save(record)
         return record
 
-    @staticmethod
-    def _assert_acceptance(record: dict[str, Any]) -> None:
+    def record_gateway_verification(
+        self, objective_id: str, worker_job_id: str
+    ) -> dict[str, Any]:
+        """Record a host-owned, hash-bound status response from the configured gateway."""
+        require_safe_id(worker_job_id, "gateway worker job id")
+        record = self.load(objective_id)
+        receipts = self._validated_receipts(record)
+        if not receipts:
+            raise ValueError("gateway verification requires retained evidence receipts")
+        revisions = {str(receipt["changed_revision"]) for receipt in receipts}
+        if len(revisions) != 1:
+            raise ValueError("gateway verification requires one evidence revision")
+        try:
+            status = self.gateway_status_reader(worker_job_id)
+        except GatewayUnavailable:
+            raise
+        except Exception as error:
+            raise GatewayUnavailable("configured model gateway is unavailable") from error
+        _validate_gateway_status(status, worker_job_id)
+        self._validate_objective_gateway_binding(record, status, revisions)
+        receipt_id = f"gateway-{uuid4().hex}"
+        path = self.home / "evidence" / objective_id / receipt_id / "gateway-status.json"
+        payload = {
+            "schema_version": "mavis.gateway-verification-receipt/v1",
+            "receipt_id": receipt_id,
+            "objective_id": objective_id,
+            "worker_job_id": worker_job_id,
+            "revision": revisions.pop(),
+            "host_receipts": deepcopy(record["evidence_receipts"]),
+            "gateway_status": deepcopy(status),
+            "gateway_status_sha256": _sha256_json(status),
+            "recorded_at": _now(),
+            "producer": "mavis-host-gateway/v1",
+        }
+        write_json(path, payload)
+        record.setdefault("gateway_verifications", []).append(
+            {"path": str(path.resolve()), "sha256": sha256_file(path)}
+        )
+        self.save(record)
+        return record
+
+    def _validated_receipts(self, record: dict[str, Any]) -> list[dict[str, Any]]:
         receipts = []
-        for retained in record["evidence_receipts"]:
+        for retained in record.get("evidence_receipts") or []:
             if not isinstance(retained, dict) or set(retained) != {"path", "sha256"}:
                 raise ValueError("evidence receipt retention record is invalid")
             path = Path(retained["path"])
@@ -240,22 +291,94 @@ class ObjectiveStore:
             receipt = read_json(path)
             _validate_receipt(receipt, str(record["objective_id"]), path)
             receipts.append(receipt)
+        return receipts
+
+    def _validate_objective_gateway_binding(
+        self,
+        record: dict[str, Any],
+        status: dict[str, Any],
+        evidence_revisions: set[str],
+    ) -> None:
+        binding = status.get("mavis_binding")
+        required = {
+            "schema_version",
+            "objective_id",
+            "cwd",
+            "starting_revision",
+            "changed_revision",
+            "owned_paths",
+            "requirements",
+            "required_checks",
+            "owner",
+            "assignment_sha256",
+            "report_sha256",
+            "target_sha256",
+        }
+        if not isinstance(binding, dict) or set(binding) != required:
+            raise ValueError("gateway status lacks an objective binding")
+        if binding["schema_version"] != "model-gateway-mavis-objective-binding/v1":
+            raise ValueError("gateway objective binding schema is invalid")
+        if binding["objective_id"] != record["objective_id"]:
+            raise ValueError("gateway objective binding names a different objective")
+        assignments = record.get("assignments") or []
+        if not assignments:
+            raise ValueError("gateway objective binding requires a worker assignment")
+        assignment = assignments[-1]
+        checkout = assignment.get("checkout")
+        if not isinstance(checkout, dict):
+            raise ValueError("worker assignment checkout is invalid")
+        try:
+            gateway_cwd = Path(str(binding["cwd"])).resolve(strict=True)
+            assignment_cwd = Path(str(checkout["path"])).resolve(strict=True)
+        except (OSError, RuntimeError) as error:
+            raise ValueError("gateway objective binding checkout is invalid") from error
+        if gateway_cwd != assignment_cwd:
+            raise ValueError("gateway objective binding checkout does not match")
+        if binding["starting_revision"] != assignment.get("starting_revision"):
+            raise ValueError("gateway objective binding starting revision does not match")
+        if _owner_identity(binding["owner"]) != _owner_identity(assignment.get("owner")):
+            raise ValueError("gateway objective binding owner does not match")
+        if binding["changed_revision"] not in evidence_revisions:
+            raise ValueError("gateway objective binding revision does not match host evidence")
+        if set(binding["owned_paths"]) != set(checkout.get("owned_paths") or []):
+            raise ValueError("gateway objective binding owned paths do not match")
+        requirements = {str(item["id"]) for item in record["requirements"]}
+        if set(binding["requirements"]) != requirements or set(assignment.get("requirements") or []) != requirements:
+            raise ValueError("gateway objective binding requirements do not match")
+        checks = {str(item["id"]) for item in record["acceptance_checks"]}
+        if set(binding["required_checks"]) != checks:
+            raise ValueError("gateway objective binding acceptance checks do not match")
+        acceptance = status["acceptance"]
+        for field, gateway_field in (
+            ("target_sha256", "target_sha256"),
+            ("report_sha256", "report_sha256_on_disk"),
+        ):
+            if binding[field] != acceptance[gateway_field]:
+                raise ValueError(f"gateway objective binding {field} does not match")
+        _require_sha256(binding["assignment_sha256"], "gateway objective assignment")
+
+    def _assert_acceptance(self, record: dict[str, Any]) -> None:
+        receipts = self._validated_receipts(record)
         if not receipts or any(item.get("verdict") != "pass" for item in receipts):
             raise ValueError(
                 "all retained evidence receipts must pass before acceptance"
             )
-        verifications = record.get("verifications") or []
-        if not verifications or verifications[-1].get("verdict") != "accepted":
-            raise ValueError(
-                "independent verification must accept the current milestone"
-            )
-        verification = verifications[-1]
-        _validate_verification(verification, str(record["objective_id"]))
-        expected_revision = verification["revision"]
+        gateway_verifications = record.get("gateway_verifications") or []
+        if not gateway_verifications:
+            raise ValueError("Mavis host gateway verification receipt is required")
+        retained_gateway = gateway_verifications[-1]
+        if not isinstance(retained_gateway, dict) or set(retained_gateway) != {"path", "sha256"}:
+            raise ValueError("gateway verification retention record is invalid")
+        gateway_path = Path(retained_gateway["path"])
+        if sha256_file(gateway_path) != retained_gateway["sha256"]:
+            raise ValueError("retained gateway verification hash changed after recording")
+        gateway_receipt = read_json(gateway_path)
+        _validate_gateway_receipt(gateway_receipt, str(record["objective_id"]))
+        expected_revision = gateway_receipt["revision"]
         if any(
             receipt.get("changed_revision") != expected_revision for receipt in receipts
         ):
-            raise ValueError("verification revision does not match evidence receipts")
+            raise ValueError("gateway verification revision does not match evidence receipts")
         required_checks = {
             str(check.get("id"))
             for check in record["acceptance_checks"]
@@ -268,12 +391,21 @@ class ObjectiveStore:
         }
         if not required_checks or not required_checks.issubset(covered_checks):
             raise ValueError("retained evidence does not cover every acceptance check")
-        retained_paths = {item["path"] for item in record["evidence_receipts"]}
-        if set(verification["required_receipts"]) != retained_paths:
-            raise ValueError("verification is not bound to the exact retained receipts")
-        required_requirements = {str(item["id"]) for item in record["requirements"]}
-        if set(verification["requirements"]) != required_requirements:
-            raise ValueError("verification does not cover every objective requirement")
+        if gateway_receipt["host_receipts"] != record["evidence_receipts"]:
+            raise ValueError("gateway verification is not bound to the exact retained receipts")
+        worker_job_id = gateway_receipt["worker_job_id"]
+        try:
+            fresh_status = self.gateway_status_reader(worker_job_id)
+        except GatewayUnavailable:
+            raise
+        except Exception as error:
+            raise GatewayUnavailable("configured model gateway is unavailable") from error
+        _validate_gateway_status(fresh_status, worker_job_id)
+        self._validate_objective_gateway_binding(
+            record, fresh_status, {str(receipt["changed_revision"]) for receipt in receipts}
+        )
+        if _sha256_json(fresh_status) != gateway_receipt["gateway_status_sha256"]:
+            raise ValueError("gateway verification status changed after recording")
 
 
 def _require_keys(payload: dict[str, Any], required: set[str], label: str) -> None:
@@ -291,6 +423,97 @@ def _owner_identity(owner: object) -> tuple[str, str, str]:
     if any(not value for value in identity):
         raise ValueError("owner identity requires provider, model, and harness")
     return identity
+
+
+def _sha256_json(payload: dict[str, Any]) -> str:
+    return hashlib.sha256(
+        json.dumps(payload, sort_keys=True, separators=(",", ":")).encode("utf-8")
+    ).hexdigest()
+
+
+def _require_sha256(value: object, label: str) -> str:
+    if not isinstance(value, str) or len(value) != 64:
+        raise ValueError(f"{label} must be a SHA-256 hash")
+    try:
+        int(value, 16)
+    except ValueError as error:
+        raise ValueError(f"{label} must be a SHA-256 hash") from error
+    return value
+
+
+def _validate_gateway_status(status: dict[str, Any], worker_job_id: str) -> None:
+    if not isinstance(status, dict):
+        raise ValueError("gateway status is invalid")
+    if status.get("job_id") != worker_job_id:
+        raise ValueError("gateway status is not bound to the requested worker job")
+    worker_receipt = status.get("receipt")
+    if (
+        not isinstance(worker_receipt, dict)
+        or worker_receipt.get("job_id") != worker_job_id
+        or worker_receipt.get("exit_code") != 0
+    ):
+        raise ValueError("gateway status lacks a successful receipt for the worker job")
+    if status.get("state") != "completed" or status.get("exit_code") != 0:
+        raise ValueError("gateway worker job did not complete successfully")
+    if status.get("accepted") is not True:
+        raise ValueError("gateway worker job is not accepted")
+    acceptance = status.get("acceptance")
+    if not isinstance(acceptance, dict) or acceptance.get("accepted") is not True:
+        raise ValueError("gateway acceptance receipt is invalid")
+    if acceptance.get("job_id") != worker_job_id:
+        raise ValueError("gateway acceptance is not bound to the worker job")
+    verifier_job_id = acceptance.get("verifier_job_id")
+    if (
+        acceptance.get("verifier") != "terra"
+        or not isinstance(verifier_job_id, str)
+        or not verifier_job_id
+        or verifier_job_id == worker_job_id
+    ):
+        raise ValueError("gateway acceptance requires a distinct Terra verifier job")
+    for field in (
+        "target_sha256",
+        "evidence_sha256",
+        "report_sha256_on_disk",
+        "verifier_verdict_sha256",
+    ):
+        _require_sha256(acceptance.get(field), f"gateway acceptance {field}")
+
+
+def _validate_gateway_receipt(receipt: dict[str, Any], objective_id: str) -> None:
+    required = {
+        "schema_version",
+        "receipt_id",
+        "objective_id",
+        "worker_job_id",
+        "revision",
+        "host_receipts",
+        "gateway_status",
+        "gateway_status_sha256",
+        "recorded_at",
+        "producer",
+    }
+    _require_keys(receipt, required, "gateway verification receipt")
+    if (
+        receipt["schema_version"] != "mavis.gateway-verification-receipt/v1"
+        or receipt["producer"] != "mavis-host-gateway/v1"
+        or receipt["objective_id"] != objective_id
+    ):
+        raise ValueError("gateway verification receipt is not Mavis-host owned")
+    require_safe_id(str(receipt["receipt_id"]), "gateway receipt id")
+    require_safe_id(str(receipt["worker_job_id"]), "gateway worker job id")
+    if not isinstance(receipt["revision"], str) or len(receipt["revision"]) < 7:
+        raise ValueError("gateway verification receipt must bind a git revision")
+    if not isinstance(receipt["host_receipts"], list) or not receipt["host_receipts"]:
+        raise ValueError("gateway verification receipt must bind host receipts")
+    for retained in receipt["host_receipts"]:
+        if not isinstance(retained, dict) or set(retained) != {"path", "sha256"}:
+            raise ValueError("gateway verification receipt host receipt is invalid")
+        _require_sha256(retained["sha256"], "gateway verification receipt host hash")
+    _validate_gateway_status(receipt["gateway_status"], receipt["worker_job_id"])
+    if _sha256_json(receipt["gateway_status"]) != _require_sha256(
+        receipt["gateway_status_sha256"], "gateway verification status"
+    ):
+        raise ValueError("gateway verification status hash does not match")
 
 
 def _validate_assignment(assignment: dict[str, Any], objective_id: str) -> None:
