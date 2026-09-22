@@ -45,4 +45,4 @@ The next integration step is a maintenance runner that executes E1 shards, store
 
 ## Repository delivery
 
-The source slice is committed locally as `89c422fc6` on `codex/mavis-phase3-experiments`. Push is pending: `gh repo view jaddai0/codex --json visibility` reported `PUBLIC`, and the checkout has no private Codex remote. The requested destination was a private fork branch, so this lane did not upload the commit to the public fork. A private destination or explicit destination change is needed.
+The source slice is committed on `codex/mavis-phase3-experiments`. `gh repo view jaddai0/codex --json visibility` reports `PUBLIC`. The coordinator clarified that this public Codex fork is the authorized ordinary-push destination. The reviewed change contains only source, synthetic tests, a schema, and documentation; it contains no credentials, private logs, model weights, or personal data.
