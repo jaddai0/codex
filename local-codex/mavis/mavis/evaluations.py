@@ -442,7 +442,8 @@ class E0Evaluator:
             final = [event.get("payload", {}).get("last_agent_message") for event in events
                      if event.get("type") == "event_msg"
                      and event.get("payload", {}).get("type") == "task_complete"]
-            if not final or marker not in (final[-1] or "") or "code `1`" not in final[-1]:
+            if (not final or marker not in (final[-1] or "")
+                    or not re.search(r"exited with code\s*`?1`?", final[-1], re.IGNORECASE)):
                 continue
             if marker in primary:
                 continue
