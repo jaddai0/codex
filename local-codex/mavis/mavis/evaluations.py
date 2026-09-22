@@ -469,6 +469,8 @@ class E0Evaluator:
                 continue
             if result.get("candidate") != installed_candidate_fingerprint():
                 continue
+            if result.get("candidate_after") != result["candidate"]:
+                continue
             if not (result.get("first_exit") == result.get("resume_exit") == 0
                     and result.get("iris_loaded") is True
                     and result.get("mavis_loaded") is False
