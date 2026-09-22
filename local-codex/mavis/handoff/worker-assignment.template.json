@@ -1,0 +1,15 @@
+{
+  "schema_version": "mavis.worker-assignment/v1",
+  "assignment_id": "replace-me",
+  "objective_id": "replace-me",
+  "requirements": ["requirement-id"],
+  "starting_revision": "git-sha",
+  "owner": {"provider": "minimax", "model": "MiniMax-M3", "harness": "opencode"},
+  "checkout": {"path": "/absolute/worktree", "owned_paths": ["path"]},
+  "allowed_effects": ["edit-owned-paths", "run-targeted-tests"],
+  "forbidden_effects": ["modify-iris", "read-secrets", "push-model-weights"],
+  "expected_artifacts": ["report-path", "test-receipt"],
+  "acceptance_commands": ["exact command"],
+  "escalate_when": ["same failure twice without new evidence"],
+  "state": "queued"
+}

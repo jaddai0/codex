@@ -1,0 +1,22 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://local.invalid/mavis/model-profile/v1",
+  "title": "Mavis model profile",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["schema_version", "profile_id", "role", "model_identity", "runtime", "prompts", "tool_settings", "context_policy", "experiments", "version", "status"],
+  "properties": {
+    "schema_version": {"const": "mavis.model-profile/v1"},
+    "profile_id": {"type": "string", "minLength": 1},
+    "role": {"enum": ["main", "decision", "librarian", "output-reader", "embedding", "ranking"]},
+    "model_identity": {"type": "object", "required": ["architecture", "weights_fingerprint", "tokenizer_fingerprint", "chat_template_fingerprint", "quantization"]},
+    "runtime": {"type": "object", "required": ["name", "version"]},
+    "prompts": {"type": "object"},
+    "tool_settings": {"type": "object"},
+    "context_policy": {"type": "object"},
+    "experiments": {"type": "array", "items": {"type": "string"}},
+    "version": {"type": "integer", "minimum": 1},
+    "previous_version": {"type": ["integer", "null"]},
+    "status": {"enum": ["candidate", "active", "previous", "rejected"]}
+  }
+}

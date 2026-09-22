@@ -1,0 +1,17 @@
+{
+  "schema_version": "mavis.verifier/v1",
+  "verification_id": "replace-me",
+  "objective_id": "replace-me",
+  "revision": "git-sha",
+  "requirements": ["requirement-id"],
+  "protected_fixtures": ["absolute-path"],
+  "checks": [
+    "missing requirements",
+    "disabled tests",
+    "fabricated success",
+    "unexpected edits",
+    "failure masking"
+  ],
+  "required_receipts": ["receipt-path"],
+  "verdict": "awaiting verification"
+}

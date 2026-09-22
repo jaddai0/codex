@@ -1,0 +1,20 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://local.invalid/mavis/experiment/v1",
+  "title": "Mavis experiment",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["schema_version", "experiment_id", "hypothesis", "baseline", "candidate_difference", "workload", "evaluation_split", "results", "reviewer", "promotion_decision"],
+  "properties": {
+    "schema_version": {"const": "mavis.experiment/v1"},
+    "experiment_id": {"type": "string", "minLength": 1},
+    "hypothesis": {"type": "string", "minLength": 1},
+    "baseline": {"type": "object"},
+    "candidate_difference": {"type": "object"},
+    "workload": {"type": "object"},
+    "evaluation_split": {"type": "object"},
+    "results": {"type": "object"},
+    "reviewer": {"type": "object"},
+    "promotion_decision": {"enum": ["pending", "promote", "reject", "inconclusive", "rolled-back"]}
+  }
+}

@@ -1,0 +1,11 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://local.invalid/mavis/common/v1",
+  "$defs": {
+    "state": {
+      "enum": ["queued", "running", "awaiting verification", "accepted", "needs repair", "escalated", "blocked", "cancelled"]
+    },
+    "nonEmptyString": {"type": "string", "minLength": 1},
+    "stringList": {"type": "array", "items": {"$ref": "#/$defs/nonEmptyString"}}
+  }
+}

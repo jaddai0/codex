@@ -1,0 +1,50 @@
+{
+  "schema_version": "mavis.baseline/v1",
+  "captured_at": "2026-09-22T00:00:00-04:00",
+  "source_revisions": {
+    "local_codex": "1a39f4aa2fc1c65175be16b73077bb4df4fcdeb4",
+    "model_gateway": "6f12e5b1cdc1cb291f5a8abc1197757dc341debf",
+    "omlx": "c6d2800c0931ff782a17eaab259a2b3915bcfa51"
+  },
+  "installed_binaries": {
+    "tmux": "3.7b",
+    "opencode": "1.15.13",
+    "zcode": "0.16.9",
+    "codex": "0.154.0",
+    "python": "3.14.7"
+  },
+  "local_runtime": {
+    "iris_endpoint": "http://127.0.0.1:8000/v1",
+    "iris_listener_pid_at_capture": 63526,
+    "omlx": "0.7.0.dev4",
+    "mlx": "0.32.2",
+    "mlx_lm": "0.32.0",
+    "mlx_vlm": "0.7.1",
+    "physical_memory_bytes": 549755813888,
+    "loaded_main_model": "Qwen3.8-Flash-Next-Abliterated-MLX-4bit",
+    "loaded_embedding_model": "Q3-8BVL-Embed-MLX-8bit"
+  },
+  "model_identity": {
+    "path": "/Users/dustinpainter/models/vlms/Qwen3.8-Flash-Next-Abliterated-MLX-4bit",
+    "architecture_config_sha256": "f3a0a2b9ba5170759d3fde6e54dd244ba7c87f0a75faf139b8049eb5b9c6ed90",
+    "tokenizer_config_sha256": "854e1f9eaf01518389646815c91e914c02554c2e1b0dd1dc1d184751e22f038c",
+    "chat_template_sha256": "c3cf9e34abf4f9e36c2d72165aa9c132d3e2a725b6c2586aaa3a8af9d7a81041",
+    "weights_manifest_sha256": "d89f73a99851a22d17f2d76281bbf98c0c445ae1adbf96f7c1820c9a4f9d6498",
+    "quantization": "MLX 4-bit",
+    "context_window": 262144
+  },
+  "harness_canaries": {
+    "glm_zcode": {"state": "accepted", "evidence": "MAVIS_GLM_CANARY_OK"},
+    "minimax_opencode": {
+      "state": "blocked",
+      "failure_class": "authentication",
+      "evidence": "Provider returned login fail because no OpenCode MiniMax credential was available"
+    },
+    "terra_codex": {"state": "queued"}
+  },
+  "known_preexisting_failures": [
+    "MiniMax OpenCode background lane has no configured credential",
+    "Mavis currently points at IRIS endpoint 8000",
+    "No Mavis service, objective store, evidence receipts, or E0 harness existed"
+  ]
+}
