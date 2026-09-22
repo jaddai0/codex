@@ -54,6 +54,7 @@ mod oneshot;
 mod process;
 mod process_manager;
 mod process_state;
+mod raw_output_spool;
 mod shell_snapshot;
 mod stdin_approval;
 
@@ -67,6 +68,7 @@ pub(crate) use process::NoopSpawnLifecycle;
 pub(crate) use process::SpawnLifecycle;
 pub(crate) use process::SpawnLifecycleHandle;
 pub(crate) use process::UnifiedExecProcess;
+pub(crate) use raw_output_spool::RawOutputReference;
 pub(crate) use stdin_approval::TerminalPermissions;
 pub(crate) use stdin_approval::TerminalSandboxSource;
 
