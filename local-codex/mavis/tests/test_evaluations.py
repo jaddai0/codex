@@ -43,6 +43,16 @@ class E0EvaluationTests(unittest.TestCase):
                 result = evaluator.run_case("tool-roundtrip")
             self.assertEqual(result["status"], "blocked")
 
+    def test_tool_roundtrip_does_not_implicitly_load_model(self):
+        with tempfile.TemporaryDirectory() as directory:
+            evaluator = E0Evaluator(Path(directory), RuntimeConfig(home=Path(directory)))
+            with patch("mavis.evaluations.endpoint_alive", return_value=True), patch(
+                "mavis.evaluations.inventory", return_value=[{"id": evaluator.config.model, "loaded": False}]
+            ), patch("mavis.evaluations._post_json") as request:
+                result = evaluator.run_case("tool-roundtrip")
+            self.assertEqual(result["status"], "blocked")
+            request.assert_not_called()
+
     def test_one_case_does_not_replace_full_suite_summary(self):
         with tempfile.TemporaryDirectory() as directory:
             evaluator = E0Evaluator(Path(directory), RuntimeConfig(home=Path(directory)))

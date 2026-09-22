@@ -17,7 +17,7 @@ from urllib.request import Request, urlopen
 
 from .evidence import parse_test_output
 from .objectives import ObjectiveStore
-from .runtime import RuntimeConfig, _listener_pids, endpoint_alive, owns_running_server
+from .runtime import RuntimeConfig, _listener_pids, admission, endpoint_alive, inventory, owns_running_server
 from .storage import sha256_file, write_json
 from .transcripts import TranscriptArchive
 
@@ -117,6 +117,15 @@ class E0Evaluator:
     def _tool_roundtrip(self) -> dict[str, Any]:
         if not endpoint_alive(self.config.endpoint):
             return self._receipt("tool-roundtrip", "blocked", ["Mavis endpoint is unavailable"])
+        selected = next(
+            (item for item in inventory(self.config.endpoint) if item.get("id") == self.config.model),
+            None,
+        )
+        if not selected or not selected.get("loaded"):
+            return self._receipt("tool-roundtrip", "blocked", ["Mavis model is not loaded; E0 will not trigger an implicit model load"])
+        decision = admission(self.config)
+        if not decision["allowed"]:
+            return self._receipt("tool-roundtrip", "blocked", decision["reasons"])
         payload = {
             "model": self.config.model,
             "input": "Call the mavis_probe tool with value exactly E0_CANARY. Do not answer in text.",

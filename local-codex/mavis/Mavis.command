@@ -8,4 +8,4 @@ if [[ ! -x "$launcher" ]]; then
 fi
 
 cd "${MAVIS_PROJECT_DIR:-${HOME}/Dev-Projects}"
-exec "$launcher"
+exec "$launcher" "$@"
