@@ -7,6 +7,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
+from .evidence import parse_test_output
 from .storage import read_json, require_safe_id, sha256_file, write_json
 
 
@@ -219,7 +220,7 @@ def _validate_assignment(assignment: dict[str, Any], objective_id: str) -> None:
 def _validate_receipt(receipt: dict[str, Any], objective_id: str, receipt_path: Path) -> None:
     required = {
         "schema_version", "receipt_id", "objective_id", "command", "cwd",
-        "exit_status", "started_at", "finished_at", "raw_output",
+        "exit_status", "timed_out", "started_at", "finished_at", "raw_output",
         "changed_revision", "artifact_hashes", "acceptance_check_ids",
         "producer", "verdict",
     }
@@ -232,6 +233,8 @@ def _validate_receipt(receipt: dict[str, Any], objective_id: str, receipt_path: 
         raise ValueError("evidence receipt command is missing")
     if not isinstance(receipt["exit_status"], int):
         raise ValueError("evidence receipt exit status is invalid")
+    if not isinstance(receipt["timed_out"], bool):
+        raise ValueError("evidence receipt timeout flag is invalid")
     if not isinstance(receipt["changed_revision"], str) or len(receipt["changed_revision"]) < 7:
         raise ValueError("evidence receipt must bind a git revision")
     if not receipt["acceptance_check_ids"]:
@@ -247,6 +250,9 @@ def _validate_receipt(receipt: dict[str, Any], objective_id: str, receipt_path: 
     actual_bytes = stdout_path.stat().st_size + stderr_path.stat().st_size
     if raw.get("sha256") != actual_hash or raw.get("bytes") != actual_bytes:
         raise ValueError("raw output hash or byte count does not match")
+    combined = stdout_path.read_text(encoding="utf-8", errors="replace") + "\n" + stderr_path.read_text(encoding="utf-8", errors="replace")
+    if receipt["verdict"] != parse_test_output(combined, receipt["exit_status"], receipt["timed_out"]):
+        raise ValueError("evidence receipt verdict does not match its raw output and exit status")
     for artifact, expected_hash in receipt["artifact_hashes"].items():
         path = Path(artifact)
         if not path.is_file() or sha256_file(path) != expected_hash:

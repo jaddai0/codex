@@ -1,4 +1,5 @@
 from pathlib import Path
+import json
 import subprocess
 import tempfile
 import unittest
@@ -151,6 +152,29 @@ class ObjectiveStoreTests(unittest.TestCase):
             (receipt.parent / "stdout.log").write_text("fabricated 99 passed")
             with self.assertRaisesRegex(ValueError, "raw output"):
                 store._assert_acceptance(store.load("obj-1"))
+
+    def test_rejects_receipt_that_calls_failed_command_a_pass(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            store = ObjectiveStore(root)
+            store.create(objective())
+            fixture = root / "fixture"
+            fixture.mkdir()
+            subprocess.run(["git", "init", "-q"], cwd=fixture, check=True)
+            subprocess.run(["git", "config", "user.email", "test@example.invalid"], cwd=fixture, check=True)
+            subprocess.run(["git", "config", "user.name", "Mavis Test"], cwd=fixture, check=True)
+            (fixture / "x").write_text("x")
+            subprocess.run(["git", "add", "x"], cwd=fixture, check=True)
+            subprocess.run(["git", "commit", "-qm", "fixture"], cwd=fixture, check=True)
+            receipt_path = run_command(
+                root, "obj-1", ["python3", "-c", "print('FAILED'); raise SystemExit(1)"],
+                fixture, acceptance_check_ids=["c1"],
+            )
+            receipt = json.loads(receipt_path.read_text(encoding="utf-8"))
+            receipt["verdict"] = "pass"
+            receipt_path.write_text(json.dumps(receipt), encoding="utf-8")
+            with self.assertRaisesRegex(ValueError, "verdict does not match"):
+                store.add_receipt("obj-1", receipt_path)
 
 
 if __name__ == "__main__":

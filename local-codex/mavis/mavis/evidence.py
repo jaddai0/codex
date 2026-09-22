@@ -97,6 +97,7 @@ def run_command(
         "command": command,
         "cwd": str(Path(cwd).resolve()),
         "exit_status": exit_status,
+        "timed_out": timed_out,
         "started_at": started_at,
         "finished_at": finished_at,
         "raw_output": {
