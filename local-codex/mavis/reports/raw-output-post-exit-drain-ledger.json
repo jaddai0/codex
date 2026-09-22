@@ -1,0 +1,46 @@
+{
+  "schema_version": "work-closeout/v1",
+  "task": "Repair Mavis raw capture after process exit",
+  "status": "complete",
+  "constraint": {
+    "binding": "evidence",
+    "statement": "An exited process could be released while its raw-output reader was still draining.",
+    "evidence": ["buried-live-098ed22159d944b89438b100f7844802", "codex-rs/core/src/unified_exec/process_manager.rs"]
+  },
+  "rejected_alternatives": [],
+  "requirements": [
+    {
+      "id": "initial_exec",
+      "requirement": "Initial exec preserves a complete burst after exit",
+      "status": "pass",
+      "command": "just test -p codex-core mavis_exited_burst_finishes_raw_capture_for_exec_and_stdin",
+      "artifact": "codex-rs/core/src/unified_exec/process_manager_tests.rs",
+      "evidence": ["Initial exec reference was complete and its raw file exactly equaled the 1.6 MB expected output"]
+    },
+    {
+      "id": "write_stdin",
+      "requirement": "Interactive write_stdin preserves a complete burst after exit",
+      "status": "pass",
+      "command": "just test -p codex-core mavis_exited_burst_finishes_raw_capture_for_exec_and_stdin",
+      "artifact": "codex-rs/core/src/unified_exec/process_manager_tests.rs",
+      "evidence": ["Interactive reference was complete; raw bytes contained the full burst and byte count matched the file"]
+    },
+    {
+      "id": "fail_closed",
+      "requirement": "Post-exit capture has a bounded failure path before an exited reference is returned",
+      "status": "pass",
+      "command": "ZDOTDIR=<empty temporary directory> just test -p codex-core unified_exec",
+      "artifact": "codex-rs/core/src/unified_exec/process.rs",
+      "evidence": ["Source enforces a 30-second Mavis-only drain limit and returns ProcessFailed on timeout; 177 unified exec tests passed"]
+    },
+    {
+      "id": "ordinary_codex",
+      "requirement": "Ordinary Codex retains its post-exit response behavior",
+      "status": "pass",
+      "command": "ZDOTDIR=<empty temporary directory> just test -p codex-core unified_exec",
+      "artifact": "codex-rs/core/src/unified_exec/process_manager.rs",
+      "evidence": ["The new wait is gated by presence of the Mavis raw spool; 177 unified exec tests passed"]
+    }
+  ],
+  "uncertainty": []
+}

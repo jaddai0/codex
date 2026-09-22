@@ -6,6 +6,182 @@ use tokio::sync::Notify;
 use tokio::time::Duration;
 use tokio::time::Instant;
 
+#[cfg(unix)]
+#[tokio::test]
+#[serial_test::serial]
+async fn mavis_exited_burst_finishes_raw_capture_for_exec_and_stdin() {
+    let temp = tempfile::tempdir().unwrap();
+    let prior_required = std::env::var_os("MAVIS_RAW_OUTPUT_REQUIRED");
+    let prior_home = std::env::var_os("MAVIS_HOME");
+    unsafe {
+        std::env::set_var("MAVIS_RAW_OUTPUT_REQUIRED", "1");
+        std::env::set_var("MAVIS_HOME", temp.path());
+    }
+
+    let (session, turn) = crate::session::tests::make_session_and_context().await;
+    let session = Arc::new(session);
+    let turn = Arc::new(turn);
+    let manager = &session.services.unified_exec_manager;
+    let context = UnifiedExecContext::new(
+        Arc::clone(&session),
+        crate::session::step_context::StepContext::for_test(Arc::clone(&turn)),
+        CancellationToken::new(),
+        "mavis-exited-burst".to_string(),
+    );
+    let python = "import sys;sys.stdout.write('A'*800000+'\\nMAVIS_E0_FAILURE\\n'+'Z'*800000+'\\n');sys.stdout.flush();sys.exit(1)";
+    let request = |process_id, command, hook_command, tty, yield_time_ms| ExecCommandRequest {
+        command,
+        shell_type: crate::shell::ShellType::Sh,
+        hook_command,
+        process_id,
+        yield_time_ms,
+        max_output_tokens: None,
+        #[allow(deprecated)]
+        cwd: turn.cwd.clone().into(),
+        #[allow(deprecated)]
+        sandbox_cwd: turn.cwd.clone().into(),
+        turn_environment: turn.initial_environments.primary().cloned().unwrap(),
+        shell_mode: codex_tools::UnifiedExecShellMode::Direct,
+        network: None,
+        tty,
+        sandbox_permissions: crate::sandboxing::SandboxPermissions::UseDefault,
+        additional_permissions: None,
+        additional_permissions_preapproved: false,
+        justification: None,
+        prefix_rule: None,
+    };
+
+    let first_id = manager.allocate_process_id().await;
+    let mut first = manager
+        .exec_command(
+            request(
+                first_id,
+                vec!["python3".into(), "-c".into(), python.into()],
+                "python3 burst".into(),
+                false,
+                10_000,
+            ),
+            &context,
+        )
+        .await
+        .unwrap();
+    for _ in 0..3 {
+        let Some(process_id) = first.process_id else {
+            break;
+        };
+        first = manager
+            .write_stdin(
+                &context,
+                WriteStdinRequest {
+                    process_id,
+                    input: "",
+                    yield_time_ms: 10_000,
+                    max_output_tokens: None,
+                    truncation_policy: codex_utils_output_truncation::TruncationPolicy::Tokens(
+                        10_000,
+                    ),
+                    interaction_event: None,
+                },
+            )
+            .await
+            .unwrap();
+    }
+    assert_eq!(first.exit_code, Some(1));
+    let first_ref = first.raw_output_reference.unwrap();
+    assert!(first_ref.complete);
+    let expected = format!(
+        "{}\nMAVIS_E0_FAILURE\n{}\n",
+        "A".repeat(800_000),
+        "Z".repeat(800_000)
+    );
+    assert_eq!(std::fs::read(&first_ref.path).unwrap(), expected.as_bytes());
+    assert_eq!(first_ref.bytes, expected.len() as u64);
+
+    let shell_id = manager.allocate_process_id().await;
+    let shell = manager
+        .exec_command(
+            request(
+                shell_id,
+                vec!["bash".into(), "-i".into()],
+                "bash -i".into(),
+                true,
+                1_000,
+            ),
+            &context,
+        )
+        .await
+        .unwrap();
+    assert_eq!(shell.process_id, Some(shell_id));
+    let input = format!("python3 -c \"{python}\"; exit 1\n");
+    let mut second = manager
+        .write_stdin(
+            &context,
+            WriteStdinRequest {
+                process_id: shell_id,
+                input: &input,
+                yield_time_ms: 10_000,
+                max_output_tokens: None,
+                truncation_policy: codex_utils_output_truncation::TruncationPolicy::Tokens(10_000),
+                interaction_event: None,
+            },
+        )
+        .await
+        .unwrap();
+    for _ in 0..3 {
+        let Some(process_id) = second.process_id else {
+            break;
+        };
+        second = manager
+            .write_stdin(
+                &context,
+                WriteStdinRequest {
+                    process_id,
+                    input: "",
+                    yield_time_ms: 10_000,
+                    max_output_tokens: None,
+                    truncation_policy: codex_utils_output_truncation::TruncationPolicy::Tokens(
+                        10_000,
+                    ),
+                    interaction_event: None,
+                },
+            )
+            .await
+            .unwrap();
+    }
+    assert_eq!(second.exit_code, Some(1));
+    let second_ref = second.raw_output_reference.unwrap();
+    assert!(second_ref.complete);
+    let raw = std::fs::read(&second_ref.path).unwrap();
+    let normalized = raw
+        .iter()
+        .copied()
+        .filter(|byte| *byte != b'\r')
+        .collect::<Vec<_>>();
+    assert!(
+        normalized
+            .windows(expected.len())
+            .any(|window| window == expected.as_bytes()),
+        "stdin raw bytes={}, marker={}, A={}, Z={}",
+        raw.len(),
+        normalized
+            .windows(b"MAVIS_E0_FAILURE".len())
+            .filter(|window| *window == b"MAVIS_E0_FAILURE")
+            .count(),
+        normalized.iter().filter(|byte| **byte == b'A').count(),
+        normalized.iter().filter(|byte| **byte == b'Z').count(),
+    );
+    assert_eq!(second_ref.bytes, raw.len() as u64);
+
+    match prior_required {
+        Some(value) => unsafe { std::env::set_var("MAVIS_RAW_OUTPUT_REQUIRED", value) },
+        None => unsafe { std::env::remove_var("MAVIS_RAW_OUTPUT_REQUIRED") },
+    }
+    match prior_home {
+        Some(value) => unsafe { std::env::set_var("MAVIS_HOME", value) },
+        None => unsafe { std::env::remove_var("MAVIS_HOME") },
+    }
+}
+
 #[test]
 fn unified_exec_env_injects_defaults() {
     let env = apply_unified_exec_env(HashMap::new());
