@@ -308,11 +308,21 @@ class E0Evaluator:
                     }
                 ],
                 "store": True,
-                "max_output_tokens": 64,
+                "max_output_tokens": 256,
             },
         )
         if second.get("status") != "completed":
-            raise RuntimeError("tool-result continuation did not complete")
+            write_json(self.root / "tool-roundtrip-incomplete.json", {
+                "schema_version": "mavis.e0-tool-roundtrip-incomplete/v1",
+                "first_response_id": first["id"],
+                "second_response_id": second.get("id"),
+                "status": second.get("status"),
+                "incomplete_details": second.get("incomplete_details"),
+                "usage": second.get("usage"),
+            })
+            raise RuntimeError(
+                f"tool-result continuation did not complete: {second.get('status')}"
+            )
         return self._receipt(
             "tool-roundtrip",
             "pass",
