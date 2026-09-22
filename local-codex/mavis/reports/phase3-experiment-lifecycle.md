@@ -42,3 +42,7 @@ The new lifecycle has only source and fixture evidence. No real Mavis failure ha
 The CLI still has no explicit profile selection or lifecycle commands. This Phase 1 integration gap is outside the trust-boundary repair in this branch; the new source store does not make profile switching available to a user or the installed runtime.
 
 The next integration step is a maintenance runner that executes E1 shards, stores host output receipts, schedules a native gateway review assignment with the exact `experiment-comparison` requirement, and applies the active configuration between objectives. Then run one real failure through that chain and deliberately roll back the promoted candidate after a seeded critical regression. Phase 3 remains **partial** until those observations exist.
+
+## Repository delivery
+
+The source slice is committed locally as `89c422fc6` on `codex/mavis-phase3-experiments`. Push is pending: `gh repo view jaddai0/codex --json visibility` reported `PUBLIC`, and the checkout has no private Codex remote. The requested destination was a private fork branch, so this lane did not upload the commit to the public fork. A private destination or explicit destination change is needed.
