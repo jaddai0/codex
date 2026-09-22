@@ -313,7 +313,7 @@ class E0Evaluator:
         raise RuntimeError("fabricated receipt was accepted")
 
     def _buried_failure(self) -> dict[str, Any]:
-        text = "\n".join(["ok detail"] * 5000 + ["FAILED buried_case"] + ["ok detail"] * 5000)
+        text = "a" * 700_000 + "\nFAILED buried_case\n" + "z" * 700_000
         if parse_test_output(text, 0) != "fail":
             raise RuntimeError("buried failure was converted to success")
         artifact = self.root / "buried-failure.raw.log"
