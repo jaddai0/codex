@@ -25,3 +25,22 @@ PYTHONPATH=local-codex/mavis python3 -m mavis eval e0
 The command exits nonzero and records `reject` until all ten mandatory cases
 have real receipts. Missing local-model or native-harness work is reported as
 blocked rather than replaced with synthetic success.
+
+## Source-only experiment lifecycle
+
+`mavis.experiments.ExperimentStore` keeps prompt, tool-setting, and retrieval
+candidate configurations under the Mavis home. It freezes the active baseline,
+accepts matched held-out results with retained output hashes, requires a
+separate gateway worker accepted by Terra for the exact comparison, stages a
+candidate, and promotes it only between objectives. Rollback restores the
+previous accepted configuration. An experiment can be queued through
+`MaintenanceQueue`; its checkpoint records the experiment state and record hash
+so paused work can resume without repeating an accepted step.
+Profile activation requires that same promoted candidate and a fresh accepted
+gateway review; old file-only promotion evidence is rejected.
+
+This module is not wired into the installed profile loader or a live E1
+evaluation runner yet. The source tests use injected gateway statuses and
+synthetic evaluation files. Phase 3 still needs a real failure, held-out
+comparison, accepted verifier job, staged runtime promotion, and rollback
+canary before it can be called complete.
