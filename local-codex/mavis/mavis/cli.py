@@ -84,6 +84,9 @@ def build_parser() -> argparse.ArgumentParser:
         entry = objective_sub.add_parser(name)
         entry.add_argument("objective_id")
         entry.add_argument("path", type=Path)
+    gateway_verify = objective_sub.add_parser("gateway-verify")
+    gateway_verify.add_argument("objective_id")
+    gateway_verify.add_argument("worker_job_id")
     attempt = objective_sub.add_parser("attempt")
     attempt.add_argument("objective_id")
     attempt.add_argument("failure_fingerprint")
@@ -236,6 +239,12 @@ def main(argv: list[str] | None = None) -> int:
             print_json(store.add_receipt(args.objective_id, args.path))
         elif args.objective_command == "verify":
             print_json(store.add_verification(args.objective_id, read_json(args.path)))
+        elif args.objective_command == "gateway-verify":
+            print_json(
+                store.record_gateway_verification(
+                    args.objective_id, args.worker_job_id
+                )
+            )
         elif args.objective_command == "attempt":
             print_json(
                 store.record_attempt(
