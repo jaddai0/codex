@@ -9,7 +9,9 @@ environment.
 from __future__ import annotations
 
 from datetime import datetime, timezone
+import hashlib
 import json
+import os
 from pathlib import Path
 import subprocess
 from typing import Any, Callable
@@ -38,6 +40,24 @@ E0_CASES = (
 
 def _now() -> str:
     return datetime.now(timezone.utc).isoformat()
+
+
+def installed_candidate_fingerprint() -> dict[str, str]:
+    """Bind E0 live work to the exact installed core, launcher, and service code."""
+    share = Path.home() / ".local" / "share" / "local-codex"
+    package = share / "mavis"
+    digest = hashlib.sha256()
+    files = sorted(package.rglob("*.py"))
+    if not files:
+        raise FileNotFoundError("installed Mavis service package is missing")
+    for path in files:
+        digest.update(str(path.relative_to(package)).encode())
+        digest.update(bytes.fromhex(sha256_file(path)))
+    return {
+        "core_sha256": sha256_file(share / "local-codex-core"),
+        "launcher_sha256": sha256_file(Path.home() / "Desktop" / "Mavis.command"),
+        "service_sha256": digest.hexdigest(),
+    }
 
 
 def _post_json(url: str, payload: dict[str, Any], timeout: float = 180.0) -> dict[str, Any]:
@@ -79,6 +99,9 @@ class E0Evaluator:
     def run_case(self, case: str) -> dict[str, Any]:
         methods: dict[str, Callable[[], dict[str, Any]]] = {
             "tool-roundtrip": self._tool_roundtrip,
+            "small-repository": lambda: self._small_repository("small-repository"),
+            "dirty-work-preservation": lambda: self._small_repository("dirty-work-preservation"),
+            "seeded-failure-repair": lambda: self._small_repository("seeded-failure-repair"),
             "fabricated-success-rejection": self._fabricated_success,
             "buried-failure": self._buried_failure,
             "compaction-restart": self._compaction_restart,
@@ -97,6 +120,67 @@ class E0Evaluator:
                 "This case requires a real Mavis or native-harness assignment receipt; no synthetic fixture is accepted as a substitute."
             ],
         )
+
+    def _small_repository(self, case: str) -> dict[str, Any]:
+        """Recheck an installed Mavis repair and its separate native Terra review."""
+        candidates = sorted(
+            (self.root / "tasks").glob("*/manifest.json"),
+            key=lambda path: path.stat().st_mtime,
+            reverse=True,
+        )
+        for manifest_path in candidates:
+            task_root = manifest_path.parent
+            mavis_log = task_root / "installed-mavis-repair.jsonl"
+            terra_log = task_root / "terra-review.jsonl"
+            terra_result = task_root / "terra-review.txt"
+            installed_run = task_root / "installed-run.json"
+            if not all(path.is_file() for path in (mavis_log, terra_log, terra_result, installed_run)):
+                continue
+            observed_run = json.loads(installed_run.read_text())
+            if observed_run.get("candidate") != installed_candidate_fingerprint():
+                continue
+            if observed_run.get("mavis_log_sha256") != sha256_file(mavis_log) or observed_run.get("terra_log_sha256") != sha256_file(terra_log):
+                raise ValueError("E0 installed task logs changed after observation")
+            manifest = json.loads(manifest_path.read_text())
+            repo = Path(manifest["repo"]).resolve()
+            if repo != (task_root / "repo").resolve() or not repo.is_dir():
+                raise ValueError("E0 task repository path is invalid")
+            if manifest["baseline_exit_status"] == 0 or sha256_file(Path(manifest["baseline_log"])) != manifest["baseline_log_sha256"]:
+                raise ValueError("E0 failing baseline is invalid")
+            if sha256_file(Path(manifest["protected_dirty_file"])) != manifest["protected_dirty_sha256"]:
+                raise ValueError("E0 protected dirty note changed")
+            revision = subprocess.check_output(["git", "-C", str(repo), "rev-parse", "HEAD"], text=True).strip()
+            if revision != manifest["starting_revision"]:
+                raise ValueError("E0 task revision changed unexpectedly")
+            changed = set(subprocess.check_output(["git", "-C", str(repo), "diff", "--name-only"], text=True).splitlines())
+            expected = set(manifest["owned_paths"]) | {"user-notes.txt"}
+            if changed != expected:
+                raise ValueError("E0 changed paths do not match the allowed repair and protected note")
+            if subprocess.check_output(["git", "-C", str(repo), "ls-files", "--others", "--exclude-standard"], text=True).strip():
+                raise ValueError("E0 task contains unexpected untracked files")
+            mavis_events = [json.loads(line) for line in mavis_log.read_text().splitlines() if line.startswith("{")]
+            terra_events = [json.loads(line) for line in terra_log.read_text().splitlines() if line.startswith("{")]
+            mavis_finished = any(event.get("type") == "turn.completed" for event in mavis_events)
+            terra_finished = any(event.get("type") == "turn.completed" for event in terra_events)
+            patch_seen = any(
+                event.get("type") == "item.completed"
+                and event.get("item", {}).get("type") == "file_change"
+                and any(Path(change.get("path", "")).resolve() == repo / "package" / "pricing.py" for change in event["item"].get("changes", []))
+                for event in mavis_events
+            )
+            if not (mavis_finished and terra_finished and patch_seen and terra_result.read_text().lstrip().startswith("ACCEPT")):
+                raise ValueError("E0 installed repair or independent Terra review is incomplete")
+            tests = subprocess.run(
+                manifest["test_command"], cwd=repo, capture_output=True, text=True,
+                env={**os.environ, "PYTHONDONTWRITEBYTECODE": "1"}, check=False,
+            )
+            if tests.returncode != 0 or "Ran 2 tests" not in tests.stderr or "OK" not in tests.stderr:
+                raise ValueError("E0 seeded repair tests failed")
+            return self._receipt(case, "pass", [
+                f"Installed Mavis repaired {repo / 'package' / 'pricing.py'}; exact tests passed and protected note hash held",
+                f"Separate native Terra review accepted; logs sha256 {sha256_file(mavis_log)} and {sha256_file(terra_log)}",
+            ], manifest=str(manifest_path), review=str(terra_result))
+        return self._receipt(case, "blocked", ["No complete installed Mavis repair and independent Terra review found"])
 
     def run(self, case: str | None = None) -> dict[str, Any]:
         if case is not None:
