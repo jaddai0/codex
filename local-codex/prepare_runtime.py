@@ -205,8 +205,14 @@ def ensure_persona(home: Path, template: Path) -> None:
 
 
 def write_profile(
-    home: Path, base_url: str, selected: str, gateway_root: Path | None = None
+    home: Path,
+    base_url: str,
+    selected: str,
+    gateway_root: Path | None = None,
+    gateway_env_file: Path | None = None,
 ) -> None:
+    if gateway_env_file is not None and gateway_root is None:
+        raise ValueError("gateway environment file requires a trusted gateway")
     catalog_path = home / "omlx-models.json"
     profile = f"""model = {json.dumps(selected)}
 model_provider = "omlx"
@@ -249,6 +255,14 @@ supports_standalone_web_search = false
             "\n[mcp_servers.model-gateway]\n"
             f"command = {json.dumps(str(gateway_script))}\n"
         )
+        if gateway_env_file is not None:
+            env_file = gateway_env_file.resolve(strict=True)
+            if not env_file.is_file():
+                raise ValueError("gateway environment path must be a regular file")
+            profile += (
+                "\n[mcp_servers.model-gateway.env]\n"
+                f"MODEL_GATEWAY_ENV_FILE = {json.dumps(str(env_file))}\n"
+            )
     start_marker = "# BEGIN LOCAL CODEX MANAGED CONFIG"
     end_marker = "# END LOCAL CODEX MANAGED CONFIG"
     config_path = home / "config.toml"
@@ -288,6 +302,7 @@ def main() -> int:
     parser.add_argument("--persona-template", type=Path, required=True)
     parser.add_argument("--instructions-template", type=Path, required=True)
     parser.add_argument("--gateway-root", type=Path)
+    parser.add_argument("--gateway-env-file", type=Path)
     args = parser.parse_args()
 
     base_url = local_base_url(args.base_url)
@@ -304,7 +319,7 @@ def main() -> int:
     catalog, selected = prepare_catalog(records, args.model, base_instructions)
     args.home.mkdir(parents=True, exist_ok=True)
     atomic_write(args.home / "omlx-models.json", json.dumps(catalog, indent=2) + "\n")
-    write_profile(args.home, base_url, selected, args.gateway_root)
+    write_profile(args.home, base_url, selected, args.gateway_root, args.gateway_env_file)
     ensure_persona(args.home, args.persona_template)
     print(selected)
     return 0

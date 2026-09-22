@@ -2,6 +2,7 @@ import importlib.util
 import json
 from pathlib import Path
 import tempfile
+import tomllib
 import unittest
 
 
@@ -140,6 +141,31 @@ class PrepareRuntimeTests(unittest.TestCase):
             self.assertEqual(profile.count("[mcp_servers.model-gateway]"), 1)
             self.assertIn(f'command = "{script.resolve()}"', profile)
             self.assertNotIn("[mcp_servers.openrouter]", profile)
+
+    def test_profile_passes_gateway_environment_file_path_only(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            script = root / "gateway" / "bin" / "mcp-server.sh"
+            script.parent.mkdir(parents=True)
+            script.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+            script.chmod(0o755)
+            env_file = root / "secrets.env"
+            env_file.write_text("MINIMAX_API_KEY=fixture-secret\n", encoding="utf-8")
+            home = root / "home"
+            prepare_runtime.write_profile(
+                home,
+                "http://127.0.0.1:8001/v1",
+                "local",
+                script.parent.parent,
+                env_file,
+            )
+            profile = (home / "config.toml").read_text(encoding="utf-8")
+            parsed = tomllib.loads(profile)
+            self.assertEqual(
+                parsed["mcp_servers"]["model-gateway"]["env"]["MODEL_GATEWAY_ENV_FILE"],
+                str(env_file.resolve()),
+            )
+            self.assertNotIn("fixture-secret", profile)
 
 
 if __name__ == "__main__":

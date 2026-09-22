@@ -38,6 +38,7 @@ package. Run `python3 -m compileall -q local-codex/mavis/mavis` as a syntax
 gate. Runtime acceptance uses `python3 -m mavis eval e0` from the installed
 environment and must retain its receipts.
 
-The direct coordinator implementation exception for the initial bootstrap is
-`MiniMax/OpenCode authentication canary failed on 2026-09-22`; it ends after a
-valid native MiniMax canary and handoff are recorded.
+The direct coordinator implementation exception for the initial bootstrap
+remains only until a native MiniMax gateway handoff is recorded. OpenCode M2.5
+and M3 authenticated and used the native Read tool in isolated fixtures on
+2026-09-22; the gateway handoff is still pending independent acceptance.

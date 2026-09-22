@@ -7,9 +7,17 @@ runtime_home=${LOCAL_CODEX_HOME:-${HOME}/.local-codex}
 base_url=${OMLX_BASE_URL:-http://127.0.0.1:8001/v1}
 core_binary=${LOCAL_CODEX_BIN:-${share_dir}/local-codex-core}
 model_args=()
+gateway_env_args=()
 
 if [[ -n ${LOCAL_CODEX_MODEL:-} ]]; then
   model_args=(--model "$LOCAL_CODEX_MODEL")
+fi
+gateway_env_file=${MAVIS_GATEWAY_ENV_FILE:-${HOME}/Dev-Projects/env.env}
+if [[ -f "$gateway_env_file" ]]; then
+  gateway_env_args=(--gateway-env-file "$gateway_env_file")
+elif [[ -n ${MAVIS_GATEWAY_ENV_FILE:-} ]]; then
+  print -u2 "mavis: configured gateway environment file is unavailable"
+  exit 2
 fi
 
 case "${1:-}" in
@@ -48,6 +56,7 @@ python3 "$share_dir/prepare_runtime.py" \
   --persona-template "$share_dir/persona.toml" \
   --instructions-template "$share_dir/base-instructions.md" \
   --gateway-root "${MAVIS_GATEWAY_ROOT:-${HOME}/Dev-Projects/ai-skills-dev-mavis-gateway/marketplace/plugins/model-gateway}" \
+  "${gateway_env_args[@]}" \
   "${model_args[@]}" >/dev/null
 
 export CODEX_HOME="$runtime_home"
