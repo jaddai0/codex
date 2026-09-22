@@ -376,11 +376,29 @@ class E0Evaluator:
         return self._receipt("repeated-no-progress", "pass", ["Second identical failure without new evidence escalated"])
 
     def _isolation_recovery(self) -> dict[str, Any]:
+        proof_path = self.root / "isolation-recovery-live.json"
+        if not proof_path.is_file():
+            return self._receipt("isolation-recovery", "blocked", ["No host-observed Mavis service outage and recovery receipt exists"])
+        proof = json.loads(proof_path.read_text())
+        if proof.get("schema_version") != "mavis.e0-isolation-recovery/v1" or proof.get("candidate") != installed_candidate_fingerprint():
+            return self._receipt("isolation-recovery", "blocked", ["The installed candidate changed since service recovery was observed"])
+        before = proof.get("before") or {}
+        after = proof.get("after") or {}
         iris_alive = endpoint_alive(self.config.iris_endpoint)
         mavis_alive = endpoint_alive(self.config.endpoint)
-        distinct = not (_listener_pids(8000) & _listener_pids(8001))
+        iris_pids = _listener_pids(8000)
+        mavis_pids = _listener_pids(8001)
+        distinct = not (iris_pids & mavis_pids)
         mavis_owned = owns_running_server(self.config) if mavis_alive else False
-        status = "pass" if iris_alive and mavis_alive and distinct and mavis_owned else "reject"
+        observed = (
+            before.get("iris_pids") == after.get("iris_pids") == sorted(iris_pids)
+            and before.get("iris_model_loaded") is True
+            and after.get("iris_model_loaded") is True
+            and before.get("mavis_pids") != after.get("mavis_pids")
+            and after.get("mavis_pids") == sorted(mavis_pids)
+            and proof.get("outage_observed") is True
+        )
+        status = "pass" if iris_alive and mavis_alive and distinct and mavis_owned and observed else "reject"
         return self._receipt(
             "isolation-recovery",
             status,
@@ -389,5 +407,7 @@ class E0Evaluator:
                 f"mavis_alive={mavis_alive}",
                 f"distinct_listener_pids={distinct}",
                 f"mavis_owned={mavis_owned}",
+                f"outage_and_new_service_observed={observed}",
             ],
+            recovery_receipt=str(proof_path),
         )
