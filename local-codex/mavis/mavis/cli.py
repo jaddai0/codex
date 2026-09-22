@@ -9,6 +9,7 @@ import sys
 from pathlib import Path
 
 from .evidence import run_command
+from .e0_tasks import prepare_small_repository
 from .evaluations import E0_CASES, E0Evaluator
 from .maintenance import MaintenanceQueue
 from .objectives import ObjectiveStore
@@ -124,6 +125,7 @@ def build_parser() -> argparse.ArgumentParser:
     e0.add_argument(
         "--omlx-binary", default="/Users/dustinpainter/.venvs/omlx-dev/bin/omlx"
     )
+    evaluate_sub.add_parser("prepare-small")
 
     maintenance = subcommands.add_parser("maintenance")
     maintenance_sub = maintenance.add_subparsers(
@@ -266,6 +268,9 @@ def main(argv: list[str] | None = None) -> int:
         print(receipt)
         return 0
     if args.command == "eval":
+        if args.eval_suite == "prepare-small":
+            print_json({"manifest": str(prepare_small_repository(home))})
+            return 0
         result = E0Evaluator(home, runtime_config(args)).run(args.case)
         print_json(result)
         return 0 if result["status"] == "pass" else 1
