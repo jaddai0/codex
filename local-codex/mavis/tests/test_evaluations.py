@@ -5,13 +5,29 @@ import tempfile
 import unittest
 from unittest.mock import patch
 
-from mavis.evaluations import E0_CASES, E0Evaluator
+from mavis.evaluations import E0_CASES, E0Evaluator, native_review_completed
 from mavis.e0_tasks import prepare_small_repository
 from mavis.runtime import RuntimeConfig
 from mavis.storage import sha256_file
 
 
 class E0EvaluationTests(unittest.TestCase):
+    def test_native_review_accepts_completed_structured_cli_receipt_only(self):
+        verdict = "ACCEPT\nExact tests passed and protected file hash matched."
+        result = {
+            "sessionId": "sess_review",
+            "turnId": "turn_review",
+            "response": verdict,
+            "eventCount": 12,
+            "projection": {"status": "idle"},
+        }
+        log = "ZCode Built-in skipped (not-due)\n" + json.dumps(result, indent=2)
+        self.assertTrue(native_review_completed(log, verdict))
+        self.assertFalse(native_review_completed(log, "ACCEPT\nDifferent finding"))
+        result["projection"]["status"] = "running"
+        self.assertFalse(native_review_completed(json.dumps(result), verdict))
+        self.assertFalse(native_review_completed("ACCEPT\nNo session receipt", verdict))
+
     def test_small_repository_fixture_has_failing_baseline_and_protected_dirty_note(
         self,
     ):

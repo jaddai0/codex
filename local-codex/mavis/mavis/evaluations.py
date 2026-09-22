@@ -60,6 +60,41 @@ def installed_candidate_fingerprint() -> dict[str, str]:
     }
 
 
+def native_review_completed(log: str, verdict: str) -> bool:
+    """Recognize a completed native ZCode stream or its structured CLI result."""
+    events = []
+    for line in log.splitlines():
+        if line.startswith("{"):
+            try:
+                events.append(json.loads(line))
+            except json.JSONDecodeError:
+                events = []
+                break
+    if any(event.get("type") == "turn.completed" for event in events):
+        return verdict.lstrip().startswith("ACCEPT")
+    start = log.find("{")
+    if start < 0:
+        return False
+    try:
+        result = json.loads(log[start:])
+    except json.JSONDecodeError:
+        return False
+    projection = result.get("projection") or {}
+    response = result.get("response")
+    return bool(
+        isinstance(result.get("sessionId"), str)
+        and result["sessionId"].startswith("sess_")
+        and isinstance(result.get("turnId"), str)
+        and result["turnId"].startswith("turn_")
+        and isinstance(result.get("eventCount"), int)
+        and result["eventCount"] > 0
+        and projection.get("status") == "idle"
+        and isinstance(response, str)
+        and response == verdict
+        and response.lstrip().startswith("ACCEPT")
+    )
+
+
 def _post_json(url: str, payload: dict[str, Any], timeout: float = 180.0) -> dict[str, Any]:
     body = json.dumps(payload).encode("utf-8")
     request = Request(
@@ -160,16 +195,16 @@ class E0Evaluator:
             if subprocess.check_output(["git", "-C", str(repo), "ls-files", "--others", "--exclude-standard"], text=True).strip():
                 raise ValueError("E0 task contains unexpected untracked files")
             mavis_events = [json.loads(line) for line in mavis_log.read_text().splitlines() if line.startswith("{")]
-            terra_events = [json.loads(line) for line in terra_log.read_text().splitlines() if line.startswith("{")]
+            terra_output = terra_log.read_text()
             mavis_finished = any(event.get("type") == "turn.completed" for event in mavis_events)
-            terra_finished = any(event.get("type") == "turn.completed" for event in terra_events)
+            terra_finished = native_review_completed(terra_output, terra_result.read_text())
             patch_seen = any(
                 event.get("type") == "item.completed"
                 and event.get("item", {}).get("type") == "file_change"
                 and any(Path(change.get("path", "")).resolve() == repo / "package" / "pricing.py" for change in event["item"].get("changes", []))
                 for event in mavis_events
             )
-            if not (mavis_finished and terra_finished and patch_seen and terra_result.read_text().lstrip().startswith("ACCEPT")):
+            if not (mavis_finished and terra_finished and patch_seen):
                 raise ValueError("E0 installed repair or independent Terra review is incomplete")
             tests = subprocess.run(
                 manifest["test_command"], cwd=repo, capture_output=True, text=True,
