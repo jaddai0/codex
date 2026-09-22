@@ -72,6 +72,9 @@ def build_parser() -> argparse.ArgumentParser:
     create.add_argument("path", type=Path)
     show = objective_sub.add_parser("show")
     show.add_argument("objective_id")
+    bind_session = objective_sub.add_parser("bind-session")
+    bind_session.add_argument("objective_id")
+    bind_session.add_argument("session_id")
     transition = objective_sub.add_parser("transition")
     transition.add_argument("objective_id")
     transition.add_argument("state")
@@ -170,24 +173,29 @@ def main(argv: list[str] | None = None) -> int:
             raise ValueError("transcript session ID does not match hook input")
         archive = TranscriptArchive(home, session_id)
         segment = archive.import_rollout(source)
-        archive.write_handoff(
-            {
-                "goals": [],
-                "accepted_decisions": [],
-                "completed_requirements": [],
-                "current_changes": [],
-                "recent_work": [
-                    {
-                        "turn_id": payload.get("turn_id"),
-                        "trigger": payload.get("trigger"),
-                    }
-                ],
-                "unresolved_failures": [
-                    "Objective state has not been added to this handoff; consult the archived transcript."
-                ],
-                "evidence_links": [str(segment or archive.manifest_path)],
-            }
+        snapshot = ObjectiveStore(home).handoff_snapshot(session_id)
+        handoff = snapshot or {
+            "goals": [],
+            "accepted_decisions": [],
+            "completed_requirements": [],
+            "current_changes": [],
+            "recent_work": [],
+            "unresolved_failures": [
+                "No objective is bound to this session; consult the archived transcript."
+            ],
+            "evidence_links": [],
+            "unknown_fields": [
+                "goals",
+                "accepted_decisions",
+                "completed_requirements",
+                "current_changes",
+            ],
+        }
+        handoff["recent_work"].append(
+            {"turn_id": payload.get("turn_id"), "trigger": payload.get("trigger")}
         )
+        handoff["evidence_links"].append(str(segment or archive.manifest_path))
+        archive.write_handoff(handoff)
         print_json({"continue": True})
         return 0
     if args.command == "runtime":
@@ -218,6 +226,10 @@ def main(argv: list[str] | None = None) -> int:
             print_json(store.load(args.objective_id))
         elif args.objective_command == "assign":
             print_json(store.add_assignment(args.objective_id, read_json(args.path)))
+        elif args.objective_command == "bind-session":
+            print_json(
+                {"binding": str(store.bind_session(args.objective_id, args.session_id))}
+            )
         elif args.objective_command == "attach-receipt":
             print_json(store.add_receipt(args.objective_id, args.path))
         elif args.objective_command == "verify":

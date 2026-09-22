@@ -60,6 +60,64 @@ class ObjectiveCliTests(unittest.TestCase):
                 with self.assertRaisesRegex(ValueError, "does not match"):
                     main(["pre-compact"])
 
+    def test_pre_compact_includes_bound_objective_without_claiming_unverified_work(
+        self,
+    ):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            home = root / "mavis"
+            codex_home = root / "codex"
+            codex_home.mkdir()
+            rollout = codex_home / "rollout.jsonl"
+            rollout.write_text(
+                json.dumps({"type": "session_meta", "payload": {"id": "session-2"}})
+                + "\n"
+            )
+            store = ObjectiveStore(home)
+            store.create(
+                {
+                    "schema_version": "mavis.objective/v1",
+                    "objective_id": "task-2",
+                    "blueprint": "Repair the parser",
+                    "requirements": [{"id": "r1", "text": "keep failures"}],
+                    "dependencies": [],
+                    "scope": {},
+                    "acceptance_checks": [{"id": "c1"}],
+                    "unresolved_decisions": ["Choose input format"],
+                }
+            )
+            with (
+                patch.dict(os.environ, {"MAVIS_HOME": str(home)}),
+                contextlib.redirect_stdout(io.StringIO()),
+            ):
+                self.assertEqual(
+                    main(["objective", "bind-session", "task-2", "session-2"]), 0
+                )
+            hook = {
+                "hook_event_name": "PreCompact",
+                "session_id": "session-2",
+                "turn_id": "turn-2",
+                "trigger": "manual",
+                "transcript_path": str(rollout),
+            }
+            with (
+                patch.dict(
+                    os.environ, {"MAVIS_HOME": str(home), "CODEX_HOME": str(codex_home)}
+                ),
+                patch("sys.stdin", io.StringIO(json.dumps(hook))),
+                contextlib.redirect_stdout(io.StringIO()),
+            ):
+                self.assertEqual(main(["pre-compact"]), 0)
+            handoff_path = next(
+                (home / "transcripts" / "session-2" / "handoffs").glob("*.json")
+            )
+            handoff = json.loads(handoff_path.read_text())
+            self.assertEqual(handoff["objective_id"], "task-2")
+            self.assertEqual(handoff["goals"], ["Repair the parser"])
+            self.assertEqual(handoff["completed_requirements"], [])
+            self.assertIn("Choose input format", handoff["unresolved_failures"])
+            self.assertIn("accepted_decisions", handoff["unknown_fields"])
+
     def test_run_attaches_host_receipt_to_existing_objective(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
