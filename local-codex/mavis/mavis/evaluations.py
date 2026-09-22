@@ -21,7 +21,6 @@ from .evidence import parse_test_output, run_command
 from .objectives import ObjectiveStore
 from .runtime import RuntimeConfig, _listener_pids, admission, endpoint_alive, inventory, owns_running_server
 from .storage import sha256_file, write_json
-from .transcripts import TranscriptArchive
 
 
 E0_CASES = (
@@ -402,28 +401,67 @@ class E0Evaluator:
         ])
 
     def _compaction_restart(self) -> dict[str, Any]:
-        archive = TranscriptArchive(self.home, "e0-compaction")
-        segment = archive.append_segment(
-            [{"role": "user", "content": "EARLY_DECISION_7B9A"}]
-        )
-        archive.write_handoff(
-            {
-                "goals": ["recover the early decision"],
-                "accepted_decisions": ["EARLY_DECISION_7B9A"],
-                "completed_requirements": [],
-                "current_changes": [],
-                "recent_work": [],
-                "unresolved_failures": [],
-                "evidence_links": ["segment"],
-            }
-        )
-        restarted = TranscriptArchive(self.home, "e0-compaction")
-        hits = restarted.search("EARLY_DECISION_7B9A", 5)
-        if not hits:
-            raise RuntimeError("early decision was not recovered after archive restart")
+        for result_path in sorted(
+            self.root.glob("compaction-live-*/result.json"),
+            key=lambda path: path.stat().st_mtime,
+            reverse=True,
+        ):
+            result = json.loads(result_path.read_text())
+            rollout = Path(result.get("rollout", ""))
+            session = result.get("session_id")
+            fact = result.get("fact")
+            if not (rollout.is_file() and isinstance(session, str) and isinstance(fact, str)):
+                continue
+            if result.get("candidate") != installed_candidate_fingerprint():
+                continue
+            if not (result.get("first_exit") == result.get("resume_exit") == 0
+                    and result.get("iris_loaded") is True
+                    and result.get("mavis_loaded") is False
+                    and result.get("exact_recovery") is True
+                    and result.get("resumed_answer") == fact):
+                continue
+            events = [json.loads(line) for line in rollout.read_text().splitlines() if line.strip()]
+            if not events or events[0].get("payload", {}).get("id") != session:
+                continue
+            if events[0].get("payload", {}).get("cwd") != result.get("workspace"):
+                continue
+            compact_at = next((i for i, event in enumerate(events) if event.get("type") == "compacted"), None)
+            if compact_at is None:
+                continue
+            before, after = events[:compact_at], events[compact_at + 1:]
+            def has_user(items: list[dict[str, Any]], expected: str) -> bool:
+                return any(event.get("type") == "response_item"
+                           and event.get("payload", {}).get("role") == "user"
+                           and expected in json.dumps(event.get("payload", {}).get("content", []))
+                           for event in items)
+            def has_answer(items: list[dict[str, Any]], expected: str) -> bool:
+                return any(event.get("type") == "event_msg"
+                           and event.get("payload", {}).get("type") == "task_complete"
+                           and event["payload"].get("last_agent_message") == expected
+                           for event in items)
+            if not (has_user(before, fact) and has_answer(before, "ACK")
+                    and has_user(after, "What exact fact did I give before compaction?")
+                    and has_answer(after, fact)):
+                continue
+            handoffs = [Path(path) for path in result.get("handoffs", [])]
+            handoff_root = self.home / "transcripts" / session / "handoffs"
+            if not handoffs or not all(path.is_file() and path.parent == handoff_root for path in handoffs):
+                continue
+            segments = []
+            for path in handoffs:
+                handoff = json.loads(path.read_text())
+                segments.extend(Path(link) for link in handoff.get("evidence_links", []))
+            segment_root = self.home / "transcripts" / session / "segments"
+            if not any(path.is_file() and path.parent == segment_root
+                       and fact in path.read_text() for path in segments):
+                continue
+            return self._receipt("compaction-restart", "pass", [
+                f"Installed TUI rollout {rollout} compacted and resumed the same session",
+                f"Handoff {handoffs[0]} linked an archive containing the fact; resumed answer matched",
+                f"IRIS restored and Mavis unloaded in {result_path}",
+            ], installed_candidate=result["candidate"])
         return self._receipt("compaction-restart", "blocked", [
-            f"Archive fixture recovered the early decision from {segment}",
-            "A real Codex compaction and resumed Mavis session are still required.",
+            "No candidate-matched installed TUI compaction, handoff, and exact-session resume passed inspection."
         ])
 
     def _repeated_no_progress(self) -> dict[str, Any]:
