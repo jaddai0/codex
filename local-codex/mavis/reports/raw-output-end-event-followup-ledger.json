@@ -1,0 +1,38 @@
+{
+  "schema_version": "work-closeout/v1",
+  "task": "Keep Mavis raw-output end events consistent with post-exit drain",
+  "status": "complete",
+  "constraint": {
+    "binding": "evidence",
+    "statement": "The background stream could stop at 100 ms while the Mavis reader remained open.",
+    "evidence": ["codex-rs/core/src/unified_exec/async_watcher.rs", "local-codex/mavis/reports/raw-output-end-event-followup.md"]
+  },
+  "rejected_alternatives": [],
+  "requirements": [
+    {
+      "id": "late_tail",
+      "requirement": "Mavis end event includes output after the ordinary grace",
+      "status": "pass",
+      "command": "just test -p codex-core mavis_",
+      "artifact": "codex-rs/core/src/unified_exec/async_watcher_tests.rs",
+      "evidence": ["Controlled 150 ms tail appeared in completed event transcript and complete raw file"]
+    },
+    {
+      "id": "held_pipe",
+      "requirement": "A held Mavis pipe fails its end event at the bounded drain limit",
+      "status": "pass",
+      "command": "just test -p codex-core mavis_",
+      "artifact": "codex-rs/core/src/unified_exec/async_watcher_tests.rs",
+      "evidence": ["Simulated 30-second held pipe produced failed event and incomplete raw reference"]
+    },
+    {
+      "id": "ordinary_codex",
+      "requirement": "Ordinary Codex output and event behavior remains valid",
+      "status": "pass",
+      "command": "ZDOTDIR=$(mktemp -d) just test -p codex-core unified_exec",
+      "artifact": "codex-rs/core/src/unified_exec/async_watcher.rs",
+      "evidence": ["179 unified exec tests passed, including ordinary event and timeout paths"]
+    }
+  ],
+  "uncertainty": []
+}

@@ -9,6 +9,7 @@ use tokio::time::Sleep;
 
 use super::SharedPluginMetricsSidecar;
 use super::UnifiedExecContext;
+use super::process::MAVIS_POST_EXIT_DRAIN_TIMEOUT;
 use super::process::OutputHandles;
 use super::process::UnifiedExecProcess;
 use super::take_plugin_metrics_sidecar;
@@ -58,11 +59,12 @@ struct Buffer<const MAX_BYTES: usize = UNIFIED_EXEC_OUTPUT_DELTA_MAX_BYTES> {
 /// shared transcript, and emits ExecCommandOutputDelta events on UTF‑8
 /// boundaries.
 pub(crate) fn start_streaming_output(
-    process: &UnifiedExecProcess,
+    process: Arc<UnifiedExecProcess>,
     context: &UnifiedExecContext,
     transcript: Arc<Mutex<HeadTailBuffer>>,
 ) {
     let mut receiver = process.output_receiver();
+    let requires_raw_output_drain = process.requires_raw_output_drain();
     let output_drained = process.output_drained_notify();
     let exit_token = process.cancellation_token();
     let OutputHandles {
@@ -103,7 +105,12 @@ pub(crate) fn start_streaming_output(
 
             tokio::select! {
                 _ = exit_token.cancelled(), if grace_sleep.is_none() => {
-                    let deadline = Instant::now() + TRAILING_OUTPUT_GRACE;
+                    let grace = if requires_raw_output_drain {
+                        MAVIS_POST_EXIT_DRAIN_TIMEOUT
+                    } else {
+                        TRAILING_OUTPUT_GRACE
+                    };
+                    let deadline = Instant::now() + grace;
                     grace_sleep.replace(Box::pin(tokio::time::sleep_until(deadline)));
                 }
 
@@ -112,6 +119,12 @@ pub(crate) fn start_streaming_output(
                         sleep.as_mut().await;
                     }
                 }, if grace_sleep.is_some() => {
+                    if requires_raw_output_drain && !output_closed.load(Ordering::Acquire) {
+                        process.fail_and_terminate(
+                            "Mavis raw output did not finish draining after process exit"
+                                .to_string(),
+                        );
+                    }
                     break;
                 }
 
@@ -187,6 +200,9 @@ pub(crate) fn spawn_exit_watcher(
     tokio::spawn(async move {
         exit_token.cancelled().await;
         output_drained.notified().await;
+        if let Err(err) = process.wait_for_raw_output_drain_if_exited().await {
+            process.fail_and_terminate(err.to_string());
+        }
         // Deferred network denial deliberately remains observable for a short
         // window after process exit. Do not classify the terminal event until
         // that monitor has settled, even when output closes immediately.
