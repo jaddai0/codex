@@ -4,7 +4,8 @@ from pathlib import Path
 import tempfile
 import unittest
 
-from mavis.experiments import ExperimentStore, _digest
+from mavis.experiments import (ExperimentStore, _digest,
+                               candidate_assignment_requirements, review_assignment_requirements)
 from mavis.storage import sha256_file, write_json
 
 
@@ -29,31 +30,40 @@ class ExperimentLifecycleTests(unittest.TestCase):
 
     def _gateway_status(self, worker_job_id):
         record = self.store._load("fix-1")
+        candidate = worker_job_id == "candidate-worker-1"
+        requirements = (candidate_assignment_requirements(record) if candidate
+                        else review_assignment_requirements(record))
+        verifier = "terra-candidate-1" if candidate else self.gateway_verifier
+        review_report = self.home / "verifications" / "experiments" / "fix-1.json"
         return {"job_id": worker_job_id, "state": "completed", "exit_code": 0,
                 "accepted": True,
                 "receipt": {"job_id": worker_job_id, "exit_code": 0},
                 "acceptance": {"accepted": True, "job_id": worker_job_id,
-                               "verifier": "terra", "verifier_job_id": self.gateway_verifier,
+                               "verifier": "terra", "verifier_job_id": verifier,
                                "target_sha256": "a" * 64, "evidence_sha256": "b" * 64,
                                "report_sha256_on_disk": "c" * 64,
                                "verifier_verdict_sha256": "d" * 64},
-                "mavis_binding": {"objective_id": "fix-1", "requirements": [
-                    {"id": "experiment-comparison", "text": record["comparison"]["comparison_digest"]}]}}
+                "mavis_binding": {"objective_id": "fix-1", "requirements": requirements,
+                                  "report_sha256": (record["comparison"]["candidate"]["evidence"]["sha256"]
+                                                    if candidate else sha256_file(review_report))}}
 
     def _result(self, arm, score, *, mandatory=True):
         path = self.home / f"{arm}.log"
         path.write_text(f"{arm} exact independent check output\n")
-        return {"configuration_sha256": self.record[arm]["sha256"],
+        result = {"configuration_sha256": self.record[arm]["sha256"],
                 "workload_digest": _digest(self.record["workload"]),
                 "case_ids": ["case-1", "case-2"], "mandatory_passed": mandatory,
                 "target_score": score,
                 "evidence": {"path": str(path), "sha256": sha256_file(path)}}
+        if arm == "candidate":
+            result["candidate_job_id"] = "candidate-worker-1"
+        return result
 
     def _compare(self):
         return self.store.compare("fix-1", baseline_result=self._result("baseline", 0.3, mandatory=False),
                                   candidate_result=self._result("candidate", 0.8))
 
-    def _review(self, *, verifier="terra-2", candidate_job="worker-1", verdict="accepted"):
+    def _review(self, *, verifier="terra-2", candidate_job="candidate-worker-1", verdict="accepted"):
         record = self.store.load("fix-1")
         path = self.home / "verifications" / "experiments" / "fix-1.json"
         write_json(path, {"schema_version": "mavis.experiment-review/v1", "experiment_id": "fix-1",
@@ -119,7 +129,7 @@ class ExperimentLifecycleTests(unittest.TestCase):
         self._compare()
         with self.assertRaisesRegex(ValueError, "separate verification store"):
             self.store.review("fix-1", self.home / "forged.json")
-        bad = self._review(verifier="worker-1")
+        bad = self._review(verifier="candidate-worker-1")
         with self.assertRaisesRegex(ValueError, "mismatched"):
             self.store.review("fix-1", bad)
         good = self._review()
@@ -140,6 +150,70 @@ class ExperimentLifecycleTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "status changed"):
             self.store.promote("fix-1", between_objectives=True)
         self.assertEqual(self.store.active("main")["configuration"], self.record["baseline"])
+
+    def test_review_rejects_gateway_incompatible_requirement_shape(self):
+        self._compare()
+        receipt = self._review()
+        def incompatible(job_id):
+            status = self._gateway_status(job_id)
+            if job_id == "review-worker-1":
+                status["mavis_binding"]["requirements"] = [
+                    {"id": "experiment-comparison", "text": self.store._load("fix-1")["comparison"]["comparison_digest"]}]
+            return status
+        self.store.gateway_status_reader = incompatible
+        with self.assertRaisesRegex(ValueError, "exact comparison"):
+            self.store.review("fix-1", receipt)
+
+    def test_assignment_requirements_are_canonical_gateway_strings(self):
+        record = self._compare()
+        candidate = candidate_assignment_requirements(record)
+        review = review_assignment_requirements(record)
+        self.assertEqual(candidate, [f"experiment-candidate-snapshot:{record['candidate']['sha256']}"])
+        self.assertEqual(review, [
+            f"experiment-comparison:{record['comparison']['comparison_digest']}",
+            "experiment-candidate-job:candidate-worker-1",
+            f"experiment-candidate-report:{record['comparison']['candidate']['evidence']['sha256']}",
+        ])
+        self.assertTrue(all(isinstance(item, str) and item for item in candidate + review))
+        self.assertEqual(len(set(review)), len(review))
+
+    def test_review_rejects_substituted_candidate_job_and_report(self):
+        self._compare()
+        with self.assertRaisesRegex(ValueError, "mismatched"):
+            self.store.review("fix-1", self._review(candidate_job="unrelated-worker"))
+        receipt = self._review()
+        def wrong_candidate_report(job_id):
+            status = self._gateway_status(job_id)
+            if job_id == "candidate-worker-1":
+                status["mavis_binding"]["report_sha256"] = "f" * 64
+            return status
+        self.store.gateway_status_reader = wrong_candidate_report
+        with self.assertRaisesRegex(ValueError, "candidate evidence"):
+            self.store.review("fix-1", receipt)
+
+    def test_review_receipt_must_be_exact_gateway_report(self):
+        self._compare()
+        receipt = self._review()
+        def unrelated_report(job_id):
+            status = self._gateway_status(job_id)
+            if job_id == "review-worker-1":
+                status["mavis_binding"]["report_sha256"] = "f" * 64
+            return status
+        self.store.gateway_status_reader = unrelated_report
+        with self.assertRaisesRegex(ValueError, "exact report"):
+            self.store.review("fix-1", receipt)
+
+    def test_candidate_gateway_revocation_blocks_staging(self):
+        self._compare()
+        self.store.review("fix-1", self._review())
+        def revoked_candidate(job_id):
+            status = self._gateway_status(job_id)
+            if job_id == "candidate-worker-1":
+                status["accepted"] = False
+            return status
+        self.store.gateway_status_reader = revoked_candidate
+        with self.assertRaisesRegex(ValueError, "not accepted"):
+            self.store.stage("fix-1")
 
     def test_stale_baseline_blocks_stage(self):
         self._compare()

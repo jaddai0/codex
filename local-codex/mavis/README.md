@@ -31,7 +31,8 @@ blocked rather than replaced with synthetic success.
 `mavis.experiments.ExperimentStore` keeps prompt, tool-setting, and retrieval
 candidate configurations under the Mavis home. It freezes the active baseline,
 accepts matched held-out results with retained output hashes, requires a
-separate gateway worker accepted by Terra for the exact comparison, stages a
+separate candidate and review gateway worker accepted by Terra for the exact
+candidate report and comparison, stages a
 candidate, and promotes it only between objectives. Rollback restores the
 previous accepted configuration. An experiment can be queued through
 `MaintenanceQueue`; its checkpoint records the experiment state and record hash

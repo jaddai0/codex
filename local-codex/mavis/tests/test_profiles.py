@@ -3,7 +3,8 @@ from pathlib import Path
 import tempfile
 import unittest
 
-from mavis.experiments import ExperimentStore, _digest
+from mavis.experiments import (ExperimentStore, _digest,
+                               candidate_assignment_requirements, review_assignment_requirements)
 from mavis.profiles import ProfileStore
 from mavis.storage import sha256_file, write_json
 
@@ -28,8 +29,12 @@ def profile(profile_id, experiments=None, prompt=""):
 
 class ProfileStoreTests(unittest.TestCase):
     def _gateway_status(self, worker_job_id):
-        experiment_id = worker_job_id.removeprefix("review-")
+        candidate = worker_job_id.startswith("candidate-")
+        experiment_id = worker_job_id.removeprefix("candidate-").removeprefix("review-")
         record = self.experiments._load(experiment_id)
+        requirements = (candidate_assignment_requirements(record) if candidate
+                        else review_assignment_requirements(record))
+        review_report = self.experiments.home / "verifications" / "experiments" / f"{experiment_id}.json"
         return {"job_id": worker_job_id, "state": "completed", "exit_code": 0,
                 "accepted": True,
                 "receipt": {"job_id": worker_job_id, "exit_code": 0},
@@ -38,8 +43,9 @@ class ProfileStoreTests(unittest.TestCase):
                                "target_sha256": "a" * 64, "evidence_sha256": "b" * 64,
                                "report_sha256_on_disk": "c" * 64,
                                "verifier_verdict_sha256": "d" * 64},
-                "mavis_binding": {"objective_id": experiment_id, "requirements": [
-                    {"id": "experiment-comparison", "text": record["comparison"]["comparison_digest"]}]}}
+                "mavis_binding": {"objective_id": experiment_id, "requirements": requirements,
+                                  "report_sha256": (record["comparison"]["candidate"]["evidence"]["sha256"]
+                                                    if candidate else sha256_file(review_report))}}
 
     def _promotion_evidence(self, root: Path, experiment_id: str, prompt: str):
         active = self.experiments.active("main")
@@ -57,6 +63,8 @@ class ProfileStoreTests(unittest.TestCase):
                             "case_ids": ["case-1"], "mandatory_passed": arm == "candidate",
                             "target_score": score,
                             "evidence": {"path": str(evidence), "sha256": sha256_file(evidence)}}
+            if arm == "candidate":
+                results[arm]["candidate_job_id"] = f"candidate-{experiment_id}"
         record = self.experiments.compare(experiment_id, baseline_result=results["baseline"],
                                           candidate_result=results["candidate"])
         verifier = root / "verifications" / "experiments" / f"{experiment_id}.json"

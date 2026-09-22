@@ -27,6 +27,21 @@ from .storage import read_json, require_safe_id, sha256_file, write_json
 KINDS = {"prompts", "tool_settings", "retrieval"}
 
 
+def candidate_assignment_requirements(record: dict[str, Any]) -> list[str]:
+    """String IDs for the gateway candidate worker's Mavis assignment."""
+    return [f"experiment-candidate-snapshot:{record['candidate']['sha256']}"]
+
+
+def review_assignment_requirements(record: dict[str, Any]) -> list[str]:
+    """String IDs for the gateway review worker's Mavis assignment."""
+    candidate = record["comparison"]["candidate"]
+    return [
+        f"experiment-comparison:{record['comparison']['comparison_digest']}",
+        f"experiment-candidate-job:{candidate['candidate_job_id']}",
+        f"experiment-candidate-report:{candidate['evidence']['sha256']}",
+    ]
+
+
 def _now() -> str:
     return datetime.now(timezone.utc).isoformat()
 
@@ -181,6 +196,10 @@ class ExperimentStore:
                 raise ValueError("held-out split needs a positive minimum gain")
             if candidate_result["target_score"] - baseline_result["target_score"] < minimum_gain:
                 raise ValueError("candidate did not improve the targeted held-out outcome")
+            candidate_job_id = candidate_result.get("candidate_job_id")
+            if not isinstance(candidate_job_id, str):
+                raise ValueError("candidate result requires a native candidate job ID")
+            require_safe_id(candidate_job_id, "candidate job id")
             comparison = {"baseline": deepcopy(baseline_result), "candidate": deepcopy(candidate_result),
                           "comparison_digest": _digest({"baseline": baseline_result, "candidate": candidate_result}),
                           "recorded_at": _now()}
@@ -226,17 +245,24 @@ class ExperimentStore:
                     or receipt.get("candidate_sha256") != record["candidate"]["sha256"]
                     or receipt.get("baseline_sha256") != record["baseline"]["sha256"]
                     or receipt.get("verdict") not in {"accepted", "rejected"}
+                    or receipt.get("candidate_job_id") != record["comparison"]["candidate"]["candidate_job_id"]
                     or not receipt.get("gateway_worker_job_id")
                     or not receipt.get("verifier_job_id")
-                    or receipt.get("verifier_job_id") == receipt.get("candidate_job_id")):
+                    or receipt.get("verifier_job_id") == receipt.get("candidate_job_id")
+                    or receipt.get("gateway_worker_job_id") == receipt.get("candidate_job_id")):
                 raise ValueError("independent review receipt is missing or mismatched")
+            candidate_status = self._candidate_status(receipt["candidate_job_id"], record)
             status = self._review_status(receipt["gateway_worker_job_id"], record)
+            if status["mavis_binding"].get("report_sha256") != sha256_file(path):
+                raise ValueError("review receipt is not the gateway worker's exact report")
             if receipt["verifier_job_id"] != status["acceptance"]["verifier_job_id"]:
                 raise ValueError("review verifier does not match the native gateway receipt")
             record["review"] = {"path": str(path), "sha256": sha256_file(path),
                                 "verdict": receipt["verdict"], "verifier_job_id": receipt["verifier_job_id"],
                                 "gateway_worker_job_id": receipt["gateway_worker_job_id"],
-                                "gateway_status_digest": _digest(status)}
+                                "gateway_status_digest": _digest(status),
+                                "candidate_job_id": receipt["candidate_job_id"],
+                                "candidate_status_digest": _digest(candidate_status)}
             record["state"] = "reviewed" if receipt["verdict"] == "accepted" else "rejected"
             record["updated_at"] = _now()
             write_json(self._record_path(experiment_id), record)
@@ -247,18 +273,33 @@ class ExperimentStore:
         if not isinstance(status, dict):
             raise ValueError("native gateway returned no review status")
         _validate_gateway_status(status, worker_job_id)
-        acceptance = status.get("acceptance") if isinstance(status, dict) else None
-        binding = status.get("mavis_binding") if isinstance(status, dict) else None
+        acceptance = status.get("acceptance")
+        binding = status.get("mavis_binding")
         requirements = binding.get("requirements") if isinstance(binding, dict) else None
-        expected_requirement = {"id": "experiment-comparison", "text": record["comparison"]["comparison_digest"]}
+        expected_requirements = review_assignment_requirements(record)
         if (status.get("job_id") != worker_job_id or status.get("state") != "completed"
                 or status.get("exit_code") != 0 or status.get("accepted") is not True
                 or not isinstance(acceptance, dict) or acceptance.get("accepted") is not True
                 or acceptance.get("job_id") != worker_job_id or acceptance.get("verifier") != "terra"
                 or not acceptance.get("verifier_job_id") or acceptance["verifier_job_id"] == worker_job_id
                 or not isinstance(binding, dict) or binding.get("objective_id") != record["experiment_id"]
-                or not isinstance(requirements, list) or expected_requirement not in requirements):
+                or not isinstance(requirements, list)
+                or not all(item in requirements for item in expected_requirements)):
             raise ValueError("native gateway did not independently accept this exact comparison")
+        return status
+
+    def _candidate_status(self, candidate_job_id: str, record: dict[str, Any]) -> dict[str, Any]:
+        status = self.gateway_status_reader(candidate_job_id)
+        if not isinstance(status, dict):
+            raise ValueError("native gateway returned no candidate status")
+        _validate_gateway_status(status, candidate_job_id)
+        binding = status.get("mavis_binding")
+        candidate = record["comparison"]["candidate"]
+        if (not isinstance(binding, dict) or binding.get("objective_id") != record["experiment_id"]
+                or binding.get("report_sha256") != candidate["evidence"]["sha256"]
+                or not isinstance(binding.get("requirements"), list)
+                or not all(item in binding["requirements"] for item in candidate_assignment_requirements(record))):
+            raise ValueError("native candidate job is not bound to candidate evidence")
         return status
 
     def _check_review(self, record: dict[str, Any]) -> None:
@@ -266,8 +307,12 @@ class ExperimentStore:
         if sha256_file(Path(review["path"])) != review["sha256"]:
             raise ValueError("review receipt changed")
         receipt = read_json(Path(review["path"]))
+        candidate_status = self._candidate_status(review["candidate_job_id"], record)
         status = self._review_status(review["gateway_worker_job_id"], record)
         if (receipt.get("verdict") != "accepted" or _digest(status) != review["gateway_status_digest"]
+                or _digest(candidate_status) != review["candidate_status_digest"]
+                or status["mavis_binding"].get("report_sha256") != review["sha256"]
+                or receipt.get("candidate_job_id") != review["candidate_job_id"]
                 or receipt.get("verifier_job_id") != status["acceptance"]["verifier_job_id"]):
             raise ValueError("independent review status changed")
 
