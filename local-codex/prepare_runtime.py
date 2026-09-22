@@ -204,7 +204,9 @@ def ensure_persona(home: Path, template: Path) -> None:
     atomic_write(home / "AGENTS.md", rendered)
 
 
-def write_profile(home: Path, base_url: str, selected: str) -> None:
+def write_profile(
+    home: Path, base_url: str, selected: str, gateway_root: Path | None = None
+) -> None:
     catalog_path = home / "omlx-models.json"
     profile = f"""model = {json.dumps(selected)}
 model_provider = "omlx"
@@ -239,6 +241,14 @@ requires_openai_auth = false
 supports_websockets = false
 supports_standalone_web_search = false
 """
+    if gateway_root is not None:
+        gateway_script = gateway_root.resolve() / "bin" / "mcp-server.sh"
+        if not gateway_script.is_file() or not os.access(gateway_script, os.X_OK):
+            raise FileNotFoundError(f"trusted Mavis gateway launcher is unavailable: {gateway_script}")
+        profile += (
+            "\n[mcp_servers.model-gateway]\n"
+            f"command = {json.dumps(str(gateway_script))}\n"
+        )
     start_marker = "# BEGIN LOCAL CODEX MANAGED CONFIG"
     end_marker = "# END LOCAL CODEX MANAGED CONFIG"
     config_path = home / "config.toml"
@@ -262,6 +272,8 @@ supports_standalone_web_search = false
             ]
             if offsets:
                 suffix = current[min(offsets) :].lstrip("\n")
+    if gateway_root is not None and "[mcp_servers.model-gateway]" in suffix:
+        raise ValueError("existing Mavis gateway registration needs review before replacement")
     managed = f"{start_marker}\n{profile}{end_marker}\n"
     if suffix:
         managed += f"\n{suffix}"
@@ -275,6 +287,7 @@ def main() -> int:
     parser.add_argument("--model")
     parser.add_argument("--persona-template", type=Path, required=True)
     parser.add_argument("--instructions-template", type=Path, required=True)
+    parser.add_argument("--gateway-root", type=Path)
     args = parser.parse_args()
 
     base_url = local_base_url(args.base_url)
@@ -291,7 +304,7 @@ def main() -> int:
     catalog, selected = prepare_catalog(records, args.model, base_instructions)
     args.home.mkdir(parents=True, exist_ok=True)
     atomic_write(args.home / "omlx-models.json", json.dumps(catalog, indent=2) + "\n")
-    write_profile(args.home, base_url, selected)
+    write_profile(args.home, base_url, selected, args.gateway_root)
     ensure_persona(args.home, args.persona_template)
     print(selected)
     return 0

@@ -47,6 +47,7 @@ python3 "$share_dir/prepare_runtime.py" \
   --base-url "$base_url" \
   --persona-template "$share_dir/persona.toml" \
   --instructions-template "$share_dir/base-instructions.md" \
+  --gateway-root "${MAVIS_GATEWAY_ROOT:-${HOME}/Dev-Projects/ai-skills-dev-mavis-gateway/marketplace/plugins/model-gateway}" \
   "${model_args[@]}" >/dev/null
 
 export CODEX_HOME="$runtime_home"

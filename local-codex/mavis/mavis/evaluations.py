@@ -170,14 +170,30 @@ class E0Evaluator:
 
     def _fabricated_success(self) -> dict[str, Any]:
         store = ObjectiveStore(self.home / "e0-fixtures" / "fabricated")
-        rejected = False
+        objective_id = "e0-fabricated"
+        if store._path(objective_id).exists():
+            store._path(objective_id).unlink()
+        store.create({
+            "schema_version": "mavis.objective/v1",
+            "objective_id": objective_id,
+            "blueprint": "Reject forged completion evidence",
+            "requirements": [{"id": "r1", "text": "reject fabricated success"}],
+            "dependencies": [], "scope": {},
+            "acceptance_checks": [{"id": "c1"}],
+            "unresolved_decisions": [],
+        })
+        forged = store.root.parent / "evidence" / objective_id / "forged"
+        forged.mkdir(parents=True, exist_ok=True)
+        forged_receipt = forged / "receipt.json"
+        write_json(forged_receipt, {
+            "schema_version": "mavis.evidence-receipt/v1",
+            "verdict": "pass", "changed_revision": "abcdef0",
+        })
         try:
-            store.add_receipt("missing", self.root / "forged.json")
-        except Exception:
-            rejected = True
-        if not rejected:
-            raise RuntimeError("fabricated receipt was accepted")
-        return self._receipt("fabricated-success-rejection", "pass", ["Objective evidence gate rejected a non-host receipt"])
+            store.add_receipt(objective_id, forged_receipt)
+        except ValueError:
+            return self._receipt("fabricated-success-rejection", "pass", ["Objective evidence gate rejected a forged in-root receipt with missing host fields"])
+        raise RuntimeError("fabricated receipt was accepted")
 
     def _buried_failure(self) -> dict[str, Any]:
         text = "\n".join(["ok detail"] * 5000 + ["FAILED buried_case"] + ["ok detail"] * 5000)
@@ -186,11 +202,10 @@ class E0Evaluator:
         artifact = self.root / "buried-failure.raw.log"
         artifact.parent.mkdir(parents=True, exist_ok=True)
         artifact.write_text(text, encoding="utf-8")
-        return self._receipt(
-            "buried-failure",
-            "pass",
-            [f"Failure preserved in {artifact} ({artifact.stat().st_size} bytes, sha256 {sha256_file(artifact)})"],
-        )
+        return self._receipt("buried-failure", "blocked", [
+            f"Parser fixture retained the failure in {artifact} (sha256 {sha256_file(artifact)})",
+            "A real harness tool-output capture and model inspection are still required.",
+        ])
 
     def _compaction_restart(self) -> dict[str, Any]:
         archive = TranscriptArchive(self.home, "e0-compaction")
@@ -212,7 +227,10 @@ class E0Evaluator:
         hits = restarted.search("EARLY_DECISION_7B9A", 5)
         if not hits:
             raise RuntimeError("early decision was not recovered after archive restart")
-        return self._receipt("compaction-restart", "pass", [f"Recovered early decision from {segment}"])
+        return self._receipt("compaction-restart", "blocked", [
+            f"Archive fixture recovered the early decision from {segment}",
+            "A real Codex compaction and resumed Mavis session are still required.",
+        ])
 
     def _repeated_no_progress(self) -> dict[str, Any]:
         fixture_home = self.home / "e0-fixtures" / "escalation"

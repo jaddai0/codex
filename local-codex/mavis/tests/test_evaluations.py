@@ -22,12 +22,19 @@ class E0EvaluationTests(unittest.TestCase):
             self.assertEqual(statuses["small-repository"], "blocked")
             self.assertEqual(statuses["external-harness"], "blocked")
 
-    def test_buried_failure_and_compaction_restart_produce_real_artifacts(self):
+    def test_buried_failure_and_compaction_fixtures_do_not_claim_real_acceptance(self):
         with tempfile.TemporaryDirectory() as directory:
             evaluator = E0Evaluator(Path(directory), RuntimeConfig(home=Path(directory)))
-            self.assertEqual(evaluator.run_case("buried-failure")["status"], "pass")
-            self.assertEqual(evaluator.run_case("compaction-restart")["status"], "pass")
+            self.assertEqual(evaluator.run_case("buried-failure")["status"], "blocked")
+            self.assertEqual(evaluator.run_case("compaction-restart")["status"], "blocked")
             self.assertTrue((Path(directory) / "evaluations" / "e0" / "buried-failure.raw.log").is_file())
+
+    def test_fabricated_success_case_checks_an_existing_objective(self):
+        with tempfile.TemporaryDirectory() as directory:
+            evaluator = E0Evaluator(Path(directory), RuntimeConfig(home=Path(directory)))
+            result = evaluator.run_case("fabricated-success-rejection")
+            self.assertEqual(result["status"], "pass")
+            self.assertTrue((Path(directory) / "e0-fixtures" / "fabricated" / "objectives" / "e0-fabricated.json").is_file())
 
     def test_tool_roundtrip_fails_closed_without_endpoint(self):
         with tempfile.TemporaryDirectory() as directory:

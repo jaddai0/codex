@@ -35,6 +35,14 @@ class TranscriptArchiveTests(unittest.TestCase):
             with self.assertRaisesRegex(ValueError, "accepted_decisions"):
                 archive.write_handoff({"goals": []})
 
+    def test_search_rejects_changed_archived_segment(self):
+        with tempfile.TemporaryDirectory() as directory:
+            archive = TranscriptArchive(Path(directory), "conversation-1")
+            segment = archive.append_segment([{"role": "user", "content": "original decision"}])
+            segment.write_text('{"role":"user","content":"altered decision"}\n', encoding="utf-8")
+            with self.assertRaisesRegex(ValueError, "missing or changed"):
+                archive.search("decision")
+
 
 if __name__ == "__main__":
     unittest.main()

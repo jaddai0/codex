@@ -79,6 +79,8 @@ class TranscriptArchive:
         manifest = read_json(self.manifest_path)
         for segment in manifest["segments"]:
             path = Path(segment["path"])
+            if not path.is_file() or sha256_file(path) != segment["sha256"]:
+                raise ValueError(f"transcript segment is missing or changed: {path}")
             for line_number, line in enumerate(path.read_text(encoding="utf-8").splitlines(), 1):
                 if query.casefold() in line.casefold():
                     results.append({"path": str(path), "line": line_number, "text": line, "sha256": segment["sha256"]})

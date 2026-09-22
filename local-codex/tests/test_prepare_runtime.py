@@ -125,6 +125,22 @@ class PrepareRuntimeTests(unittest.TestCase):
             self.assertIn('base_url = "http://127.0.0.1:9000/v1"', profile)
             self.assertIn('[mcp_servers.fixture]\ncommand = "fixture-server"', profile)
 
+    def test_profile_registers_only_explicit_trusted_gateway(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            gateway = root / "gateway"
+            script = gateway / "bin" / "mcp-server.sh"
+            script.parent.mkdir(parents=True)
+            script.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+            script.chmod(0o755)
+            home = root / "home"
+            prepare_runtime.write_profile(home, "http://127.0.0.1:8001/v1", "local", gateway)
+            prepare_runtime.write_profile(home, "http://127.0.0.1:8001/v1", "local", gateway)
+            profile = (home / "config.toml").read_text(encoding="utf-8")
+            self.assertEqual(profile.count("[mcp_servers.model-gateway]"), 1)
+            self.assertIn(f'command = "{script.resolve()}"', profile)
+            self.assertNotIn("[mcp_servers.openrouter]", profile)
+
 
 if __name__ == "__main__":
     unittest.main()
