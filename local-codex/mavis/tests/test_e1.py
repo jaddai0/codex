@@ -128,12 +128,19 @@ class E1RunnerTests(unittest.TestCase):
             self.runner.store.active("main")["configuration"], record["baseline"]
         )
 
-    def test_changed_manifest_and_raw_output_fail_closed(self):
+    def test_changed_manifest_fails_closed(self):
         self._freeze()
         frozen = self.home / "e1" / "repair" / "cases.json"
         frozen.write_text("{}")
         with self.assertRaisesRegex(ValueError, "manifest changed"):
             self.runner.coverage("repair")
+
+    def test_changed_original_failure_output_fails_closed(self):
+        failure = read_json(self.manifest)["failure_receipt"]
+        receipt = read_json(Path(failure["path"]))
+        (Path(receipt["raw_output"]["path"]) / "stdout.log").write_text("changed")
+        with self.assertRaisesRegex(ValueError, "original failure"):
+            self._freeze()
 
     def test_manifest_rejects_overlapping_split(self):
         manifest = read_json(self.manifest)

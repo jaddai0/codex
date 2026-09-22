@@ -86,8 +86,12 @@ def _manifest(path: Path) -> dict[str, Any]:
         original.get("schema_version") != "mavis.evidence-receipt/v1"
         or original.get("producer") != "mavis-host-command/v1"
         or original.get("verdict") != "fail"
-        or original.get("changed_revision") != regression["revision"]
-        or not original.get("acceptance_check_ids")
+            or original.get("changed_revision") != regression["revision"]
+            or not any(
+                original.get("acceptance_check_ids") == [check["id"]]
+                and original.get("command") == check["argv"]
+                for check in regression["checks"]
+            )
         or sha256_file(output / "stdout.log") + ":" + sha256_file(output / "stderr.log")
         != original["raw_output"]["sha256"]
     ):
