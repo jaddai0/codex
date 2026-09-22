@@ -41,7 +41,7 @@ use super::raw_output_spool::RawOutputSpool;
 use crate::shell_snapshot::ShellSnapshotFile;
 
 const EARLY_EXIT_GRACE_PERIOD: Duration = Duration::from_millis(150);
-const MAVIS_POST_EXIT_DRAIN_TIMEOUT: Duration = Duration::from_secs(30);
+pub(super) const MAVIS_POST_EXIT_DRAIN_TIMEOUT: Duration = Duration::from_secs(30);
 
 fn append_raw_output(
     spool: &Option<Arc<StdMutex<RawOutputSpool>>>,
@@ -301,6 +301,10 @@ impl UnifiedExecProcess {
 
     pub(super) fn output_handles(&self) -> &OutputHandles {
         &self.output
+    }
+
+    pub(super) fn requires_raw_output_drain(&self) -> bool {
+        self.raw_output_spool.is_some()
     }
 
     pub(super) fn output_receiver(&self) -> tokio::sync::broadcast::Receiver<Vec<u8>> {

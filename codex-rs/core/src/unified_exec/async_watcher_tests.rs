@@ -2,6 +2,7 @@ use std::sync::Arc;
 
 use super::Buffer;
 use super::Emitter;
+use super::MAVIS_POST_EXIT_DRAIN_TIMEOUT;
 use super::TRAILING_OUTPUT_GRACE;
 use super::spawn_exit_watcher;
 use super::start_streaming_output;
@@ -11,6 +12,7 @@ use crate::unified_exec::UnifiedExecContext;
 use crate::unified_exec::head_tail_buffer::HeadTailBuffer;
 use crate::unified_exec::process::NoopSpawnLifecycle;
 use crate::unified_exec::process::UnifiedExecProcess;
+use crate::unified_exec::raw_output_spool::RawOutputSpool;
 use codex_protocol::items::CommandExecutionStatus;
 use codex_protocol::items::TurnItem;
 use codex_protocol::protocol::Event;
@@ -33,6 +35,12 @@ struct StreamingOutputHarness {
 }
 
 async fn streaming_output_harness() -> anyhow::Result<StreamingOutputHarness> {
+    streaming_output_harness_with_spool(None).await
+}
+
+async fn streaming_output_harness_with_spool(
+    raw_output_spool: Option<RawOutputSpool>,
+) -> anyhow::Result<StreamingOutputHarness> {
     let (writer_tx, _writer_rx) = tokio::sync::mpsc::channel::<Vec<u8>>(1);
     let (stdout_tx, stdout_rx) = tokio::sync::broadcast::channel::<Vec<u8>>(8);
     let (exit_tx, exit_rx) = tokio::sync::oneshot::channel::<i32>();
@@ -52,7 +60,7 @@ async fn streaming_output_harness() -> anyhow::Result<StreamingOutputHarness> {
             spawned,
             SandboxType::None,
             Box::new(NoopSpawnLifecycle),
-            None,
+            raw_output_spool,
         )
         .await?,
     );
@@ -64,7 +72,7 @@ async fn streaming_output_harness() -> anyhow::Result<StreamingOutputHarness> {
         "streaming-output-test".to_string(),
     );
     let transcript = Arc::new(tokio::sync::Mutex::new(HeadTailBuffer::default()));
-    start_streaming_output(&process, &context, Arc::clone(&transcript));
+    start_streaming_output(Arc::clone(&process), &context, Arc::clone(&transcript));
 
     Ok(StreamingOutputHarness {
         process,
@@ -287,6 +295,115 @@ async fn exit_watcher_waits_for_late_network_denial_before_classifying_end() -> 
         "completion should wait for denial without falling back to the output grace: {elapsed:?}"
     );
 
+    Ok(())
+}
+
+#[tokio::test]
+async fn mavis_end_event_includes_output_after_ordinary_grace() -> anyhow::Result<()> {
+    let temp = tempfile::tempdir()?;
+    let spool = RawOutputSpool::open_in(temp.path().join("output"))?;
+    let StreamingOutputHarness {
+        process,
+        stdout_tx,
+        exit_tx,
+        transcript,
+        context,
+        rx_event,
+    } = streaming_output_harness_with_spool(Some(spool)).await?;
+    #[allow(deprecated)]
+    let cwd = context.step_context.turn.cwd.clone().into();
+    spawn_exit_watcher(
+        Arc::clone(&process),
+        &context,
+        vec!["late-output".to_string()],
+        cwd,
+        /*process_id*/ 124,
+        /*plugin_attribution*/ None,
+        Arc::clone(&transcript),
+        Instant::now(),
+        /*network_denial_monitor*/ None,
+        /*plugin_metrics_sidecar*/ None,
+    );
+
+    tokio::time::pause();
+    stdout_tx.send(b"HEAD".to_vec())?;
+    exit_tx.send(0).expect("send exit");
+    tokio::spawn(async move {
+        tokio::time::sleep(TRAILING_OUTPUT_GRACE + Duration::from_millis(50)).await;
+        stdout_tx.send(b"-LATE-TAIL".to_vec()).expect("send tail");
+    });
+    let item = loop {
+        let event = rx_event.recv().await?;
+        if let EventMsg::ItemCompleted(completed) = event.msg {
+            let TurnItem::CommandExecution(item) = completed.item else {
+                panic!("expected command execution");
+            };
+            break item;
+        }
+    };
+    tokio::time::resume();
+    assert_eq!(item.status, CommandExecutionStatus::Completed);
+    assert_eq!(item.aggregated_output.as_deref(), Some("HEAD-LATE-TAIL"));
+    let reference = process.raw_output_reference()?.expect("Mavis reference");
+    assert!(reference.complete);
+    assert_eq!(std::fs::read(reference.path)?, b"HEAD-LATE-TAIL");
+    Ok(())
+}
+
+#[tokio::test]
+async fn mavis_held_pipe_fails_end_event_after_drain_limit() -> anyhow::Result<()> {
+    let temp = tempfile::tempdir()?;
+    let spool = RawOutputSpool::open_in(temp.path().join("output"))?;
+    let StreamingOutputHarness {
+        process,
+        stdout_tx,
+        exit_tx,
+        transcript,
+        context,
+        rx_event,
+    } = streaming_output_harness_with_spool(Some(spool)).await?;
+    #[allow(deprecated)]
+    let cwd = context.step_context.turn.cwd.clone().into();
+    spawn_exit_watcher(
+        Arc::clone(&process),
+        &context,
+        vec!["held-pipe".to_string()],
+        cwd,
+        /*process_id*/ 125,
+        /*plugin_attribution*/ None,
+        Arc::clone(&transcript),
+        Instant::now(),
+        /*network_denial_monitor*/ None,
+        /*plugin_metrics_sidecar*/ None,
+    );
+
+    tokio::time::pause();
+    let exited_at = Instant::now();
+    stdout_tx.send(b"PREFIX".to_vec())?;
+    exit_tx.send(0).expect("send exit");
+    let item = loop {
+        let event = rx_event.recv().await?;
+        if let EventMsg::ItemCompleted(completed) = event.msg {
+            let TurnItem::CommandExecution(item) = completed.item else {
+                panic!("expected command execution");
+            };
+            break item;
+        }
+    };
+    let elapsed = Instant::now().saturating_duration_since(exited_at);
+    tokio::time::resume();
+    assert!(elapsed >= MAVIS_POST_EXIT_DRAIN_TIMEOUT);
+    assert_eq!(item.status, CommandExecutionStatus::Failed);
+    assert!(
+        item.aggregated_output
+            .as_deref()
+            .expect("failure output")
+            .contains("Mavis raw output did not finish draining after process exit")
+    );
+    let reference = process.raw_output_reference()?.expect("Mavis reference");
+    assert!(!reference.complete);
+    assert_eq!(std::fs::read(reference.path)?, b"PREFIX");
+    drop(stdout_tx);
     Ok(())
 }
 
