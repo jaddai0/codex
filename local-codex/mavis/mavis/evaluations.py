@@ -398,6 +398,8 @@ class E0Evaluator:
             result = json.loads(result_path.read_text())
             if result.get("candidate") != installed_candidate_fingerprint():
                 continue
+            if result.get("candidate_after") != result["candidate"]:
+                continue
             rollout = Path(result.get("rollout", ""))
             repo = Path(result.get("repo", ""))
             if not rollout.is_file() or not (repo / "produce_log.py").is_file():

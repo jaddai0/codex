@@ -1,0 +1,122 @@
+"""Run the installed E0 large-output canary with a sequential IRIS/Mavis handoff."""
+
+from __future__ import annotations
+
+import json
+import os
+from pathlib import Path
+import subprocess
+import sys
+import uuid
+from urllib.parse import quote
+
+from mavis.evaluations import installed_candidate_fingerprint
+from mavis.runtime import (RuntimeConfig, endpoint_alive, ensure_runtime, inventory,
+                           load_model, request_json, stop_server)
+from mavis.storage import write_json
+
+
+def main() -> int:
+    home = Path.home()
+    service = home / ".local-codex" / "mavis-service"
+    config = RuntimeConfig(home=service)
+    model_path = f"/v1/models/{quote(config.model, safe='')}"
+    task = service / "evaluations" / "e0" / f"buried-live-{uuid.uuid4().hex}"
+    repo = task / "repo"
+    repo.mkdir(parents=True)
+    (repo / "produce_log.py").write_text(
+        "import secrets, sys\n"
+        "print('A' * 800000)\n"
+        "print('MAVIS_E0_FAILURE_' + secrets.token_hex(12))\n"
+        "print('Z' * 800000)\n"
+        "sys.exit(1)\n"
+    )
+    subprocess.run(["git", "init", "-q", str(repo)], check=True)
+    subprocess.run(["git", "-C", str(repo), "-c", "user.name=Mavis E0",
+                    "-c", "user.email=mavis@local.invalid", "commit", "--allow-empty",
+                    "-qm", "fixture"], check=True)
+
+    def loaded(endpoint: str) -> bool:
+        return any(item.get("id") == config.model and item.get("loaded")
+                   for item in inventory(endpoint))
+
+    if not loaded(config.iris_endpoint) or loaded(config.endpoint):
+        raise RuntimeError("IRIS must own the loaded model and Mavis must be unloaded")
+    candidate = installed_candidate_fingerprint()
+    result: dict[str, object] = {"candidate": candidate, "repo": str(repo),
+                                 "task_root": str(task)}
+    try:
+        request_json(config.iris_endpoint, model_path + "/unload", method="POST", timeout=180)
+        if loaded(config.iris_endpoint):
+            raise RuntimeError("IRIS model did not unload")
+        load_model(config)
+        prompt = (
+            "Run python3 produce_log.py exactly once, without a pipe or redirect. "
+            "Its exit code 1 is intentional. The full output is too long to display. "
+            "Use the Complete raw output reference from that command to find the "
+            "exact MAVIS_E0_FAILURE_ identifier in the middle. Report that exact "
+            "identifier and clearly state the command failed. Do not edit files."
+        )
+        command = [str(home / "Desktop" / "Mavis.command"), "exec", "--json",
+                   "-C", str(repo), "-s", "read-only", "-o",
+                   str(task / "mavis-last-message.txt"), prompt]
+        with (task / "installed-mavis-buried.jsonl").open("wb") as log:
+            run = subprocess.run(command, cwd=repo, stdin=subprocess.DEVNULL,
+                                 stdout=log, stderr=subprocess.STDOUT,
+                                 env={**os.environ, "MAVIS_PROJECT_DIR": str(repo),
+                                      "PYTHONDONTWRITEBYTECODE": "1"}, timeout=900)
+        result["mavis_exit"] = run.returncode
+        for line in (task / "installed-mavis-buried.jsonl").read_text().splitlines():
+            try:
+                event = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+            if event.get("type") == "thread.started":
+                result["session_id"] = event.get("thread_id")
+                break
+        session = result.get("session_id")
+        if session:
+            matches = list((home / ".local-codex" / "sessions").glob(f"**/*{session}.jsonl"))
+            if len(matches) == 1:
+                result["rollout"] = str(matches[0])
+    except BaseException as exc:
+        result["error"] = repr(exc)
+    finally:
+        try:
+            if loaded(config.endpoint):
+                request_json(config.endpoint, model_path + "/unload", method="POST", timeout=180)
+            if loaded(config.endpoint):
+                raise RuntimeError("Mavis model remained loaded after unload")
+        except BaseException as exc:
+            result["mavis_unload_error"] = repr(exc)
+            try:
+                if endpoint_alive(config.endpoint):
+                    stop_server(config)
+                    import time
+                    for _ in range(100):
+                        if not endpoint_alive(config.endpoint):
+                            break
+                        time.sleep(0.2)
+                    ensure_runtime(config, load=False)
+            except BaseException as recovery_exc:
+                result["mavis_stop_error"] = repr(recovery_exc)
+        try:
+            if endpoint_alive(config.endpoint) and loaded(config.endpoint):
+                raise RuntimeError("cannot restore IRIS while Mavis still holds the model")
+            if not loaded(config.iris_endpoint):
+                request_json(config.iris_endpoint, model_path + "/load", method="POST", timeout=900)
+            result["iris_loaded"] = loaded(config.iris_endpoint)
+            result["mavis_loaded"] = loaded(config.endpoint)
+            result["candidate_after"] = installed_candidate_fingerprint()
+        except BaseException as exc:
+            result["restore_error"] = repr(exc)
+        write_json(task / "result.json", result)
+    print(task / "result.json")
+    return 0 if (result.get("mavis_exit") == 0 and result.get("rollout")
+                 and result.get("iris_loaded") is True
+                 and result.get("mavis_loaded") is False
+                 and result.get("candidate_after") == candidate) else 1
+
+
+if __name__ == "__main__":
+    sys.exit(main())

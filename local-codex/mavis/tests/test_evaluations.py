@@ -99,7 +99,8 @@ class E0EvaluationTests(unittest.TestCase):
             ]
             rollout.write_text("".join(json.dumps(event) + "\n" for event in events))
             (task / "result.json").write_text(json.dumps({
-                "candidate": {"core_sha256": "test"}, "rollout": str(rollout),
+                "candidate": {"core_sha256": "test"},
+                "candidate_after": {"core_sha256": "test"}, "rollout": str(rollout),
                 "repo": str(repo), "mavis_exit": 0, "iris_loaded": True,
                 "mavis_loaded": False,
             }))
