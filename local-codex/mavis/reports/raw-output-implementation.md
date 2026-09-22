@@ -45,3 +45,25 @@ For native local PTY output, the Mavis path replaces the intermediate lossy broa
 The first closeout audit returned `FAIL` because exec-server source bytes were not yet durable. This revision adds source storage before replay, a burst test, and an explicit executor acknowledgement. Source-level capture is verified. Installed runtime acceptance and any external executor file retrieval remain separate checks for the parent release lane. Existing `unified_exec_persists_across_requests` and `unified_exec_uses_remote_exec_server_when_configured` tests passed; they prove routing compatibility, not installed capture.
 
 The source-slice ledger passed: `work-closeout check /tmp/mavis-raw-output-ledger.json --stage closeout`. `cargo check -p codex-exec-server --tests --no-default-features` also passed, compiling the updated integration test constructors. This closeout covers code and focused tests; the installed binary remains a separate acceptance step.
+
+## Independent review repair, 2026-09-22
+
+Terra rejected the preceding revision. This follow-up addresses its six findings:
+
+1. **Terminal-only replay gap (P0):** Core now checks the executor's `next_seq` against every replayed output sequence and only allows sequence positions for terminal events it has not already seen. If output was evicted and replay contains only `Exited` and `Closed`, core records a failure and cannot mark its partial local file complete. A focused regression test covers that exact case and a prior `Exited` event.
+2. **Spawn before controller spool (P1):** The process manager opens the Mavis controller spool before either a local child or remote executor starts. The process constructors receive that already-open spool. Failure to open the controller file therefore stops command launch. This also removes the remote-command orphan path caused by a post-acknowledgement controller open failure. Missing executor acknowledgement still requests remote termination.
+3. **Sync before display (P1):** Core now calls `sync_data` for each local append before it updates the display buffer or sends the output chunk, matching executor-side behavior.
+4. **Windows privacy (P1):** Mavis raw capture now fails closed on Windows. Unix mode `0700`/`0600` is not a Windows ACL and this branch does not implement an equivalent. Ordinary Codex remains unaffected. The installed Mavis lane is macOS.
+5. **Stable paths (P2):** Both spools reject a relative `MAVIS_HOME` and canonicalize the created directory before producing a reference or manifest. The launcher rejects a relative override before runtime admission or model loading.
+
+Verification after repair:
+
+- `just test -p codex-core terminal_only_replay_cannot_hide_evicted_output`: 1 passed.
+- `just test -p codex-core mavis_spool_failure_prevents_command_launch`: 1 passed. With an invalid Mavis home, the unified exec command returns an error and leaves its marker file absent.
+- `just test -p codex-exec-server mavis`: 3 passed, including the source-side burst test.
+- `ZDOTDIR=<empty temporary directory> just test -p codex-core unified_exec`: 175 passed.
+- `just fmt`, `git diff --check`, and `zsh -n local-codex/bin/local-codex`: passed. The formatter also touched unrelated Python files; those formatting-only changes were discarded before commit.
+- An initial run of the 175 core tests had one unrelated shell-snapshot failure because the user's `.zshenv` invokes `grep` and `cut` under a test that deliberately restricts `PATH`. Repeating that test and the full focused set with an empty temporary `ZDOTDIR` passed.
+- The complete `codex-exec-server` crate test run had unrelated parallel registration-retry failures; one representative failure passed alone. The Mavis-targeted executor tests passed. No full workspace suite, live service call, model load, or install was run.
+
+This is source-level repair evidence. The parent release lane still needs a new core binary build and installed macOS acceptance. A lost controller replay must be treated as a failed command even though the executor-side source file is durable. Windows Mavis execution remains explicitly unsupported until private ACL storage is implemented.

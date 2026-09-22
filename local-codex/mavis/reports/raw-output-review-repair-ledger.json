@@ -1,0 +1,62 @@
+{
+  "schema_version": "work-closeout/v1",
+  "task": "Repair independently rejected Mavis raw-output source slice",
+  "status": "complete",
+  "constraint": {
+    "binding": "evidence",
+    "statement": "Prevent incomplete controller output from being reported complete and open durable storage before command launch.",
+    "evidence": ["Terra raw-output review, 2026-09-22", "codex-rs/core/src/unified_exec/process.rs"]
+  },
+  "rejected_alternatives": [],
+  "requirements": [
+    {
+      "id": "replay_gap",
+      "requirement": "Evicted output with terminal-only replay fails closed",
+      "status": "pass",
+      "command": "just test -p codex-core terminal_only_replay_cannot_hide_evicted_output",
+      "artifact": "codex-rs/core/src/unified_exec/process.rs",
+      "evidence": ["Focused regression passed for evicted output, terminal-only replay, and exit-before-last-output ordering"]
+    },
+    {
+      "id": "pre_spawn",
+      "requirement": "Open the controller spool before either local or remote command starts",
+      "status": "pass",
+      "command": "just test -p codex-core mavis_spool_failure_prevents_command_launch",
+      "artifact": "codex-rs/core/src/unified_exec/process_manager.rs",
+      "evidence": ["Focused test passed: invalid Mavis home returned error and marker file remained absent; source call order opens spool before backend.start and spawn_process"]
+    },
+    {
+      "id": "remote_orphan",
+      "requirement": "Controller spool failure cannot orphan an acknowledged remote command",
+      "status": "pass",
+      "command": "just test -p codex-core mavis_spool_failure_prevents_command_launch",
+      "artifact": "codex-rs/core/src/unified_exec/process_manager.rs",
+      "evidence": ["Controller spool opening precedes backend.start; post-acknowledgement constructor no longer opens a file; failed preflight left the marker file absent"]
+    },
+    {
+      "id": "sync_before_display",
+      "requirement": "Local output is synced before display forwarding",
+      "status": "pass",
+      "command": "ZDOTDIR=<empty temporary directory> just test -p codex-core unified_exec",
+      "artifact": "codex-rs/core/src/unified_exec/raw_output_spool.rs",
+      "evidence": ["RawOutputSpool::append calls sync_data before output task updates the buffer or broadcasts"]
+    },
+    {
+      "id": "private_platform",
+      "requirement": "Mavis capture does not claim private Windows storage without an ACL implementation",
+      "status": "pass",
+      "command": "just test -p codex-exec-server mavis",
+      "artifact": "codex-rs/exec-server/src/mavis_output_spool.rs",
+      "evidence": ["Mavis-specific Windows path returns Unsupported before process launch; ordinary path remains inactive; macOS is the install target"]
+    },
+    {
+      "id": "absolute_reference",
+      "requirement": "Mavis raw references and manifest paths are absolute",
+      "status": "pass",
+      "command": "just test -p codex-exec-server mavis; zsh -n local-codex/bin/local-codex",
+      "artifact": "codex-rs/core/src/unified_exec/raw_output_spool.rs",
+      "evidence": ["Both spools reject relative MAVIS_HOME and canonicalize directories; launcher rejects relative overrides before runtime admission"]
+    }
+  ],
+  "uncertainty": []
+}
