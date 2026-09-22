@@ -38,8 +38,12 @@ class TranscriptArchive:
             raise ValueError("cannot archive an empty transcript segment")
         segment_id = uuid.uuid4().hex
         path = self.root / "segments" / f"{segment_id}.jsonl"
-        path.parent.mkdir(parents=True, exist_ok=True)
-        with path.open("x", encoding="utf-8") as handle:
+        self.root.mkdir(parents=True, exist_ok=True, mode=0o700)
+        os.chmod(self.root, 0o700)
+        path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+        os.chmod(path.parent, 0o700)
+        descriptor = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+        with os.fdopen(descriptor, "w", encoding="utf-8") as handle:
             for message in messages:
                 handle.write(
                     json.dumps(message, sort_keys=True, ensure_ascii=False) + "\n"
@@ -70,10 +74,12 @@ class TranscriptArchive:
 
     def import_rollout(self, rollout_path: Path) -> Path | None:
         """Archive only complete JSONL records added since the last import."""
-        self.root.mkdir(parents=True, exist_ok=True)
+        self.root.mkdir(parents=True, exist_ok=True, mode=0o700)
+        os.chmod(self.root, 0o700)
         lock_path = self.root / "import.lock"
         descriptor = os.open(lock_path, os.O_CREAT | os.O_RDWR, 0o600)
         with os.fdopen(descriptor, "rb") as lock:
+            os.fchmod(lock.fileno(), 0o600)
             fcntl.flock(lock.fileno(), fcntl.LOCK_EX)
             return self._import_rollout_locked(rollout_path)
 
@@ -130,6 +136,8 @@ class TranscriptArchive:
         handoff["manifest"] = str(self.manifest_path.resolve())
         handoff["written_at"] = datetime.now(timezone.utc).isoformat()
         path = self.root / "handoffs" / f"{uuid.uuid4().hex}.json"
+        path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+        os.chmod(path.parent, 0o700)
         write_json(path, handoff)
         return path
 

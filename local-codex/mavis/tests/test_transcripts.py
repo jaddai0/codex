@@ -85,6 +85,15 @@ class TranscriptArchiveTests(unittest.TestCase):
                 }
             )
             self.assertTrue(handoff.is_file())
+            for path, expected in (
+                (archive.root, 0o700),
+                (segment.parent, 0o700),
+                (handoff.parent, 0o700),
+                (segment, 0o600),
+                (handoff, 0o600),
+                (archive.manifest_path, 0o600),
+            ):
+                self.assertEqual(path.stat().st_mode & 0o777, expected)
             matches = archive.search("blue heron")
             self.assertEqual(len(matches), 1)
             self.assertEqual(matches[0]["line"], 1)
