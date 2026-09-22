@@ -9,6 +9,8 @@ import sys
 from pathlib import Path
 
 from .evidence import run_command
+from .e1 import E1Runner
+from .experiments import ExperimentStore, review_assignment_requirements
 from .e0_tasks import prepare_small_repository
 from .evaluations import E0_CASES, E0Evaluator
 from .maintenance import MaintenanceQueue
@@ -138,6 +140,39 @@ def build_parser() -> argparse.ArgumentParser:
     )
     evaluate_sub.add_parser("prepare-small")
 
+    e1 = subcommands.add_parser("e1")
+    e1_sub = e1.add_subparsers(dest="e1_command", required=True)
+    seed = e1_sub.add_parser("seed-active")
+    seed.add_argument("scope")
+    seed.add_argument("config", type=Path)
+    freeze = e1_sub.add_parser("freeze")
+    freeze.add_argument("experiment_id")
+    freeze.add_argument("--scope", required=True)
+    freeze.add_argument(
+        "--kind", choices=("prompts", "tool_settings", "retrieval"), required=True
+    )
+    freeze.add_argument("--candidate", type=Path, required=True)
+    freeze.add_argument("--cases", type=Path, required=True)
+    freeze.add_argument("--hypothesis", required=True)
+    for name in ("prepare", "check"):
+        entry = e1_sub.add_parser(name)
+        entry.add_argument("experiment_id")
+        entry.add_argument("arm", choices=("baseline", "candidate"))
+        if name == "check":
+            entry.add_argument("case_id")
+    coverage = e1_sub.add_parser("coverage")
+    coverage.add_argument("experiment_id")
+    compare = e1_sub.add_parser("compare")
+    compare.add_argument("experiment_id")
+    compare.add_argument("--candidate-job-id", required=True)
+    compare.add_argument("--candidate-report", type=Path, required=True)
+    for name in ("status", "review-requirements", "stage"):
+        entry = e1_sub.add_parser(name)
+        entry.add_argument("experiment_id")
+    review = e1_sub.add_parser("review")
+    review.add_argument("experiment_id")
+    review.add_argument("receipt", type=Path)
+
     maintenance = subcommands.add_parser("maintenance")
     maintenance_sub = maintenance.add_subparsers(
         dest="maintenance_command", required=True
@@ -249,9 +284,7 @@ def main(argv: list[str] | None = None) -> int:
             print_json(store.add_verification(args.objective_id, read_json(args.path)))
         elif args.objective_command == "gateway-verify":
             print_json(
-                store.record_gateway_verification(
-                    args.objective_id, args.worker_job_id
-                )
+                store.record_gateway_verification(args.objective_id, args.worker_job_id)
             )
         elif args.objective_command == "attempt":
             print_json(
@@ -291,6 +324,43 @@ def main(argv: list[str] | None = None) -> int:
         result = E0Evaluator(home, runtime_config(args)).run(args.case)
         print_json(result)
         return 0 if result["status"] == "pass" else 1
+    if args.command == "e1":
+        runner = E1Runner(home)
+        store = ExperimentStore(home)
+        if args.e1_command == "seed-active":
+            result = store.seed_active(args.scope, read_json(args.config))
+        elif args.e1_command == "freeze":
+            result = runner.freeze(
+                args.experiment_id,
+                args.scope,
+                args.kind,
+                args.candidate,
+                args.cases,
+                args.hypothesis,
+            )
+        elif args.e1_command == "prepare":
+            result = runner.prepare(args.experiment_id, args.arm)
+        elif args.e1_command == "check":
+            result = runner.check(args.experiment_id, args.arm, args.case_id)
+        elif args.e1_command == "coverage":
+            result = runner.coverage(args.experiment_id)
+        elif args.e1_command == "compare":
+            result = runner.compare(
+                args.experiment_id, args.candidate_job_id, args.candidate_report
+            )
+        elif args.e1_command == "status":
+            result = store.load(args.experiment_id)
+        elif args.e1_command == "review-requirements":
+            record = store.load(args.experiment_id)
+            if record["state"] != "compared":
+                raise ValueError("review requirements need a completed comparison")
+            result = review_assignment_requirements(record)
+        elif args.e1_command == "review":
+            result = store.review(args.experiment_id, args.receipt)
+        else:
+            result = store.stage(args.experiment_id)
+        print_json(result)
+        return 0
     if args.command == "project-index":
         index = ProjectIndex(args.project, home)
         if args.index_command == "refresh":
