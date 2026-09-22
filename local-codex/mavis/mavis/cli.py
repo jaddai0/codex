@@ -9,7 +9,9 @@ from pathlib import Path
 
 from .evidence import run_command
 from .evaluations import E0_CASES, E0Evaluator
+from .maintenance import MaintenanceQueue
 from .objectives import ObjectiveStore
+from .retrieval import ProjectIndex
 from .runtime import RuntimeConfig, admission, ensure_runtime, endpoint_alive, inventory, owns_running_server, stop_server
 from .storage import read_json
 from .transcripts import TranscriptArchive
@@ -76,6 +78,16 @@ def build_parser() -> argparse.ArgumentParser:
     search.add_argument("query")
     search.add_argument("--limit", type=int, default=20)
 
+    index = subcommands.add_parser("project-index")
+    index.add_argument("--project", type=Path, required=True)
+    index_sub = index.add_subparsers(dest="index_command", required=True)
+    index_sub.add_parser("refresh")
+    index_search = index_sub.add_parser("search")
+    index_search.add_argument("query")
+    index_search.add_argument("--limit", type=int, default=20)
+    index_symbol = index_sub.add_parser("symbol")
+    index_symbol.add_argument("name")
+
     evaluate = subcommands.add_parser("eval")
     evaluate_sub = evaluate.add_subparsers(dest="eval_suite", required=True)
     e0 = evaluate_sub.add_parser("e0")
@@ -85,6 +97,15 @@ def build_parser() -> argparse.ArgumentParser:
     e0.add_argument("--model", default="Qwen3.8-Flash-Next-Abliterated-MLX-4bit")
     e0.add_argument("--model-dir", default="/Users/dustinpainter/models/vlms")
     e0.add_argument("--omlx-binary", default="/Users/dustinpainter/.venvs/omlx-dev/bin/omlx")
+
+    maintenance = subcommands.add_parser("maintenance")
+    maintenance_sub = maintenance.add_subparsers(dest="maintenance_command", required=True)
+    enqueue = maintenance_sub.add_parser("enqueue")
+    enqueue.add_argument("interval", choices=("immediate", "daily", "weekly", "monthly"))
+    enqueue.add_argument("kind")
+    enqueue.add_argument("--payload", default="{}")
+    maintenance_list = maintenance_sub.add_parser("list")
+    maintenance_list.add_argument("--state")
     return parser
 
 
@@ -130,6 +151,25 @@ def main(argv: list[str] | None = None) -> int:
         result = E0Evaluator(home, runtime_config(args)).run(args.case)
         print_json(result)
         return 0 if result["status"] == "pass" else 1
+    if args.command == "project-index":
+        index = ProjectIndex(args.project, home)
+        if args.index_command == "refresh":
+            print_json(index.refresh())
+        elif args.index_command == "search":
+            print_json(index.search(args.query, args.limit))
+        else:
+            print_json(index.symbol(args.name))
+        return 0
+    if args.command == "maintenance":
+        queue = MaintenanceQueue(home)
+        if args.maintenance_command == "enqueue":
+            payload = json.loads(args.payload)
+            if not isinstance(payload, dict):
+                raise ValueError("maintenance payload must be a JSON object")
+            print_json(queue.enqueue(args.interval, args.kind, payload))
+        else:
+            print_json(queue.list(args.state))
+        return 0
     archive = TranscriptArchive(home, args.conversation_id)
     print_json(archive.search(args.query, args.limit))
     return 0
