@@ -397,6 +397,7 @@ async fn remote_environment_routes_encrypted_exec_server_rpc() -> Result<()> {
         ExecResponse {
             process_id: ProcessId::from("proc-1"),
             sandbox_type: Some(ProcessSandboxType::None),
+            mavis_raw_output_active: false,
         }
     );
 

@@ -313,6 +313,7 @@ async fn blocking_terminate_unified_process(
                 wake_tx,
             }),
             sandbox_type: Some(codex_sandboxing::SandboxType::None),
+            mavis_raw_output_active: false,
         })
         .await?,
     ))

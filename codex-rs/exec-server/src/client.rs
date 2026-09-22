@@ -256,6 +256,7 @@ pub(crate) struct Session {
     client: ExecServerClient,
     process_id: ProcessId,
     sandbox_type: Option<ProcessSandboxType>,
+    mavis_raw_output_active: bool,
     state: Arc<SessionState>,
 }
 
@@ -1099,6 +1100,7 @@ impl ExecServerClient {
                             client: client.clone(),
                             process_id: process_id.clone(),
                             sandbox_type: response.sandbox_type,
+                            mavis_raw_output_active: response.mavis_raw_output_active,
                             state: Arc::clone(&state),
                         };
                         // Wait for caller receipt so cancellation after send still triggers cleanup.
@@ -1155,6 +1157,7 @@ impl ExecServerClient {
             client: self.clone(),
             process_id: process_id.clone(),
             sandbox_type: None,
+            mavis_raw_output_active: false,
             state,
         })
     }
@@ -1569,6 +1572,10 @@ impl Session {
 
     pub(crate) fn sandbox_type(&self) -> Option<ProcessSandboxType> {
         self.sandbox_type
+    }
+
+    pub(crate) fn mavis_raw_output_active(&self) -> bool {
+        self.mavis_raw_output_active
     }
 
     pub(crate) fn subscribe_wake(&self) -> watch::Receiver<u64> {
@@ -1999,6 +2006,7 @@ mod tests {
                     result: serde_json::to_value(ExecResponse {
                         process_id: params.process_id,
                         sandbox_type: Some(ProcessSandboxType::LinuxSeccomp),
+                        mavis_raw_output_active: false,
                     })
                     .expect("process start response should serialize"),
                 }),

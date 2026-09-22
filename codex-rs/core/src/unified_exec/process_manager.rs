@@ -237,12 +237,22 @@ fn exec_server_params_for_request(
         } else {
             process_id.to_string()
         };
+    let mavis_raw_output_required =
+        std::env::var("MAVIS_RAW_OUTPUT_REQUIRED").as_deref() == Ok("1");
     codex_exec_server::ExecParams {
         process_id: exec_server_process_id.into(),
-        metadata: tool_ctx.map(|ctx| codex_exec_server::ExecMetadata {
-            thread_id: Some(ctx.session.thread_id()),
-            tool_call_id: Some(ctx.call_id.clone()),
-        }),
+        metadata: tool_ctx
+            .map(|ctx| codex_exec_server::ExecMetadata {
+                thread_id: Some(ctx.session.thread_id()),
+                tool_call_id: Some(ctx.call_id.clone()),
+                mavis_raw_output_required,
+            })
+            .or_else(|| {
+                mavis_raw_output_required.then_some(codex_exec_server::ExecMetadata {
+                    mavis_raw_output_required,
+                    ..Default::default()
+                })
+            }),
         argv: request.command.clone(),
         cwd: request.cwd.clone(),
         env_policy,
