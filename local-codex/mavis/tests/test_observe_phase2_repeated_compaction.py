@@ -162,7 +162,8 @@ class RepeatedCompactionEvidenceTests(unittest.TestCase):
                 " for row in rows: output.write(json.dumps(row) + '\\n')\n"
                 "if sys.stdin.readline().strip() != '/compact': sys.exit(2)\n"
                 "with path.open('a') as output: output.write(json.dumps({'type':'compacted','payload':{}}) + '\\n')\n"
-                "if sys.stdin.readline().strip() != '/exit': sys.exit(3)\n",
+                "if sys.stdin.readline().strip() != '/exit': sys.exit(3)\n"
+                "if sys.stdin.readline().strip(): sys.exit(5)\n",
                 encoding="utf-8",
             )
             lease_fd = os.open(os.devnull, os.O_RDONLY)
@@ -174,7 +175,7 @@ class RepeatedCompactionEvidenceTests(unittest.TestCase):
                         log=root / "terminal.log", sessions=sessions,
                         prompt="remember fact", expected_answer="ACK1",
                         expected_compactions=1, rollout=None,
-                        launch_started=time.time(), stage_timeout=8)
+                        launch_started=time.time(), stage_timeout=16)
             finally:
                 os.close(lease_fd)
             self.assertGreater(pid, 0)

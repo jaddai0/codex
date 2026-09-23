@@ -198,6 +198,9 @@ def _run_stage(command: list[str], *, workspace: Path, env: dict[str, str],
         stage = "answer"
         trust_sent = False
         terminal_tail = b""
+        last_output_at = time.monotonic()
+        last_enter_at = 0.0
+        enter_retries = 0
         deadline = time.monotonic() + stage_timeout
         with log.open("wb") as output:
             while True:
@@ -210,6 +213,7 @@ def _run_stage(command: list[str], *, workspace: Path, env: dict[str, str],
                         output.write(chunk)
                         output.flush()
                         terminal_tail = (terminal_tail + chunk)[-16384:]
+                        last_output_at = time.monotonic()
                         if (not trust_sent and b"folder?" in terminal_tail
                                 and b"Trust and continue" in terminal_tail):
                             # Codex discards input queued during the trust-screen transition.
@@ -234,6 +238,8 @@ def _run_stage(command: list[str], *, workspace: Path, env: dict[str, str],
                         os.write(master, b"/compact" if expected_compactions else b"/exit")
                         time.sleep(0.75)
                         os.write(master, b"\r")
+                        last_enter_at = time.monotonic()
+                        enter_retries = 0
                         stage = "compact" if expected_compactions else "exit"
                         deadline = time.monotonic() + min(
                             stage_timeout, 600 if expected_compactions else 60)
@@ -242,8 +248,17 @@ def _run_stage(command: list[str], *, workspace: Path, env: dict[str, str],
                     os.write(master, b"/exit")
                     time.sleep(0.75)
                     os.write(master, b"\r")
+                    last_enter_at = time.monotonic()
+                    enter_retries = 0
                     stage = "exit"
                     deadline = time.monotonic() + min(stage_timeout, 60)
+                if (stage in {"compact", "exit"} and enter_retries < 3
+                        and time.monotonic() - last_enter_at > 5
+                        and time.monotonic() - last_output_at > 2
+                        and (b"/compact" if stage == "compact" else b"/exit") in terminal_tail[-2048:]):
+                    os.write(master, b"\r")
+                    last_enter_at = time.monotonic()
+                    enter_retries += 1
                 code = process.poll()
                 if code is not None:
                     if stage != "exit":

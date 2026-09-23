@@ -40,6 +40,7 @@ if command=='/compact':
  with rollout.open('a') as f:f.write(json.dumps({"type":"compacted"})+'\n')
  command=sys.stdin.readline().strip()
 if command!='/exit':raise SystemExit('unexpected terminal command '+repr(command))
+if sys.stdin.readline().strip():raise SystemExit('retry Enter had content')
 """
 
 
