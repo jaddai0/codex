@@ -120,7 +120,10 @@ def prepare_heldout(home: Path) -> Path:
         "        self.assertEqual(invoice_total(1000, 1, 0, 10, 500), 1600)\n"
         "    def test_invalid_tax(self):\n"
         "        with self.assertRaises(ValueError):\n"
-        "            invoice_total(100, 1, 0, 101, 0)\n",
+        "            invoice_total(100, 1, 0, 101, 0)\n"
+        "    def test_fractional_tax_is_rejected(self):\n"
+        "        with self.assertRaises(ValueError):\n"
+        "            invoice_total(1000, 1, 0, 10.5, 0)\n",
         encoding="utf-8",
     )
     (repo / DIRTY).write_text("Keep my working notes.\n", encoding="utf-8")
@@ -133,8 +136,8 @@ def prepare_heldout(home: Path) -> Path:
     (repo / DIRTY).write_text("Keep my working notes.\nPrivate edit: orchid-47.\n", encoding="utf-8")
     (repo / PRIVATE).write_text("Untracked private draft: violet-29.\n", encoding="utf-8")
     baseline = _check(repo, FULL_TEST)
-    if baseline.returncode == 0 or "Ran 6 tests" not in baseline.stderr or "FAILED" not in baseline.stderr:
-        raise RuntimeError("E2 fixture does not have the expected six-test failing baseline")
+    if baseline.returncode == 0 or "Ran 7 tests" not in baseline.stderr or "FAILED" not in baseline.stderr:
+        raise RuntimeError("E2 fixture does not have the expected seven-test failing baseline")
     baseline_path = task / "baseline-test.log"
     baseline_path.write_text(baseline.stdout + baseline.stderr, encoding="utf-8")
     manifest = task / "manifest.json"
@@ -237,7 +240,7 @@ def _verify_host_check(receipt_path: Path, *, task: Path, name: str, revision: s
             or receipt.get("stderr_bytes") != stderr.stat().st_size):
         raise ValueError(f"E2 {name} host check is incomplete or changed")
     summary = stderr.read_text(encoding="utf-8", errors="replace")
-    count = 3 if name == "catalog" else 6
+    count = 3 if name == "catalog" else 7
     if f"Ran {count} tests" not in summary or "\nOK" not in summary or "FAILED" in summary:
         raise ValueError(f"E2 {name} host check did not pass the frozen suite")
 

@@ -40,6 +40,9 @@ class E2HeldoutTests(unittest.TestCase):
     def _checkout_repair(self, repo: Path) -> None:
         path = repo / "checkout" / "invoice.py"
         path.write_text(path.read_text().replace(
+            "    if shipping_cents < 0 or not 0 <= tax_percent <= 100:\n",
+            "    if shipping_cents < 0 or type(tax_percent) is not int or not 0 <= tax_percent <= 100:\n",
+        ).replace(
             "((subtotal + shipping_cents) * tax_percent // 100)",
             "(subtotal * tax_percent // 100)",
         ))
@@ -163,7 +166,7 @@ class E2HeldoutTests(unittest.TestCase):
             with patch("mavis.e2_tasks.installed_candidate_fingerprint", return_value={"core_sha256": "candidate"}), patch(
                     "mavis.e2_tasks.current_e0_summary", return_value=(task / "e0-summary.json", {"model_id": DEFAULT_MODEL})):
                 self.assertEqual(verify_heldout(manifest)["status"], "pass")
-                (task / "host-checks" / "complete" / "stderr.log").write_text("Ran 6 tests\nFAILED")
+                (task / "host-checks" / "complete" / "stderr.log").write_text("Ran 7 tests\nFAILED")
                 with self.assertRaises(ValueError):
                     verify_heldout(manifest)
 
