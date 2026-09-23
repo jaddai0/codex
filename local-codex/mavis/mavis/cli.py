@@ -31,6 +31,8 @@ from .maintenance_runtime import tick as maintenance_tick
 from .objectives import ObjectiveStore
 from .output_inspection import inspect_output
 from .project_memory import ProjectMemory, KINDS
+from .project_evidence import (active_project_home, legacy_home_for_record,
+                               migrate_legacy_objective, objective_home)
 from .retrieval import ProjectIndex
 from .runtime import (
     RuntimeConfig,
@@ -41,7 +43,7 @@ from .runtime import (
     owns_running_server,
     stop_server,
 )
-from .storage import read_json
+from .storage import read_json, require_safe_id
 from .transcripts import TranscriptArchive
 
 
@@ -149,6 +151,12 @@ def build_parser() -> argparse.ArgumentParser:
     search.add_argument("query")
     search.add_argument("--limit", type=int, default=20)
     search.add_argument("--offset", type=int, default=0)
+
+    project_evidence = subcommands.add_parser("project-evidence")
+    project_evidence_sub = project_evidence.add_subparsers(dest="project_evidence_command", required=True)
+    migrate = project_evidence_sub.add_parser("migrate-legacy-objective")
+    migrate.add_argument("project", type=Path)
+    migrate.add_argument("objective_id")
 
     retention = subcommands.add_parser("archive-retention")
     retention_sub = retention.add_subparsers(dest="retention_command", required=True)
@@ -326,6 +334,10 @@ def build_parser() -> argparse.ArgumentParser:
 def main(argv: list[str] | None = None) -> int:
     args = build_parser().parse_args(argv)
     home = home_from_env()
+    if args.command == "project-evidence":
+        print_json({"manifest": str(migrate_legacy_objective(
+            home, args.project, args.objective_id))})
+        return 0
     if args.command == "pre-compact":
         payload = json.load(sys.stdin)
         if (
@@ -357,9 +369,11 @@ def main(argv: list[str] | None = None) -> int:
             or first.get("payload", {}).get("id") != session_id
         ):
             raise ValueError("transcript session ID does not match hook input")
-        archive = TranscriptArchive(home, session_id)
+        evidence_home = active_project_home(home, create=True, path=payload.get("cwd"))
+        archive = TranscriptArchive(evidence_home, session_id)
         segment = archive.import_rollout(source)
-        snapshot = ObjectiveStore(home).handoff_snapshot(session_id)
+        snapshot_home = legacy_home_for_record(home, evidence_home, "objective_sessions", f"{session_id}.json")
+        snapshot = ObjectiveStore(snapshot_home).handoff_snapshot(session_id)
         handoff = snapshot or {
             "goals": [],
             "accepted_decisions": [],
@@ -397,7 +411,9 @@ def main(argv: list[str] | None = None) -> int:
         if not isinstance(session_id, str):
             raise ValueError("SessionStart needs session_id")
         try:
-            handoff = TranscriptArchive(home, session_id).load_latest_handoff()
+            evidence_home = active_project_home(home, path=payload.get("cwd"))
+            archive_home = legacy_home_for_record(home, evidence_home, "transcripts", session_id)
+            handoff = TranscriptArchive(archive_home, session_id).load_latest_handoff()
             if handoff is None:
                 if source == "compact":
                     raise ValueError("compaction handoff is missing")
@@ -422,7 +438,11 @@ def main(argv: list[str] | None = None) -> int:
         })
         return 0
     if args.command == "archive-retention":
-        retention = ArchiveRetention(home)
+        retention_home = active_project_home(home, create=args.retention_command == "register")
+        if args.retention_command != "register":
+            retention_home = legacy_home_for_record(home, retention_home,
+                                                    "archive-projects", f"{args.project_id}.json")
+        retention = ArchiveRetention(retention_home)
         if args.retention_command == "register":
             result = retention.register(args.project_id, args.conversation, args.objective)
         elif args.retention_command == "close":
@@ -436,7 +456,7 @@ def main(argv: list[str] | None = None) -> int:
         print_json(result)
         return 0
     if args.command == "storage-pressure":
-        print_json(storage_pressure(home, prune=args.prune_reproducible_cache))
+        print_json(storage_pressure(active_project_home(home), prune=args.prune_reproducible_cache))
         return 0
     if args.command == "runtime":
         config = runtime_config(args)
@@ -459,7 +479,10 @@ def main(argv: list[str] | None = None) -> int:
             print_json({"stopped": True})
         return 0
     if args.command == "objective":
-        store = ObjectiveStore(home)
+        evidence_home = active_project_home(home, create=args.objective_command == "create")
+        if args.objective_command != "create":
+            evidence_home = objective_home(home, evidence_home, args.objective_id)
+        store = ObjectiveStore(evidence_home)
         if args.objective_command == "create":
             print_json(store.create(read_json(args.path)))
         elif args.objective_command == "show":
@@ -498,15 +521,24 @@ def main(argv: list[str] | None = None) -> int:
         command = list(args.argv)
         if command and command[0] == "--":
             command = command[1:]
+        require_safe_id(args.objective_id, "objective id")
+        evidence_home = active_project_home(home, create=True, path=args.cwd)
+        if (not os.environ.get("MAVIS_PROJECT_ROOT")
+                and (home / "objectives" / f"{args.objective_id}.json").exists()
+                and not (evidence_home / "objectives" / f"{args.objective_id}.json").exists()):
+            evidence_home = home
+        else:
+            evidence_home = objective_home(home, evidence_home, args.objective_id)
+        ObjectiveStore(evidence_home).load(args.objective_id)
         receipt = run_command(
-            home,
+            evidence_home,
             args.objective_id,
             command,
             args.cwd,
             timeout=args.timeout,
             acceptance_check_ids=args.check_id,
         )
-        ObjectiveStore(home).add_receipt(args.objective_id, receipt)
+        ObjectiveStore(evidence_home).add_receipt(args.objective_id, receipt)
         print(receipt)
         return 0
     if args.command == "output":
@@ -702,6 +734,8 @@ def main(argv: list[str] | None = None) -> int:
         else:
             print_json(queue.list(args.state))
         return 0
-    archive = TranscriptArchive(home, args.conversation_id)
+    evidence_home = active_project_home(home)
+    archive_home = legacy_home_for_record(home, evidence_home, "transcripts", args.conversation_id)
+    archive = TranscriptArchive(archive_home, args.conversation_id)
     print_json(archive.search(args.query, args.limit, args.offset))
     return 0

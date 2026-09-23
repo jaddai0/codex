@@ -98,3 +98,29 @@ evaluation runner yet. The source tests use injected gateway statuses and
 synthetic evaluation files. Phase 3 still needs a real failure, held-out
 comparison, accepted verifier job, staged runtime promotion, and rollback
 canary before it can be called complete.
+### Project evidence
+
+When the Mavis launcher runs from a nested Git checkout, it records new project objectives,
+host command receipts, and transcript handoffs under that checkout's ignored
+`.mavis/` directory. `MAVIS_PROJECT_ROOT` can name the checkout explicitly for
+service commands run elsewhere. The directory has a private `.gitignore` and
+must pass `git check-ignore` before Mavis writes evidence. Project memory and
+the search index already use the same directory. Shared verified coding
+knowledge remains under `$MAVIS_HOME/knowledge`; service runtime, profiles,
+and evaluation data remain under `$MAVIS_HOME`. The launcher's default
+`~/Dev-Projects` directory resolves to the user's home Git repository and is
+deliberately not treated as a project.
+
+Older objectives and sessions under `$MAVIS_HOME` stay readable at their
+original paths. Mavis selects an existing project record first and otherwise
+reads the older service record. It does not rewrite old receipt paths or hashes.
+To preserve a complete project copy of one older objective, run
+`mavis project-evidence migrate-legacy-objective PROJECT OBJECTIVE_ID`. The
+command copies its objective, host evidence, bound session records, and
+transcript archive into `.mavis/legacy-import/objectives/OBJECTIVE_ID/`, then
+writes a hash manifest. It leaves the source evidence intact so old acceptance
+links continue to verify. A failed copy does not publish a final import. To
+roll back new routing, remove `MAVIS_PROJECT_ROOT` from a direct service
+invocation; old global records remain in place. Never delete the original
+service evidence before all linked acceptance and retention records have been
+checked separately.
