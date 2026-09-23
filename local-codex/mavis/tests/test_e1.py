@@ -102,6 +102,14 @@ class E1RunnerTests(unittest.TestCase):
             "Fix a real omission",
         )
 
+    def _pass_candidate(self, case_id):
+        checkout = self.home / "e1" / "repair" / "checkouts" / "candidate" / case_id
+        (checkout / "result.txt").write_text("pass\n")
+        subprocess.run(["git", "-C", str(checkout), "add", "result.txt"], check=True)
+        subprocess.run(["git", "-C", str(checkout), "-c", "user.name=Test",
+                        "-c", "user.email=test@example.invalid", "commit", "-qm", "repair"], check=True)
+        return checkout
+
     def test_complete_comparison_retains_raw_receipts_and_coverage(self):
         frozen = self._freeze()
         self.assertEqual(len(frozen["candidate_requirements"]), 1)
@@ -111,10 +119,7 @@ class E1RunnerTests(unittest.TestCase):
             self.runner.compare("repair", "native-job", self.manifest)
         for case in ("regression", "held-a", "held-b"):
             self.runner.check("repair", "baseline", case)
-            candidate_checkout = (
-                self.home / "e1" / "repair" / "checkouts" / "candidate" / case
-            )
-            (candidate_checkout / "result.txt").write_text("pass\n")
+            self._pass_candidate(case)
             result = self.runner.check("repair", "candidate", case)
             self.assertTrue(result["passed"])
             receipt = read_json(Path(result["checks"][0]["receipt"]))
@@ -163,15 +168,7 @@ class E1RunnerTests(unittest.TestCase):
         self.runner.prepare("repair", "candidate")
         for case in ("regression", "held-a", "held-b"):
             self.runner.check("repair", "baseline", case)
-            (
-                self.home
-                / "e1"
-                / "repair"
-                / "checkouts"
-                / "candidate"
-                / case
-                / "result.txt"
-            ).write_text("pass\n")
+            self._pass_candidate(case)
             self.runner.check("repair", "candidate", case)
         report = self.root / "native-report.json"
         report.write_text('{"report":"native fixture"}')
@@ -281,8 +278,7 @@ class E1RunnerTests(unittest.TestCase):
                          {"provider": "minimax", "model": "minimax/MiniMax-M3", "harness": "opencode"})
         for case in ("regression", "held-a", "held-b"):
             self.runner.check("repair", "baseline", case)
-            checkout = self.home / "e1" / "repair" / "checkouts" / "candidate" / case
-            (checkout / "result.txt").write_text("pass\n")
+            self._pass_candidate(case)
             self.runner.check("repair", "candidate", case)
         binding = {"objective_id": "repair", "starting_revision": dispatch["starting_revision"],
                    "cwd": dispatch["checkout"], "requirements": assignments[0]["mavis_requirements"],
@@ -300,14 +296,10 @@ class E1RunnerTests(unittest.TestCase):
                            "verifier_job_id": "terra-job", "target_sha256": "a" * 64,
                            "evidence_sha256": "b" * 64, "report_sha256_on_disk": "c" * 64,
                            "verifier_verdict_sha256": "d" * 64}}
-        binding["report_sha256"] = "0" * 64
-        with self.assertRaisesRegex(ValueError, "receipt or report"):
+        with self.assertRaisesRegex(ValueError, "installed Mavis runtime profile activation receipt"):
             self.runner.compare_native("repair", "regression")
-        binding["report_sha256"] = sha256_file(report)
-        compared = self.runner.compare_native("repair", "regression")
-        self.assertEqual(compared["comparison"]["candidate"]["candidate_job_id"], "candidate-native")
-        self.assertEqual((self.home / "e1" / "repair" / "candidate-worker-report.json").read_text(),
-                         report.read_text())
+        self.assertEqual(self.runner.store.load("repair")["state"], "candidate")
+        self.assertFalse((self.home / "e1" / "repair" / "candidate-worker-report.json").exists())
 
     def test_native_dispatch_rejects_unbound_start_receipt(self):
         self._freeze()
@@ -320,6 +312,38 @@ class E1RunnerTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "exact Mavis candidate job"):
             self.runner.dispatch_candidate("repair", "regression", job_id="expected-job",
                                            lane="minimax", model="minimax/MiniMax-M3", task="Fix")
+
+    def test_candidate_check_rejects_uncommitted_or_ignored_content(self):
+        self._freeze()
+        self.runner.prepare("repair", "candidate")
+        checkout = self.home / "e1" / "repair" / "checkouts" / "candidate" / "regression"
+        (checkout / "result.txt").write_text("pass\n")
+        with self.assertRaisesRegex(ValueError, "checkout must be clean"):
+            self.runner.check("repair", "candidate", "regression")
+        self._pass_candidate("regression")
+        (checkout / ".gitignore").write_text("cache.bin\n")
+        subprocess.run(["git", "-C", str(checkout), "add", ".gitignore"], check=True)
+        subprocess.run(["git", "-C", str(checkout), "-c", "user.name=Test",
+                        "-c", "user.email=test@example.invalid", "commit", "-qm", "ignore cache"], check=True)
+        (checkout / "cache.bin").write_bytes(b"hidden input")
+        with self.assertRaisesRegex(ValueError, "checkout must be clean"):
+            self.runner.check("repair", "candidate", "regression")
+
+    def test_comparison_rejects_checkout_change_after_host_check(self):
+        self._freeze()
+        self.runner.prepare("repair", "baseline")
+        self.runner.prepare("repair", "candidate")
+        for case in ("regression", "held-a", "held-b"):
+            self.runner.check("repair", "baseline", case)
+            self._pass_candidate(case)
+            self.runner.check("repair", "candidate", case)
+        checkout = self.home / "e1" / "repair" / "checkouts" / "candidate" / "held-a"
+        (checkout / "result.txt").write_text("different dirty content\n")
+        report = self.root / "native-report.json"
+        report.write_text('{"worker":"fixture"}')
+        with self.assertRaisesRegex(ValueError, "checkout must be clean"):
+            self.runner.compare("repair", "candidate-job", report)
+        self.assertEqual(self.runner.store.load("repair")["state"], "candidate")
 
 
 if __name__ == "__main__":
