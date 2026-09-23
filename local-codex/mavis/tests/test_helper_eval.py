@@ -6,7 +6,7 @@ import unittest
 from unittest.mock import patch
 
 from mavis.evidence import run_command
-from mavis.helper_eval import SUITE_VERSION, _completion, evaluate
+from mavis.helper_eval import SUITE_VERSION, _completion, evaluate, main
 from mavis.helpers import HelperSession
 from mavis.transcripts import TranscriptArchive
 
@@ -63,6 +63,34 @@ class HelperEvaluationTests(unittest.TestCase):
             self.assertEqual(result["status"], "fail")
             self.assertIn("cited source", result["cases"][0]["error"])
 
+    def test_followup_never_reuses_another_conversations_history(self):
+        with tempfile.TemporaryDirectory() as directory:
+            home = Path(directory)
+            first = TranscriptArchive(home, "first")
+            first.append_segment([{"content": "old decision"}])
+            old = first.search("old decision")[0]
+            HelperSession(home, "librarian").store_query_context("old question", [
+                {key: old[key] for key in ("path", "line", "sha256")}
+            ])
+            second = TranscriptArchive(home, "second")
+            second.append_segment([{"content": "new decision"}])
+            current = second.search("new decision")[0]
+            citation = {key: current[key] for key in ("path", "line", "sha256")}
+            suite = {"schema_version": SUITE_VERSION, "role": "librarian", "cases": [
+                {"id": "followup", "conversation_id": "second", "question": "What decision?",
+                 "search_terms": ["new decision"], "followup": True,
+                 "expected_answer_terms": ["new decision"],
+                 "expected_source_terms": ["new decision"]}
+            ]}
+
+            def ask(*args):
+                user = json.loads(args[2][1]["content"])
+                self.assertIsNone(user["followup"])
+                return {"answer": "new decision", "uncertainty": "No reason recorded",
+                        "citations": [citation]}
+
+            self.assertEqual(evaluate(home, suite, MODEL, BASE_URL, ask=ask)["status"], "pass")
+
     def test_output_known_format_uses_host_parser_before_model(self):
         with tempfile.TemporaryDirectory() as directory:
             home = Path(directory)
@@ -94,6 +122,20 @@ class HelperEvaluationTests(unittest.TestCase):
             rejected = evaluate(home, suite, MODEL, BASE_URL, ask=lambda *args: promoted)
             self.assertEqual(rejected["status"], "fail")
 
+    def test_large_buried_failure_uses_full_host_log_without_model_truncation(self):
+        with tempfile.TemporaryDirectory() as directory:
+            home = Path(directory)
+            code = "print('ordinary output\\n' * 1500 + 'FAILED: hidden test\\n' + 'ordinary output\\n' * 1500)"
+            receipt = run_command(home, "reader", ["python3", "-c", code], home)
+            suite = {"schema_version": SUITE_VERSION, "role": "output-reader", "cases": [
+                {"id": "buried", "receipt_path": str(receipt), "expected_verdict": "fail"}
+            ]}
+            result = evaluate(home, suite, MODEL, BASE_URL,
+                              ask=lambda *args: self.fail("model called for known buried failure"))
+            self.assertEqual(result["status"], "inconclusive")
+            failure_lines = result["cases"][0]["result"]["host"]["failure_lines"]
+            self.assertEqual([item["text"] for item in failure_lines], ["FAILED: hidden test"])
+
     def test_output_failure_and_timeout_cannot_become_pass(self):
         with tempfile.TemporaryDirectory() as directory:
             home = Path(directory)
@@ -106,6 +148,7 @@ class HelperEvaluationTests(unittest.TestCase):
             result = evaluate(home, suite, MODEL, BASE_URL, ask=lambda *args: {
                 "verdict": "pass", "summary": "success", "observations": [{"line": 1, "text": "hidden fault"}]})
             self.assertEqual(result["status"], "fail")
+            self.assertEqual(result["cases"][0]["proposed"]["summary"], "success")
             result = evaluate(home, suite, MODEL, BASE_URL, ask=lambda *args: {
                 "verdict": "fail", "summary": "success", "observations": [{"line": 1, "text": "hidden fault"}]})
             self.assertEqual(result["status"], "fail")
@@ -166,6 +209,20 @@ class HelperEvaluationTests(unittest.TestCase):
             with self.assertRaisesRegex(ValueError, "differs"):
                 evaluate(home, suite, MODEL, BASE_URL, model_path=model,
                          inventory_reader=lambda _: [{"id": MODEL, "model_path": str(home)}])
+
+    def test_preflight_failure_keeps_private_failure_receipt(self):
+        with tempfile.TemporaryDirectory() as directory:
+            home = Path(directory)
+            suite = home / "suite.json"
+            suite.write_text(json.dumps({"schema_version": SUITE_VERSION,
+                                         "role": "librarian", "cases": [{"id": "case"}]}))
+            with patch("mavis.helper_eval._model_binding", side_effect=ValueError("wrong model")):
+                exit_status = main(["--home", str(home), "--suite", str(suite),
+                                    "--model-id", MODEL, "--model-path", str(home)])
+            self.assertEqual(exit_status, 1)
+            receipts = list((home / "helpers" / "librarian" / "evaluations").glob("*.json"))
+            self.assertEqual(len(receipts), 1)
+            self.assertEqual(json.loads(receipts[0].read_text())["cases"][0]["error"], "wrong model")
 
 
 if __name__ == "__main__":
