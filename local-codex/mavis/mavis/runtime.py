@@ -201,11 +201,19 @@ def omlx_live_process_binding(config: RuntimeConfig, endpoint: str,
         raise RuntimeError("oMLX process is not bound to the expected base path")
     status = request_json(endpoint, "/api/status")
     snapshot = status.get("runtime_source") if isinstance(status, dict) else None
-    expected_python = str((config.omlx_binary.parent / "python").resolve(strict=True))
+    shebang = config.omlx_binary.open("rb").readline().decode("ascii").strip()
+    if not shebang.startswith("#!"):
+        raise RuntimeError("oMLX launcher has no Python shebang")
+    expected_python = Path(shebang[2:].split()[0])
+    expected_prefix = config.omlx_binary.parent.parent.resolve(strict=True)
+    if (not expected_python.is_file()
+            or expected_python.parent.resolve() != config.omlx_binary.parent.resolve()):
+        raise RuntimeError("oMLX launcher uses a Python outside its configured venv")
     if (not isinstance(snapshot, dict) or snapshot.get("process_pid") != pid
             or snapshot.get("package_sha256") != runtime["package_sha256"]
             or snapshot.get("package_files") != runtime["package_files"]
-            or snapshot.get("python_executable") != expected_python):
+            or snapshot.get("python_executable") != str(expected_python)
+            or snapshot.get("python_prefix") != str(expected_prefix)):
         raise RuntimeError("live oMLX process does not report the fingerprinted package and Python")
     result = subprocess.run(["ps", "-p", str(pid), "-o", "lstart="],
                             text=True, capture_output=True, check=True, timeout=5,
@@ -224,7 +232,8 @@ def omlx_live_process_binding(config: RuntimeConfig, endpoint: str,
         raise RuntimeError("oMLX process may predate its current source or model files")
     return {"pid": pid, "started_at_epoch": started, "base_path": str(base_path),
             "package_sha256": runtime["package_sha256"],
-            "python_executable": expected_python}
+            "python_executable": str(expected_python),
+            "python_prefix": str(expected_prefix)}
 
 
 def _iris_drain_token() -> str:
