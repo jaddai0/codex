@@ -160,6 +160,12 @@ class MaintenanceRuntimeTests(unittest.TestCase):
                 return_value=subprocess.CompletedProcess([], 0, "node diagnostics/lyria/bench.mjs\n", ""),
             ):
                 self.assertIn("benchmark", host_admission(home)[1])
+            with patch("mavis.maintenance_runtime.inventory", return_value=[]), patch(
+                "mavis.maintenance_runtime.subprocess.run",
+                return_value=subprocess.CompletedProcess([], 0,
+                    "node diagnostics/lyria/replay.mjs --variant=candidate\n", ""),
+            ):
+                self.assertIn("benchmark", host_admission(home)[1])
             with patch("mavis.maintenance_runtime.inventory", side_effect=OSError("down")):
                 self.assertIn("unavailable", host_admission(home)[1])
 

@@ -17,7 +17,8 @@ from .storage import read_json, sha256_file, write_json
 
 
 RUNTIME_KINDS = HOST_KINDS
-BENCHMARK_MARKERS = ("bench.mjs", "benchmark.py", "mlx_lm.benchmark", "mlx_lm.generate")
+BENCHMARK_MARKERS = ("bench.mjs", "replay.mjs", "benchmark.py",
+                     "mlx_lm.benchmark", "mlx_lm.generate")
 
 
 def _lock_available(path: Path) -> bool:
