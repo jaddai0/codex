@@ -15,10 +15,13 @@ import signal
 import subprocess
 import sys
 import time
+import uuid
 from urllib.parse import quote
 
-from mavis.e2_tasks import (CATALOG_TEST, FULL_TEST, codex_terra_review_completed,
-                            fixture_state, prepare_heldout, run_host_check,
+from mavis.e2_tasks import (CATALOG_TEST, FULL_TEST, _completed_prompt_turn,
+                            _user_turn, codex_terra_review_completed, first_task_prompt,
+                            fixture_state, matching_first_rollout, prepare_heldout,
+                            resume_task_prompt, run_host_check, task_launch_commands,
                             terra_review_command, terra_review_prompt, verify_heldout)
 from mavis.e1_bootstrap import _summary as current_e0_summary
 from mavis.evaluations import installed_candidate_fingerprint
@@ -86,20 +89,14 @@ def main() -> int:
         if loaded(config.iris_endpoint):
             raise RuntimeError("IRIS main model did not unload")
         load_model(config)
-        launcher = str(Path.home() / "Desktop" / "Mavis.command")
         env = {**os.environ, "MAVIS_PROJECT_DIR": str(repo), "PYTHONDONTWRITEBYTECODE": "1"}
-        prompt = (
-            "Read BLUEPRINT.md and inspect this repository. Work on the catalog "
-            "package only: fix its discounted subtotal and input checks, then run "
-            "python3 -m unittest tests.test_catalog -q and report the actual result. "
-            "Preserve BLUEPRINT.md, tests, user-notes.txt, and private-draft.txt. "
-            "Do not touch checkout yet and do not commit."
-        )
+        nonce = uuid.uuid4().hex
+        result["prompt_nonce"] = nonce
+        first_argv, _unused_resume = task_launch_commands(repo, "pending", nonce)
+        result["first_argv"] = first_argv
         print(f"Mavis catalog slice in {repo}: after its answer, enter /compact, then /exit", flush=True)
         started = time.time()
-        result["first_pid"], result["first_exit"] = _run_tui(
-            [launcher, "--no-daemon", "--no-alt-screen", "-C", str(repo), prompt],
-            repo=repo, env=env)
+        result["first_pid"], result["first_exit"] = _run_tui(first_argv, repo=repo, env=env)
         if result["first_exit"] != 0:
             raise RuntimeError("first installed Mavis process failed")
         result["stage1_state"] = fixture_state(manifest_path, stage="catalog")
@@ -107,43 +104,33 @@ def main() -> int:
         if json.loads(Path(result["catalog_check"]).read_text())["exit_status"] != 0:
             raise RuntimeError("catalog host check failed")
         session_root = Path.home() / ".local-codex" / "sessions"
-        rollout = None
-        for path in sorted(session_root.glob("**/rollout-*.jsonl"),
-                           key=lambda item: item.stat().st_mtime, reverse=True):
-            if path.stat().st_mtime < started - 2:
-                continue
-            rows = _records(path)
-            if rows and rows[0].get("payload", {}).get("cwd") == str(repo):
-                rollout = path
-                break
-        if rollout is None:
-            raise RuntimeError("first installed Mavis process produced no fixture rollout")
+        rollout, session_id, first_turn = matching_first_rollout(
+            session_root, repo, first_task_prompt(nonce), started)
         first_data = rollout.read_bytes()
         first_rows = _records(rollout)
+        _first_user, first_complete = _completed_prompt_turn(
+            first_rows, first_task_prompt(nonce), session_id, first_turn)
         result.update({
             "rollout": str(rollout),
-            "session_id": first_rows[0]["payload"]["id"],
+            "session_id": session_id,
+            "first_turn_id": first_turn,
             "first_rollout_bytes": len(first_data),
             "first_rollout_events": len(first_rows),
             "first_rollout_sha256": hashlib.sha256(first_data).hexdigest(),
         })
-        if (not any(row.get("type") == "compacted" for row in first_rows)
-                or not any(row.get("type") == "event_msg" and row.get("payload", {}).get("type") == "task_complete" for row in first_rows)):
+        if not any(index > first_complete and row.get("type") == "compacted"
+                   for index, row in enumerate(first_rows)):
             raise RuntimeError("first process did not complete work and compact")
-        next_prompt = (
-            "Resume the same BLUEPRINT.md objective. Catalog is already fixed. "
-            "Now fix the checkout package, check downstream invoice behavior, "
-            "run python3 -m unittest discover -s tests -q, and report the real result. "
-            "Preserve the blueprint, tests, user-notes.txt, private-draft.txt, "
-            "and the catalog repair. Do not commit."
-        )
+        _first_command, resume_argv = task_launch_commands(repo, session_id, nonce)
+        result["resume_argv"] = resume_argv
         print("Mavis resumed checkout slice: after its answer, enter /exit", flush=True)
-        result["resume_pid"], result["resume_exit"] = _run_tui(
-            [launcher, "resume", "--no-daemon", "--no-alt-screen",
-             "-C", str(repo), result["session_id"], next_prompt],
-            repo=repo, env=env)
+        result["resume_pid"], result["resume_exit"] = _run_tui(resume_argv, repo=repo, env=env)
         if result["resume_exit"] != 0:
             raise RuntimeError("resumed installed Mavis process failed")
+        resumed_rows = _records(rollout)[len(first_rows):]
+        _resume_user, resume_turn = _user_turn(resumed_rows, resume_task_prompt(nonce), session_id)
+        _completed_prompt_turn(resumed_rows, resume_task_prompt(nonce), session_id, resume_turn)
+        result["resume_turn_id"] = resume_turn
         result["final_state"] = fixture_state(manifest_path, stage="complete")
         result["complete_check"] = str(run_host_check(task, "complete", FULL_TEST))
         if json.loads(Path(result["complete_check"]).read_text())["exit_status"] != 0:

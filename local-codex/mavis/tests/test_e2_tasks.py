@@ -11,7 +11,9 @@ import unittest
 from unittest.mock import patch
 
 from mavis.e2_tasks import (CATALOG_TEST, FULL_TEST, codex_terra_review_completed,
-                            fixture_state, prepare_heldout, run_host_check,
+                            first_task_prompt, fixture_state, matching_first_rollout,
+                            prepare_heldout, resume_task_prompt, run_host_check,
+                            task_launch_commands,
                             terra_review_command, terra_review_prompt, verify_heldout)
 from mavis.runtime import DEFAULT_MODEL
 from mavis.storage import sha256_file, write_json
@@ -50,14 +52,30 @@ class E2HeldoutTests(unittest.TestCase):
         self._checkout_repair(repo)
         final = fixture_state(manifest, stage="complete")
         second_check = run_host_check(task, "complete", FULL_TEST)
+        nonce = "ab" * 16
+        session = "session-e2"
+        first_turn, resume_turn = "first-turn", "resume-turn"
         events = [
-            {"type": "session_meta", "payload": {"cwd": str(repo), "id": "session-e2"}},
-            {"type": "event_msg", "payload": {"type": "task_complete", "last_agent_message": "Catalog fixed"}},
+            {"type": "session_meta", "payload": {"cwd": str(repo), "id": session, "session_id": session}},
+            {"type": "event_msg", "payload": {"type": "task_started", "turn_id": first_turn}},
+            {"type": "event_msg", "payload": {"type": "item_completed", "thread_id": session,
+              "turn_id": first_turn, "item": {"type": "UserMessage", "content": [
+                  {"type": "text", "text": first_task_prompt(nonce)}]}}},
+            {"type": "event_msg", "payload": {"type": "task_complete", "turn_id": first_turn,
+              "last_agent_message": "Catalog fixed"}},
             {"type": "compacted", "payload": {}},
         ]
         prefix = b"".join(json.dumps(event).encode() + b"\n" for event in events)
-        events.append({"type": "event_msg", "payload": {"type": "task_complete", "last_agent_message": "Checkout fixed"}})
-        rollout = task / "rollout.jsonl"
+        first_count = len(events)
+        events.extend([
+            {"type": "event_msg", "payload": {"type": "task_started", "turn_id": resume_turn}},
+            {"type": "event_msg", "payload": {"type": "item_completed", "thread_id": session,
+              "turn_id": resume_turn, "item": {"type": "UserMessage", "content": [
+                  {"type": "text", "text": resume_task_prompt(nonce)}]}}},
+            {"type": "event_msg", "payload": {"type": "task_complete", "turn_id": resume_turn,
+              "last_agent_message": "Checkout fixed"}},
+        ])
+        rollout = task / "rollout-selected.jsonl"
         rollout.write_bytes(b"".join(json.dumps(event).encode() + b"\n" for event in events))
         review_log = task / "terra-review.jsonl"
         review_events = [
@@ -82,10 +100,14 @@ class E2HeldoutTests(unittest.TestCase):
             "observer_path": str(observer), "observer_sha256": sha256_file(observer),
             "first_pid": 1001, "resume_pid": 1002, "first_exit": 0, "resume_exit": 0,
             "iris_loaded": True, "mavis_loaded": False,
+            "prompt_nonce": nonce,
+            "first_argv": task_launch_commands(repo, session, nonce)[0],
+            "resume_argv": task_launch_commands(repo, session, nonce)[1],
+            "first_turn_id": first_turn, "resume_turn_id": resume_turn,
             "stage1_state": stage1, "final_state": final,
             "catalog_check": str(first_check), "complete_check": str(second_check),
-            "rollout": str(rollout), "session_id": "session-e2",
-            "first_rollout_bytes": len(prefix), "first_rollout_events": 3,
+            "rollout": str(rollout), "session_id": session,
+            "first_rollout_bytes": len(prefix), "first_rollout_events": first_count,
             "first_rollout_sha256": hashlib.sha256(prefix).hexdigest(),
             "review_exit": 0,
             "review_argv": terra_review_command(repo, review_text, terra_review_prompt(manifest, rollout)),
@@ -157,6 +179,41 @@ class E2HeldoutTests(unittest.TestCase):
                 result["resume_pid"] = 1002
                 result["first_rollout_sha256"] = "0" * 64
                 write_json(task / "result.json", result)
+                with self.assertRaises(ValueError):
+                    verify_heldout(manifest)
+
+    def test_competing_same_cwd_rollout_cannot_steal_first_session(self):
+        with tempfile.TemporaryDirectory() as directory:
+            manifest, task, repo, result = self._observed(Path(directory))
+            competing = task / "rollout-competing.jsonl"
+            competing.write_text("\n".join(json.dumps(row) for row in [
+                {"type": "session_meta", "payload": {"cwd": str(repo), "id": "other-session"}},
+                {"type": "event_msg", "payload": {"type": "item_completed", "thread_id": "other-session",
+                 "turn_id": "other-turn", "item": {"type": "UserMessage", "content": [
+                     {"type": "text", "text": "A competing task in the same directory"}]}}},
+            ]) + "\n")
+            path, session, turn = matching_first_rollout(
+                task, repo, first_task_prompt(result["prompt_nonce"]), 0)
+            self.assertEqual(path, Path(result["rollout"]))
+            self.assertEqual((session, turn), ("session-e2", "first-turn"))
+            competing.write_text(Path(result["rollout"]).read_text())
+            with self.assertRaises(ValueError):
+                matching_first_rollout(task, repo, first_task_prompt(result["prompt_nonce"]), 0)
+
+    def test_wrong_resume_session_or_unrelated_later_completion_is_rejected(self):
+        with tempfile.TemporaryDirectory() as directory:
+            manifest, task, repo, result = self._observed(Path(directory))
+            result["resume_argv"][-2] = "wrong-session"
+            write_json(task / "result.json", result)
+            with patch("mavis.e2_tasks.installed_candidate_fingerprint", return_value={"core_sha256": "candidate"}), patch(
+                    "mavis.e2_tasks.current_e0_summary", return_value=(task / "e0-summary.json", {"model_id": DEFAULT_MODEL})):
+                with self.assertRaises(ValueError):
+                    verify_heldout(manifest)
+                result["resume_argv"] = task_launch_commands(repo, "session-e2", result["prompt_nonce"])[1]
+                write_json(task / "result.json", result)
+                rows = [json.loads(line) for line in Path(result["rollout"]).read_text().splitlines()]
+                rows[-2]["payload"]["thread_id"] = "other-session"
+                Path(result["rollout"]).write_text("".join(json.dumps(row) + "\n" for row in rows))
                 with self.assertRaises(ValueError):
                     verify_heldout(manifest)
 
