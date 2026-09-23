@@ -122,14 +122,18 @@ def _run_tui(command: list[str], *, repo: Path, env: dict[str, str],
                             pass
                         else:
                             time.sleep(0.5)
-                            os.write(master, b"/compact\r" if compact else b"/exit\r")
+                            os.write(master, b"/compact" if compact else b"/exit")
+                            time.sleep(0.75)
+                            os.write(master, b"\r")
                             stage = "compact" if compact else "exit"
                             deadline = time.monotonic() + (600 if compact else 60)
                 elif (stage == "compact" and completed_at is not None
                       and any(row.get("type") == "compacted"
                               for row in rows[completed_at + 1:])):
                     time.sleep(0.5)
-                    os.write(master, b"/exit\r")
+                    os.write(master, b"/exit")
+                    time.sleep(0.75)
+                    os.write(master, b"\r")
                     stage = "exit"
                     deadline = time.monotonic() + 60
                 code = process.poll()

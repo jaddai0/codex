@@ -231,13 +231,17 @@ def _run_stage(command: list[str], *, workspace: Path, env: dict[str, str],
                         if answer != expected_answer:
                             raise ValueError("installed Mavis gave a different answer")
                         time.sleep(0.5)
-                        os.write(master, b"/compact\r" if expected_compactions else b"/exit\r")
+                        os.write(master, b"/compact" if expected_compactions else b"/exit")
+                        time.sleep(0.75)
+                        os.write(master, b"\r")
                         stage = "compact" if expected_compactions else "exit"
                         deadline = time.monotonic() + min(
                             stage_timeout, 600 if expected_compactions else 60)
                 elif stage == "compact" and sum(row.get("type") == "compacted" for row in rows) == expected_compactions:
                     time.sleep(1)
-                    os.write(master, b"/exit\r")
+                    os.write(master, b"/exit")
+                    time.sleep(0.75)
+                    os.write(master, b"\r")
                     stage = "exit"
                     deadline = time.monotonic() + min(stage_timeout, 60)
                 code = process.poll()
