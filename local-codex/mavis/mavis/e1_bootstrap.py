@@ -108,6 +108,7 @@ def _review(home: Path, receipt: dict[str, Any], status_reader: Callable[[str], 
     acceptance = status["acceptance"]
     binding = status.get("mavis_binding")
     if (acceptance.get("verifier_job_id") != review.get("verifier_job_id")
+            or acceptance.get("report_sha256_on_disk") != sha256_file(path)
             or not isinstance(binding, dict)
             or binding.get("objective_id") != "e1-bootstrap-main"
             or binding.get("report_sha256") != sha256_file(path)
