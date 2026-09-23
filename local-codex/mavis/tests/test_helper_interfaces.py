@@ -56,6 +56,42 @@ class LibrarianEvidenceTests(unittest.TestCase):
 
 
 class OutputReaderTests(unittest.TestCase):
+    def test_zero_failure_summary_remains_pass(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            receipt = run_command(
+                root,
+                "reader-test",
+                ["python3", "-c", "print('10 passed, 0 failed, 0 errors')"],
+                root,
+            )
+            result = OutputReader.read(receipt)
+            self.assertEqual(result["verdict"], "pass")
+            self.assertEqual(result["failure_lines"], [])
+            self.assertEqual(
+                result["count_lines"][0]["text"], "10 passed, 0 failed, 0 errors"
+            )
+
+    def test_mixed_zero_count_and_explicit_failure_remains_fail(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            receipt = run_command(
+                root,
+                "reader-test",
+                [
+                    "python3",
+                    "-c",
+                    "print('10 passed, 0 failed\\nFAILED: later stage\\n9 passed, 1 failed')",
+                ],
+                root,
+            )
+            result = OutputReader.read(receipt)
+            self.assertEqual(result["verdict"], "fail")
+            self.assertEqual(
+                [item["text"] for item in result["failure_lines"]],
+                ["FAILED: later stage", "9 passed, 1 failed"],
+            )
+
     def test_buried_failure_cannot_be_rewritten_as_success(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)

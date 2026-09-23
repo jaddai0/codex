@@ -9,7 +9,7 @@
     {
       "artifact": "local-codex/mavis/mavis/helper_interfaces.py",
       "command": "PYTHONPATH=local-codex/mavis python3 -m unittest discover -s local-codex/mavis/tests -v",
-      "evidence": ["77 tests passed; citation tests reject foreign files, unknown lines, missing uncertainty, and changed sources"],
+      "evidence": ["79 tests passed; citation tests reject foreign files, unknown lines, missing uncertainty, and changed sources"],
       "id": "cited-history",
       "requirement": "Librarian answers cite verified archived lines and state uncertainty.",
       "status": "pass"
@@ -17,7 +17,7 @@
     {
       "artifact": "local-codex/mavis/tests/test_helper_interfaces.py",
       "command": "PYTHONPATH=local-codex/mavis python3 -m unittest discover -s local-codex/mavis/tests -v",
-      "evidence": ["77 tests passed; buried failure, nonzero exit, count, and modified raw output cases covered"],
+      "evidence": ["79 tests passed; zero-failure passing counts, mixed-format failure, buried failure, nonzero exit, and modified raw output cases covered"],
       "id": "reader-safety",
       "requirement": "Output reader preserves host verdict, failure messages, counts, exit status, and raw references.",
       "status": "pass"
@@ -25,7 +25,7 @@
     {
       "artifact": "local-codex/mavis/mavis/helper_interfaces.py",
       "command": "python3 -m compileall -q local-codex/mavis/mavis && git diff --check",
-      "evidence": ["Syntax and whitespace checks passed; 77 Mavis tests passed"],
+      "evidence": ["Syntax and whitespace checks passed; 79 Mavis tests passed"],
       "id": "syntax",
       "requirement": "New helper interfaces compile and do not disturb existing Mavis tests.",
       "status": "pass"
