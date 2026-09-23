@@ -287,6 +287,7 @@ class PrepareRuntimeTests(unittest.TestCase):
         installer = (MODULE_PATH.parent / "install.sh").read_text(encoding="utf-8")
         self.assertIn('"$install_bin/mavis"', installer)
         self.assertIn("Desktop/Mavis.command", installer)
+        self.assertIn('"$repo_root/local-codex/launch_core.py" "$install_share/launch_core.py"', installer)
 
     def test_launcher_uses_isolated_mavis_runtime(self):
         launcher = (MODULE_PATH.parent / "bin" / "local-codex").read_text(
