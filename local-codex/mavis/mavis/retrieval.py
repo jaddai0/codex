@@ -384,7 +384,10 @@ class ProjectIndex:
                 continue
         return hits
 
-    def search(self, query: str, limit: int = 20, offset: int = 0) -> list[dict[str, Any]]:
+    def search(
+        self, query: str, limit: int = 20, offset: int = 0,
+        *, embedding_provider: Any = None,
+    ) -> list[dict[str, Any]]:
         if not query.strip():
             raise ValueError("query must not be empty")
         self._page(limit, offset)
@@ -409,8 +412,22 @@ class ProjectIndex:
             if key not in seen_claims:
                 distinct_global.append(hit.as_dict())
                 seen_claims.add(key)
-        combined = [item.as_dict() for item in project_ranked] + memories + distinct_global
+        project_hits = [item.as_dict() for item in project_ranked]
+        embedding_hits = []
+        if embedding_provider is not None:
+            from .embedding_index import EmbeddingIndex
+
+            exact_paths = {item["path"] for item in project_hits}
+            embedding_hits = [item for item in EmbeddingIndex(self).search(query, embedding_provider)
+                              if item["path"] not in exact_paths]
+        combined = project_hits + memories + embedding_hits + distinct_global
         return combined[offset:offset + limit]
+
+    def refresh_embeddings(self, provider: Any, *, rebuild: bool = False) -> dict[str, Any]:
+        """Refresh optional vectors; exact retrieval remains available without a provider."""
+        from .embedding_index import EmbeddingIndex
+
+        return EmbeddingIndex(self).refresh(provider, rebuild=rebuild)
 
     def symbol(self, name: str, limit: int = 20, offset: int = 0) -> list[dict[str, Any]]:
         self._page(limit, offset)
