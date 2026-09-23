@@ -215,6 +215,11 @@ def omlx_live_process_binding(config: RuntimeConfig, endpoint: str,
             or snapshot.get("python_executable") != str(expected_python)
             or snapshot.get("python_prefix") != str(expected_prefix)):
         raise RuntimeError("live oMLX process does not report the fingerprinted package and Python")
+    models = [row for row in inventory(endpoint) if row.get("id") == runtime["model_id"]]
+    if (len(models) != 1 or not isinstance(models[0].get("model_path"), str)
+            or Path(models[0]["model_path"]).resolve(strict=True)
+            != Path(runtime["model_path"])):
+        raise RuntimeError("live oMLX selected model path differs from fingerprinted model")
     result = subprocess.run(["ps", "-p", str(pid), "-o", "lstart="],
                             text=True, capture_output=True, check=True, timeout=5,
                             env={**os.environ, "LC_ALL": "C"})
