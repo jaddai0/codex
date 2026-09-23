@@ -306,15 +306,19 @@ def write_profile(
     selected: str,
     gateway_root: Path | None = None,
     gateway_env_file: Path | None = None,
+    accepted_instructions_path: Path | None = None,
 ) -> None:
     if gateway_env_file is not None and gateway_root is None:
         raise ValueError("gateway environment file requires a trusted gateway")
     catalog_path = home / "omlx-models.json"
     hook_key = f"{(home / 'config.toml').resolve()}:pre_compact:0:0"
     hook_hash = mavis_archive_hook_hash()
+    instructions_line = (f"model_instructions_file = {json.dumps(str(accepted_instructions_path.resolve()))}\n"
+                         if accepted_instructions_path else "")
     profile = f"""model = {json.dumps(selected)}
 model_provider = "omlx"
 model_catalog_json = {json.dumps(str(catalog_path))}
+{instructions_line}
 check_for_update_on_startup = false
 
 [analytics]
@@ -447,8 +451,12 @@ def main() -> int:
             base_instructions = base_instructions.rstrip() + "\n\n" + custom_system + "\n"
     catalog, selected = prepare_catalog(records, accepted_model or args.model, base_instructions)
     args.home.mkdir(parents=True, exist_ok=True)
+    accepted_instructions_path = args.home / "accepted-model-instructions.md" if accepted else None
+    if accepted_instructions_path is not None:
+        atomic_write(accepted_instructions_path, base_instructions)
     atomic_write(args.home / "omlx-models.json", json.dumps(catalog, indent=2) + "\n")
-    write_profile(args.home, base_url, selected, args.gateway_root, args.gateway_env_file)
+    write_profile(args.home, base_url, selected, args.gateway_root, args.gateway_env_file,
+                  accepted_instructions_path)
     ensure_persona(args.home, args.persona_template)
     if accepted:
         config_path = args.home / "config.toml"
@@ -466,6 +474,8 @@ def main() -> int:
             "model_identity": accepted["model_identity"],
             "selected_model": selected,
             "effective_system_prompt_sha256": hashlib.sha256(base_instructions.encode()).hexdigest(),
+            "instructions_path": str(accepted_instructions_path.resolve()),
+            "instructions_sha256": hashlib.sha256(accepted_instructions_path.read_bytes()).hexdigest(),
             "config_path": str(config_path.resolve()),
             "config_sha256": hashlib.sha256(config_path.read_bytes()).hexdigest(),
             "catalog_path": str(catalog_path.resolve()),

@@ -34,20 +34,34 @@ def launch(receipt_path: Path | None, argv: list[str]) -> int:
     if not argv:
         raise ValueError("core binary is required")
     receipt = None
+    launch_argv = argv
     if receipt_path is not None:
         check_profile_cli_arguments(argv[1:])
         receipt = json.loads(receipt_path.read_text(encoding="utf-8"))
         if receipt.get("state") != "prepared":
             raise ValueError("profile launch receipt is not prepared")
-        for name in ("config", "catalog"):
+        for name in ("config", "catalog", "instructions"):
             if digest(Path(receipt[f"{name}_path"])) != receipt[f"{name}_sha256"]:
                 raise ValueError(f"profile {name} changed after preparation")
+        if receipt["instructions_sha256"] != receipt["effective_system_prompt_sha256"]:
+            raise ValueError("accepted instructions differ from recorded effective prompt")
         if digest(Path(receipt["profile_path"])) != receipt["profile_sha256"]:
             raise ValueError("accepted profile changed after preparation")
         active = accepted_main_profile(Path(receipt["mavis_home"]))
         if active is None or active["_source_sha256"] != receipt["profile_sha256"]:
             raise ValueError("accepted main profile is no longer active")
-    child = subprocess.Popen(argv)
+        if receipt["selected_model"] != active["model_identity"]["model_id"]:
+            raise ValueError("recorded model differs from accepted main profile")
+        bindings = {
+            "model": receipt["selected_model"],
+            "model_provider": "omlx",
+            "model_catalog_json": receipt["catalog_path"],
+            "model_instructions_file": receipt["instructions_path"],
+        }
+        overrides = [f"{key}={json.dumps(value)}" for key, value in bindings.items()]
+        launch_argv = [argv[0], *(item for override in overrides for item in ("-c", override)), *argv[1:]]
+        receipt["binding_overrides"] = overrides
+    child = subprocess.Popen(launch_argv)
     if receipt is not None:
         receipt.update({"state": "spawned", "spawned_at": datetime.now(timezone.utc).isoformat(),
                         "core_binary": str(Path(argv[0]).resolve()), "core_pid": child.pid})

@@ -40,8 +40,30 @@ class PrepareRuntimeTests(unittest.TestCase):
                 "import json, os, sys\n"
                 "open(os.environ['STUB_RUNTIME_ARGS'], 'w').write(json.dumps(sys.argv[1:]))\n"
             )
+            workspace = root / "workspace"
+            (workspace / ".codex").mkdir(parents=True)
+            (workspace / ".codex" / "wrong.md").write_text("Wrong project prompt\n")
+            (workspace / ".codex" / "config.toml").write_text(
+                'model = "wrong-project-model"\n'
+                'model_provider = "wrong-provider"\n'
+                'model_catalog_json = "wrong-catalog.json"\n'
+                'model_instructions_file = "wrong.md"\n'
+            )
             core = root / "core"
-            core.write_text("#!/bin/sh\nexit 0\n")
+            core.write_text(
+                "#!/usr/bin/env python3\n"
+                "import json, os, pathlib, sys, tomllib\n"
+                "args = sys.argv[1:]\n"
+                "work = pathlib.Path(args[args.index('-C') + 1])\n"
+                "with (work / '.codex/config.toml').open('rb') as handle: cfg = tomllib.load(handle)\n"
+                "for index, argument in enumerate(args):\n"
+                "    if argument == '-c':\n"
+                "        key, value = args[index + 1].split('=', 1)\n"
+                "        cfg[key] = tomllib.loads('value = ' + value)['value']\n"
+                "prompt = pathlib.Path(cfg['model_instructions_file']).read_text()\n"
+                "pathlib.Path(os.environ['STUB_CORE_OBSERVED']).write_text(json.dumps(\n"
+                "    {'config': cfg, 'prompt': prompt, 'args': args}))\n"
+            )
             core.chmod(0o755)
             gateway = root / "gateway" / "bin" / "mcp-server.sh"
             gateway.parent.mkdir(parents=True)
@@ -69,8 +91,10 @@ class PrepareRuntimeTests(unittest.TestCase):
                             "LOCAL_CODEX_HOME": str(root / "codex-home"), "MAVIS_HOME": str(mavis_home),
                             "LOCAL_CODEX_BIN": str(core), "MAVIS_GATEWAY_ROOT": str(gateway.parent.parent),
                             "OMLX_BASE_URL": f"http://127.0.0.1:{server.server_port}/v1",
-                            "STUB_RUNTIME_ARGS": str(root / "runtime-args.json")})
-                result = subprocess.run(["zsh", str(MODULE_PATH.parent / "bin/local-codex")],
+                            "STUB_RUNTIME_ARGS": str(root / "runtime-args.json"),
+                            "STUB_CORE_OBSERVED": str(root / "core-observed.json")})
+                result = subprocess.run(["zsh", str(MODULE_PATH.parent / "bin/local-codex"),
+                                         "-C", str(workspace)],
                                         env=env, capture_output=True, text=True, timeout=15)
                 self.assertEqual(result.returncode, 0, result.stderr)
                 args = json.loads((root / "runtime-args.json").read_text())
@@ -79,6 +103,15 @@ class PrepareRuntimeTests(unittest.TestCase):
                 self.assertEqual(receipt["state"], "exited")
                 self.assertEqual(receipt["selected_model"], "model-b")
                 self.assertEqual(receipt["core_exit_code"], 0)
+                observed = json.loads((root / "core-observed.json").read_text())
+                self.assertEqual(observed["config"]["model"], "model-b")
+                self.assertEqual(observed["config"]["model_provider"], "omlx")
+                self.assertEqual(observed["config"]["model_catalog_json"], receipt["catalog_path"])
+                self.assertEqual(observed["config"]["model_instructions_file"], receipt["instructions_path"])
+                self.assertEqual(hashlib.sha256(observed["prompt"].encode()).hexdigest(),
+                                 receipt["effective_system_prompt_sha256"])
+                self.assertEqual(observed["args"][:8],
+                                 [part for override in receipt["binding_overrides"] for part in ("-c", override)])
                 (root / "runtime-args.json").unlink()
                 blocked = subprocess.run(["zsh", str(MODULE_PATH.parent / "bin/local-codex"),
                                           "-c", 'model_provider="other"'],
@@ -169,6 +202,17 @@ class PrepareRuntimeTests(unittest.TestCase):
                 stub_core = root / "stub-core"
                 stub_core.write_text("#!/bin/sh\nexit 0\n")
                 stub_core.chmod(0o755)
+                if version == 1:
+                    accepted_prompt = Path(receipt["instructions_path"])
+                    original_prompt = accepted_prompt.read_text()
+                    accepted_prompt.write_text("changed after preparation\n")
+                    rejected = subprocess.run([sys.executable, str(MODULE_PATH.parent / "launch_core.py"),
+                                               "--receipt", str(receipt_path), "--", str(stub_core)],
+                                              capture_output=True, text=True,
+                                              env={**os.environ, "PYTHONPATH": str(MODULE_PATH.parent / "mavis")})
+                    self.assertEqual(rejected.returncode, 2)
+                    self.assertEqual(json.loads(receipt_path.read_text())["state"], "prepared")
+                    accepted_prompt.write_text(original_prompt)
                 run = subprocess.run([sys.executable, str(MODULE_PATH.parent / "launch_core.py"),
                                       "--receipt", str(receipt_path), "--", str(stub_core)],
                                      capture_output=True, text=True,

@@ -58,6 +58,16 @@
       ]
     },
     {
+      "id": "project-config-precedence",
+      "requirement": "Bind accepted model, provider, catalog, and instructions above trusted project config precedence, and verify the actual launch arguments and prompt file.",
+      "status": "pass",
+      "command": "python3 -m unittest discover -s local-codex/tests -p test_prepare_runtime.py -q",
+      "artifact": "local-codex/tests/test_prepare_runtime.py",
+      "evidence": [
+        "15 tests passed; actual launcher with -C workspace and conflicting workspace/.codex/config.toml spawned stub core with four host-owned -c bindings; resolved model and prompt hash matched accepted receipt; changed instructions file blocked spawn."
+      ]
+    },
+    {
       "id": "install-source",
       "requirement": "Ship selector and launch receipt writer through the installed launcher source without modifying the live install.",
       "status": "pass",
