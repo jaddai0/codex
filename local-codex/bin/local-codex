@@ -47,25 +47,41 @@ if [[ "$MAVIS_HOME" != /* ]]; then
   exit 2
 fi
 
+profile_model=$(python3 "$share_dir/prepare_runtime.py" \
+  --mavis-home "$MAVIS_HOME" --resolve-model "${model_args[@]}")
+
 PYTHONPATH="${share_dir}${PYTHONPATH:+:${PYTHONPATH}}" \
 python3 -m mavis runtime ensure \
   --endpoint "$base_url" \
   --iris-endpoint "${IRIS_OMLX_BASE_URL:-http://127.0.0.1:8000/v1}" \
-  --model "${LOCAL_CODEX_MODEL:-Qwen3.8-Flash-Next-Abliterated-MLX-4bit}" \
+  --model "$profile_model" \
   --model-dir "${MAVIS_MODEL_DIR:-${HOME}/models/vlms}" \
   --omlx-binary "${MAVIS_OMLX_BIN:-${HOME}/.venvs/omlx-dev/bin/omlx}" >/dev/null
 
-python3 "$share_dir/prepare_runtime.py" \
+launch_receipt=$(python3 "$share_dir/prepare_runtime.py" \
   --home "$runtime_home" \
+  --mavis-home "$MAVIS_HOME" \
+  --print-receipt \
   --base-url "$base_url" \
   --persona-template "$share_dir/persona.toml" \
   --instructions-template "$share_dir/base-instructions.md" \
   --gateway-root "${MAVIS_GATEWAY_ROOT:-${HOME}/Dev-Projects/ai-skills-dev-mavis-gateway/marketplace/plugins/model-gateway}" \
   "${gateway_env_args[@]}" \
-  "${model_args[@]}" >/dev/null
+  --model "$profile_model")
 
 export CODEX_HOME="$runtime_home"
 export MAVIS_PRECOMPACT_REQUIRED=1
 export MAVIS_RAW_OUTPUT_REQUIRED=1
 export PYTHONPATH="${share_dir}${PYTHONPATH:+:${PYTHONPATH}}"
+if [[ -n "$launch_receipt" ]]; then
+  for argument in "$@"; do
+    case "$argument" in
+      --model|-m|--model=*|model=*)
+        print -u2 "mavis: model override conflicts with accepted main profile"
+        exit 2
+        ;;
+    esac
+  done
+  exec python3 "$share_dir/launch_core.py" --receipt "$launch_receipt" -- "$core_binary" "$@"
+fi
 exec "$core_binary" "$@"

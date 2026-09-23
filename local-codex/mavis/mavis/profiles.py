@@ -77,6 +77,17 @@ class ProfileStore:
                           "retrieval": (profile.get("context_policy") or {}).get("retrieval", {})}
         if candidate != profile_config:
             raise ValueError("profile configuration differs from promoted candidate")
+        if role == "main":
+            identity = profile.get("model_identity") or {}
+            if not isinstance(identity.get("model_id"), str) or not identity["model_id"]:
+                raise ValueError("main profile requires exact model_identity.model_id")
+            if (profile.get("runtime") or {}).get("name") != "omlx":
+                raise ValueError("main profile requires oMLX runtime")
+            prompts = profile.get("prompts")
+            if not isinstance(prompts, dict) or set(prompts) - {"system"} or not isinstance(prompts.get("system", ""), str):
+                raise ValueError("main profile has unsupported prompt settings")
+            if profile.get("tool_settings") != {} or profile.get("context_policy") != {"retrieval": {}}:
+                raise ValueError("main profile has settings the Codex launcher cannot apply")
         previous = self.active_version(role)
         if previous is not None:
             previous_path = role_root / f"v{previous}.json"
@@ -84,6 +95,7 @@ class ProfileStore:
             previous_profile["status"] = "previous"
             write_json(previous_path, previous_profile)
         profile["status"] = "active"
+        profile["previous_version"] = previous
         profile["accepted_experiment"] = {
             "path": str(experiment_path),
             "sha256": sha256_file(experiment_path),

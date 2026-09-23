@@ -11,6 +11,8 @@ from pathlib import Path
 import sys
 import tempfile
 import tomllib
+from datetime import datetime, timezone
+from uuid import uuid4
 from urllib.parse import urlparse
 from urllib.request import Request, urlopen
 
@@ -75,6 +77,51 @@ def atomic_write(path: Path, content: str) -> None:
         except FileNotFoundError:
             pass
         raise
+
+
+def accepted_main_profile(mavis_home: Path) -> dict[str, object] | None:
+    role_root = mavis_home / "profiles" / "main"
+    pointer_path = role_root / "active.json"
+    if not pointer_path.exists():
+        return None
+    pointer = json.loads(pointer_path.read_text(encoding="utf-8"))
+    version = pointer.get("version")
+    if type(version) is not int or version < 1:
+        raise ValueError("invalid active main profile version")
+    profile_path = (role_root / f"v{version}.json").resolve()
+    if pointer.get("path") != str(profile_path):
+        raise ValueError("active main profile pointer does not match versioned file")
+    profile = json.loads(profile_path.read_text(encoding="utf-8"))
+    if (profile.get("schema_version"), profile.get("role"), profile.get("version"), profile.get("status")) != (
+        "mavis.model-profile/v1", "main", version, "active"
+    ):
+        raise ValueError("active main profile has an invalid state")
+    for name in ("accepted_experiment", "verifier_receipt"):
+        retained = profile.get(name)
+        if not isinstance(retained, dict) or not retained.get("path") or not retained.get("sha256"):
+            raise ValueError(f"active main profile lacks {name} evidence")
+        evidence_path = Path(retained["path"]).resolve()
+        if mavis_home.resolve() not in evidence_path.parents:
+            raise ValueError(f"active main profile {name} is outside Mavis home")
+        if hashlib.sha256(evidence_path.read_bytes()).hexdigest() != retained["sha256"]:
+            raise ValueError(f"active main profile {name} evidence changed")
+    identity = profile.get("model_identity")
+    if not isinstance(identity, dict) or not isinstance(identity.get("model_id"), str) or not identity["model_id"]:
+        raise ValueError("active main profile requires exact model_identity.model_id")
+    for key in ("architecture", "weights_fingerprint", "tokenizer_fingerprint", "chat_template_fingerprint", "quantization"):
+        if not isinstance(identity.get(key), str) or not identity[key]:
+            raise ValueError(f"active main profile lacks model_identity.{key}")
+    runtime = profile.get("runtime")
+    if not isinstance(runtime, dict) or runtime.get("name") != "omlx":
+        raise ValueError("active main profile requires oMLX runtime")
+    prompts = profile.get("prompts")
+    if not isinstance(prompts, dict) or set(prompts) - {"system"} or not isinstance(prompts.get("system", ""), str):
+        raise ValueError("active main profile has unsupported prompt settings")
+    if profile.get("tool_settings") != {} or profile.get("context_policy") != {"retrieval": {}}:
+        raise ValueError("active main profile has settings the Codex launcher cannot apply")
+    profile["_source_path"] = str(profile_path)
+    profile["_source_sha256"] = hashlib.sha256(profile_path.read_bytes()).hexdigest()
+    return profile
 
 
 def reasoning_levels(record: dict[str, object]) -> list[dict[str, str]]:
@@ -336,14 +383,27 @@ supports_standalone_web_search = false
 
 def main() -> int:
     parser = argparse.ArgumentParser()
-    parser.add_argument("--home", type=Path, required=True)
-    parser.add_argument("--base-url", required=True)
+    parser.add_argument("--home", type=Path)
+    parser.add_argument("--mavis-home", type=Path)
+    parser.add_argument("--resolve-model", action="store_true")
+    parser.add_argument("--print-receipt", action="store_true")
+    parser.add_argument("--base-url")
     parser.add_argument("--model")
-    parser.add_argument("--persona-template", type=Path, required=True)
-    parser.add_argument("--instructions-template", type=Path, required=True)
+    parser.add_argument("--persona-template", type=Path)
+    parser.add_argument("--instructions-template", type=Path)
     parser.add_argument("--gateway-root", type=Path)
     parser.add_argument("--gateway-env-file", type=Path)
     args = parser.parse_args()
+
+    accepted = accepted_main_profile(args.mavis_home) if args.mavis_home else None
+    accepted_model = accepted["model_identity"]["model_id"] if accepted else None
+    if args.model and accepted_model and args.model != accepted_model:
+        raise ValueError("explicit model conflicts with accepted main profile")
+    if args.resolve_model:
+        print(accepted_model or args.model or "Qwen3.8-Flash-Next-Abliterated-MLX-4bit")
+        return 0
+    if not all((args.home, args.base_url, args.persona_template, args.instructions_template)):
+        parser.error("--home, --base-url, --persona-template, and --instructions-template are required")
 
     base_url = local_base_url(args.base_url)
     origin = base_url.removesuffix("/v1")
@@ -356,12 +416,38 @@ def main() -> int:
     base_instructions = args.instructions_template.read_text(encoding="utf-8")
     if not base_instructions.strip():
         raise RuntimeError("Codex base instruction template is empty")
-    catalog, selected = prepare_catalog(records, args.model, base_instructions)
+    if accepted:
+        custom_system = accepted["prompts"].get("system", "")
+        if custom_system:
+            base_instructions = base_instructions.rstrip() + "\n\n" + custom_system + "\n"
+    catalog, selected = prepare_catalog(records, accepted_model or args.model, base_instructions)
     args.home.mkdir(parents=True, exist_ok=True)
     atomic_write(args.home / "omlx-models.json", json.dumps(catalog, indent=2) + "\n")
     write_profile(args.home, base_url, selected, args.gateway_root, args.gateway_env_file)
     ensure_persona(args.home, args.persona_template)
-    print(selected)
+    if accepted:
+        config_path = args.home / "config.toml"
+        catalog_path = args.home / "omlx-models.json"
+        receipt = {
+            "schema_version": "mavis.profile-launch/v1",
+            "state": "prepared",
+            "created_at": datetime.now(timezone.utc).isoformat(),
+            "profile_id": accepted["profile_id"],
+            "profile_version": accepted["version"],
+            "previous_version": accepted.get("previous_version"),
+            "profile_path": accepted["_source_path"],
+            "profile_sha256": accepted["_source_sha256"],
+            "model_identity": accepted["model_identity"],
+            "selected_model": selected,
+            "effective_system_prompt_sha256": hashlib.sha256(base_instructions.encode()).hexdigest(),
+            "config_path": str(config_path.resolve()),
+            "config_sha256": hashlib.sha256(config_path.read_bytes()).hexdigest(),
+            "catalog_path": str(catalog_path.resolve()),
+            "catalog_sha256": hashlib.sha256(catalog_path.read_bytes()).hexdigest(),
+        }
+        receipt_path = args.mavis_home / "launches" / f"{uuid4()}.json"
+        atomic_write(receipt_path, json.dumps(receipt, indent=2, sort_keys=True) + "\n")
+    print(receipt_path if accepted and args.print_receipt else selected if not args.print_receipt else "")
     return 0
 
 

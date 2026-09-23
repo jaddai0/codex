@@ -13,6 +13,7 @@ def profile(profile_id, experiments=None, prompt=""):
     return {
         "profile_id": profile_id,
         "model_identity": {
+            "model_id": "qwen-local",
             "architecture": "qwen",
             "weights_fingerprint": "weights",
             "tokenizer_fingerprint": "tokenizer",
@@ -98,6 +99,7 @@ class ProfileStoreTests(unittest.TestCase):
             self.experiments.rollback("exp-b", reason="critical regression")
             restored = store.restore("main", 1)
             self.assertEqual(restored["profile_id"], "a")
+            self.assertEqual(restored["previous_version"], 2)
             self.assertEqual(first.read_text(), (root / "profiles/main/v1.json").read_text())
             self.assertEqual(store.active_version("main"), 1)
 
@@ -144,6 +146,21 @@ class ProfileStoreTests(unittest.TestCase):
                 payload["candidate_inheritance"],
                 {"profile_id": "parent", "passed_status_inherited": False, "adapters_inherited": False},
             )
+
+    def test_main_profile_rejects_unapplied_candidate_settings(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            self.experiments = ExperimentStore(root, gateway_status_reader=self._gateway_status)
+            self.experiments.seed_active("main", {"prompts": {"system": "initial"},
+                                                  "tool_settings": {}, "retrieval": {}})
+            experiment, verifier = self._promotion_evidence(root, "exp-a", "A")
+            store = ProfileStore(root, gateway_status_reader=self._gateway_status)
+            payload = profile("a", ["exp-a"], "A")
+            payload["context_policy"]["compaction"] = "unsupported"
+            store.create_candidate("main", payload)
+            with self.assertRaisesRegex(ValueError, "cannot apply"):
+                store.activate("main", 1, experiment, verifier)
+            self.assertIsNone(store.active_version("main"))
 
 
 if __name__ == "__main__":
