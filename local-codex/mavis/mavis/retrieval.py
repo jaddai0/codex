@@ -69,6 +69,8 @@ class ProjectIndex:
         self.project_state = self.project_root / ".mavis"
         self.shared_home = Path(shared_home).resolve()
         self.database = self.project_state / "index.sqlite3"
+        # Optional vector failures are observable without making exact search fail.
+        self.last_embedding_error: dict[str, str] | None = None
 
     def _connect(self) -> sqlite3.Connection:
         self.project_state.mkdir(parents=True, exist_ok=True)
@@ -388,6 +390,7 @@ class ProjectIndex:
         self, query: str, limit: int = 20, offset: int = 0,
         *, embedding_provider: Any = None,
     ) -> list[dict[str, Any]]:
+        self.last_embedding_error = None
         if not query.strip():
             raise ValueError("query must not be empty")
         self._page(limit, offset)
@@ -418,8 +421,15 @@ class ProjectIndex:
             from .embedding_index import EmbeddingIndex
 
             exact_paths = {item["path"] for item in project_hits}
-            embedding_hits = [item for item in EmbeddingIndex(self).search(query, embedding_provider)
-                              if item["path"] not in exact_paths]
+            try:
+                embedding_hits = [
+                    item for item in EmbeddingIndex(self).search(query, embedding_provider)
+                    if item["path"] not in exact_paths
+                ]
+            except Exception as exc:
+                self.last_embedding_error = {
+                    "type": type(exc).__name__, "message": str(exc)
+                }
         combined = project_hits + memories + embedding_hits + distinct_global
         return combined[offset:offset + limit]
 

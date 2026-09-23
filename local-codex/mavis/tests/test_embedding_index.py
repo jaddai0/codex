@@ -69,8 +69,8 @@ class EmbeddingIndexTests(unittest.TestCase):
             ):
                 with self.assertRaisesRegex(ValueError, "rebuild"):
                     index.refresh_embeddings(FakeProvider(identity))
-                with self.assertRaisesRegex(ValueError, "rebuild"):
-                    index.search("concept", embedding_provider=FakeProvider(identity))
+                self.assertEqual(index.search("concept", embedding_provider=FakeProvider(identity)), [])
+                self.assertIn("rebuild", index.last_embedding_error["message"])
             replacement = FakeProvider(EmbeddingIdentity("new", "revision-3", "v2", 2))
             self.assertEqual(
                 index.refresh_embeddings(replacement, rebuild=True)["changed"], 2
@@ -190,7 +190,7 @@ class EmbeddingIndexTests(unittest.TestCase):
             for hit in hits[:2]:
                 self.assertEqual(
                     (root / hit["path"]).read_text().splitlines()[hit["line"] - 1],
-                    hit["text"],
+                    hit["text"].strip(),
                 )
             self.assertEqual(
                 index.search("apple source", embedding_provider=provider)[0]["source"],
@@ -205,7 +205,7 @@ class EmbeddingIndexTests(unittest.TestCase):
             index.refresh_embeddings(provider)
             connection = sqlite3.connect(index.database)
             before = connection.execute(
-                "SELECT path,sha256,vector FROM embedding_documents ORDER BY path"
+                "SELECT path,passage_index,sha256,vector FROM embedding_passages ORDER BY path,passage_index"
             ).fetchall()
             connection.close()
             (root / "banana.md").write_text("banana revised\n")
@@ -216,7 +216,7 @@ class EmbeddingIndexTests(unittest.TestCase):
             self.assertEqual(
                 before,
                 connection.execute(
-                    "SELECT path,sha256,vector FROM embedding_documents ORDER BY path"
+                    "SELECT path,passage_index,sha256,vector FROM embedding_passages ORDER BY path,passage_index"
                 ).fetchall(),
             )
             connection.close()
@@ -227,7 +227,7 @@ class EmbeddingIndexTests(unittest.TestCase):
             self.assertEqual(
                 before,
                 connection.execute(
-                    "SELECT path,sha256,vector FROM embedding_documents ORDER BY path"
+                    "SELECT path,passage_index,sha256,vector FROM embedding_passages ORDER BY path,passage_index"
                 ).fetchall(),
             )
             connection.close()
@@ -243,7 +243,7 @@ class EmbeddingIndexTests(unittest.TestCase):
             connection = sqlite3.connect(index.database)
             self.assertEqual(
                 connection.execute(
-                    "SELECT count(*) FROM embedding_documents"
+                    "SELECT count(*) FROM embedding_passages"
                 ).fetchone()[0],
                 0,
             )
@@ -252,12 +252,86 @@ class EmbeddingIndexTests(unittest.TestCase):
             index.refresh_embeddings(provider)
             connection = sqlite3.connect(index.database)
             connection.execute(
-                "UPDATE embedding_documents SET vector='[0, 0]' WHERE path='apple.md'"
+                "UPDATE embedding_passages SET vector='[0, 0]' WHERE path='apple.md'"
             )
             connection.commit()
             connection.close()
-            with self.assertRaisesRegex(ValueError, "magnitude"):
-                index.search("concept", embedding_provider=provider)
+            self.assertEqual(index.search("concept", embedding_provider=provider), [])
+            self.assertIn("magnitude", index.last_embedding_error["message"])
+
+    def test_query_provider_failure_preserves_exact_result_and_reports_error(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            index = self.make_index(root)
+            provider = FakeProvider()
+            index.refresh_embeddings(provider)
+            (root / "apple.md").write_text("heading\nneedle exact fact\n")
+            expected = index.search("needle exact fact")
+            provider.embed_query = lambda query: (_ for _ in ()).throw(
+                RuntimeError("query provider offline")
+            )
+            self.assertEqual(index.search("needle exact fact", embedding_provider=provider), expected)
+            self.assertEqual(index.last_embedding_error, {
+                "type": "RuntimeError", "message": "query provider offline"
+            })
+            self.assertEqual(index.search("needle exact fact"), expected)
+            self.assertIsNone(index.last_embedding_error)
+
+    def test_passage_hit_has_current_bounded_source_span(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            index = self.make_index(root)
+            (root / "apple.md").write_text(
+                "\n".join(["generic heading"] * 49 + ["apple needle lives here"] +
+                          ["tail"] * 80) + "\n"
+            )
+            provider = FakeProvider()
+            index.refresh_embeddings(provider)
+            hits = [hit for hit in index.search("concept", embedding_provider=provider)
+                    if hit["path"] == "apple.md"]
+            self.assertGreaterEqual(len(hits), 2)
+            self.assertTrue(all(len(hit["text"]) <= 8192 for hit in hits))
+            self.assertTrue(all(hit["evidence_kind"] == "passage-candidate" for hit in hits))
+            self.assertTrue(any("apple needle lives here" in hit["text"] and
+                                hit["line"] <= 50 <= hit["end_line"] for hit in hits))
+            self.assertTrue(all(
+                hit["text"] in "".join(
+                    (root / hit["path"]).read_text().splitlines(keepends=True)
+                    [hit["line"] - 1:hit["end_line"]]
+                ) for hit in hits
+            ))
+            embedded_count = len(provider.documents)
+            subprocess.run(["git", "mv", "apple.md", "renamed.md"], cwd=root, check=True)
+            refreshed = index.refresh_embeddings(provider)
+            self.assertEqual(refreshed["renamed"], [{"from": "apple.md", "to": "renamed.md"}])
+            self.assertEqual(len(provider.documents), embedded_count)
+            self.assertTrue(any(hit["path"] == "renamed.md" for hit in
+                                index.search("concept", embedding_provider=provider)))
+            (root / "renamed.md").write_text("new source\n")
+            self.assertNotIn("apple.md", [hit["path"] for hit in
+                             index.search("concept", embedding_provider=provider)])
+            self.assertNotIn("renamed.md", [hit["path"] for hit in
+                             index.search("concept", embedding_provider=provider)])
+            self.assertEqual(index.refresh_embeddings(provider)["changed"], 1)
+            connection = sqlite3.connect(index.database)
+            self.assertEqual(connection.execute(
+                "SELECT count(*) FROM embedding_passages WHERE path='renamed.md'"
+            ).fetchone()[0], 1)
+            connection.close()
+
+    def test_long_source_line_is_split_into_bounded_current_passages(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            index = self.make_index(root)
+            (root / "apple.md").write_text("apple " + "x" * 20000 + " needle\n")
+            provider = FakeProvider()
+            index.refresh_embeddings(provider)
+            hits = [hit for hit in index.search("concept", embedding_provider=provider)
+                    if hit["path"] == "apple.md"]
+            self.assertGreaterEqual(len(hits), 3)
+            self.assertTrue(all(hit["line"] == hit["end_line"] == 1 for hit in hits))
+            self.assertTrue(all(len(hit["text"]) <= 8192 for hit in hits))
+            self.assertTrue(any("needle" in hit["text"] for hit in hits))
 
 
 if __name__ == "__main__":
