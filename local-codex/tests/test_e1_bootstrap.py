@@ -1,6 +1,7 @@
 # ruff: noqa: E402
 """First-profile E1 trials require current installed E0 and independent review."""
 
+import copy
 import json
 from pathlib import Path
 import shutil
@@ -19,7 +20,7 @@ from mavis import e1_bootstrap
 from mavis.evaluations import E0_CASES
 from mavis.package_provenance import package_tree_sha256
 from mavis.storage import read_json, sha256_file, write_json
-from test_e1 import E1RunnerTests
+from test_e1 import E1RunnerTests, bootstrap_inspection, terra_verifier_evidence
 import trial_runtime
 
 
@@ -138,7 +139,8 @@ class E1BootstrapTests(unittest.TestCase):
             self.home, "review-job", starter=start_review
         )
         write_json(self.review, {
-            "schema_version": "mavis.e1-bootstrap-review/v1", "verdict": "accepted",
+            "schema_version": "mavis.e1-bootstrap-review/v2", "verdict": "accepted",
+            "inspection": bootstrap_inspection(self.home, self.assignment),
             "e0_summary_sha256": sha256_file(self.summary),
             "baseline_sha256": baseline["sha256"],
             "package_manifest_sha256": sha256_file(self.package),
@@ -148,6 +150,10 @@ class E1BootstrapTests(unittest.TestCase):
             "gateway_worker_job_id": "review-job", "verifier_job_id": "review-job-terra",
         })
         shutil.copyfile(self.review, self.gateway_report)
+        self.terra_evidence = terra_verifier_evidence(
+            self.gateway_job_dir, self.gateway_report, self.gateway_assignment,
+            sha256_file(self.assignment_path), self.assignment["required_checks"],
+        )
 
     def _status(self, job_id):
         return {
@@ -156,7 +162,8 @@ class E1BootstrapTests(unittest.TestCase):
             "acceptance": {"accepted": True, "job_id": job_id, "verifier": "terra",
                            "verifier_job_id": "review-job-terra", "target_sha256": sha256_file(self.assignment_path),
                            "evidence_sha256": "b" * 64, "report_sha256_on_disk": sha256_file(self.review),
-                           "verifier_verdict_sha256": "d" * 64},
+                           "verifier_verdict_sha256": self.terra_evidence["report_sha256"]},
+            "verifier_evidence": self.terra_evidence,
             "mavis_binding": {
                 "schema_version": "model-gateway-mavis-objective-binding/v1",
                 "objective_id": "e1-bootstrap-main",
@@ -257,6 +264,87 @@ class E1BootstrapTests(unittest.TestCase):
         write_json(self.review, review)
         with self.assertRaisesRegex(ValueError, "differs from gateway report bytes"):
             self._create()
+
+    def test_review_requires_specific_inspected_evidence(self):
+        original = read_json(self.review)
+
+        def change(field):
+            review = copy.deepcopy(original)
+            inspection = review["inspection"]
+            if field == "missing":
+                del review["inspection"]
+            elif field == "source":
+                inspection["source"]["checked_sha256"] = "f" * 64
+            elif field == "source-excerpt":
+                inspection["source"]["source_excerpt"] = "A fabricated source passage that does not exist."
+            elif field == "case-count":
+                inspection["e0_cases"].pop()
+            elif field == "case-evidence":
+                inspection["e0_cases"][0]["cited_evidence"] = "fabricated"
+            elif field == "generic-false-claim":
+                inspection["e0_cases"][0]["observation"] = "This case failed despite its pass receipt."
+            elif field == "model":
+                inspection["model"]["cited_sha256"] = "f" * 64
+            elif field == "model-config":
+                inspection["model"]["observed_architecture"] = "WrongArchitecture"
+            elif field == "conclusion":
+                inspection["conclusion"] = {"matched": False, "issues": ["model mismatch"]}
+            elif field == "old-schema":
+                review["schema_version"] = "mavis.e1-bootstrap-review/v1"
+            return review
+
+        failures = {
+            "missing": "lacks an evidence inspection",
+            "source": "source inspection differs",
+            "source-excerpt": "source inspection differs",
+            "case-count": "did not inspect every E0 case",
+            "case-evidence": "E0 inspection differs",
+            "generic-false-claim": "E0 inspection differs",
+            "model": "model inspection differs",
+            "model-config": "model inspection differs",
+            "conclusion": "cannot accept unresolved inspection issues",
+            "old-schema": "independent review does not match frozen evidence",
+        }
+        for field, message in failures.items():
+            with self.subTest(field=field):
+                write_json(self.review, change(field))
+                shutil.copyfile(self.review, self.gateway_report)
+                with self.assertRaisesRegex(ValueError, message):
+                    self._create()
+                self.assertFalse((self.home / "e1/bootstrap/main.json").exists())
+
+    def test_terra_report_must_bind_substantive_findings(self):
+        original = self._status("review-job")
+        cases = {
+            "missing": "lacks bound Terra verifier evidence",
+            "wrong-report-hash": "Terra report bytes differ",
+            "empty-findings": "Terra findings omit required evidence",
+            "failed-finding": "Terra finding is incomplete",
+        }
+        for case, message in cases.items():
+            with self.subTest(case=case):
+                status = copy.deepcopy(original)
+                if case == "missing":
+                    del status["verifier_evidence"]
+                elif case == "wrong-report-hash":
+                    status["verifier_evidence"]["report_sha256"] = "f" * 64
+                else:
+                    findings = status["verifier_evidence"]["findings"]
+                    if case == "empty-findings":
+                        findings.clear()
+                    else:
+                        findings[0]["assessment"] = "fail"
+                    write_json(self.terra_evidence["report_path"], {
+                        "target_sha256": status["verifier_evidence"]["target_sha256"],
+                        "verdict": "accepted", "findings": findings,
+                    })
+                    digest = sha256_file(self.terra_evidence["report_path"])
+                    status["verifier_evidence"]["report_sha256"] = digest
+                    status["acceptance"]["verifier_verdict_sha256"] = digest
+                with patch.object(e1_bootstrap, "harness_job_status", return_value=status):
+                    with self.assertRaisesRegex(ValueError, message):
+                        self._create()
+                self.assertFalse((self.home / "e1/bootstrap/main.json").exists())
 
     def test_same_model_id_with_changed_weight_bytes_rejected(self):
         self._create()

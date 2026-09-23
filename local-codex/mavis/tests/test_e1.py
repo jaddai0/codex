@@ -21,6 +21,75 @@ from mavis.package_provenance import package_tree_sha256
 from mavis.storage import read_json, sha256_file, write_json
 
 
+def bootstrap_inspection(home: Path, assignment: dict) -> dict:
+    package = read_json(Path(assignment["package_manifest"]["path"]))
+    model_files = assignment["model_artifacts"]["files"]
+    shard = next(name for name in model_files if name.endswith(".safetensors"))
+    config = read_json(Path(assignment["model_artifacts"]["model_path"]) / "config.json")
+    checked_file = "local-codex/mavis/mavis/e1_bootstrap.py"
+    checked_source = home / "e1/bootstrap/review-checkout" / checked_file
+    summary = read_json(Path(assignment["e0_summary"]["path"]))
+    return {
+        "source": {
+            "revision": assignment["starting_revision"],
+            "package_tree_sha256": package["mavis_package_sha256"],
+            "checked_file": checked_file,
+            "checked_sha256": sha256_file(checked_source),
+            "source_excerpt": checked_source.read_text(encoding="utf-8")[:80],
+        },
+        "e0_cases": [
+            {
+                "case": case,
+                "receipt_path": str((home / "evaluations/e0" / f"{case}.json").resolve()),
+                "receipt_sha256": summary["case_receipts"][case],
+                "observed_status": "pass",
+                "cited_evidence": read_json(home / "evaluations/e0" / f"{case}.json")["evidence"][0],
+            }
+            for case in E0_CASES
+        ],
+        "model": {
+            "model_id": assignment["model_identity"]["model_id"],
+            "weights_fingerprint": assignment["model_identity"]["weights_fingerprint"],
+            "cited_file": shard,
+            "cited_sha256": model_files[shard],
+            "observed_architecture": config["architectures"][0],
+            "observed_quantization": config.get("quantization") or config.get("quantization_config"),
+        },
+        "conclusion": {"matched": True, "issues": []},
+    }
+
+
+def terra_verifier_evidence(worker_dir: Path, worker_report: Path,
+                            worker_assignment: Path, target: str,
+                            required_checks: list[str]) -> dict:
+    receipt = worker_dir / "receipt.json"
+    write_json(receipt, {"job_id": "review-job", "exit_code": 0})
+    checks = worker_dir / "checks.json"
+    write_json(checks, {"checks": required_checks, "status": "pass"})
+    digests = {
+        "assignment": sha256_file(worker_assignment),
+        "report": sha256_file(worker_report),
+        "receipt": sha256_file(receipt),
+    }
+    digests.update({f"check:{name}": sha256_file(checks) for name in required_checks})
+    findings = [
+        {"evidence_ref": ref, "sha256": digest, "assessment": "pass",
+         "observation": f"The {ref} evidence record was checked against the frozen bootstrap packet and matched exactly."}
+        for ref, digest in digests.items()
+    ]
+    terra_report = worker_dir.parent / "bootstrap-terra-job" / "report.md"
+    write_json(terra_report, {"target_sha256": target, "verdict": "accepted",
+                              "findings": findings})
+    return {
+        "schema_version": "model-gateway-terra-verifier-evidence/v1",
+        "verifier_job_id": "review-job-terra", "verdict": "accepted",
+        "target_sha256": target,
+        "worker_report_sha256": sha256_file(worker_report),
+        "report_path": str(terra_report), "report_sha256": sha256_file(terra_report),
+        "findings": findings,
+    }
+
+
 class E1RunnerTests(unittest.TestCase):
     def setUp(self):
         self.temp = tempfile.TemporaryDirectory()
@@ -149,11 +218,17 @@ class E1RunnerTests(unittest.TestCase):
         package_dir = share / "mavis"
         package_dir.mkdir(exist_ok=True)
         (package_dir / "__init__.py").write_text("# fixture package\n")
+        (package_dir / "e1_bootstrap.py").write_text(
+            "def _review():\n    return 'fixture source review'\n"
+        )
         committed_package = self.repo / "local-codex/mavis/mavis/__init__.py"
         if not committed_package.exists():
             committed_package.parent.mkdir(parents=True)
             committed_package.write_bytes((package_dir / "__init__.py").read_bytes())
-            subprocess.run(["git", "-C", str(self.repo), "add", "local-codex/mavis/mavis/__init__.py"], check=True)
+            (committed_package.parent / "e1_bootstrap.py").write_bytes(
+                (package_dir / "e1_bootstrap.py").read_bytes()
+            )
+            subprocess.run(["git", "-C", str(self.repo), "add", "local-codex/mavis/mavis"], check=True)
             subprocess.run(["git", "-C", str(self.repo), "commit", "-qm", "fixture package"], check=True)
         source_revision = subprocess.check_output(["git", "-C", str(self.repo), "rev-parse", "HEAD"], text=True).strip()
         launcher = self.root / "installed-mavis-command"
@@ -531,8 +606,9 @@ class E1RunnerTests(unittest.TestCase):
                     "target_sha256": target,
                     "evidence_sha256": "b" * 64,
                     "report_sha256_on_disk": sha256_file(gateway_report),
-                    "verifier_verdict_sha256": "d" * 64,
+                    "verifier_verdict_sha256": terra_evidence["report_sha256"],
                 },
+                "verifier_evidence": terra_evidence,
                 "mavis_binding": {
                     "schema_version": "model-gateway-mavis-objective-binding/v1",
                     "objective_id": "e1-bootstrap-main",
@@ -576,8 +652,9 @@ class E1RunnerTests(unittest.TestCase):
         write_json(
             gateway_report,
             {
-                "schema_version": "mavis.e1-bootstrap-review/v1",
+                "schema_version": "mavis.e1-bootstrap-review/v2",
                 "verdict": "accepted",
+                "inspection": bootstrap_inspection(self.home, assignment),
                 "e0_summary_sha256": sha256_file(summary),
                 "baseline_sha256": baseline["sha256"],
                 "package_manifest_sha256": sha256_file(package),
@@ -589,6 +666,10 @@ class E1RunnerTests(unittest.TestCase):
                 "gateway_worker_job_id": "review-job",
                 "verifier_job_id": "review-job-terra",
             },
+        )
+        terra_evidence = terra_verifier_evidence(
+            gateway_dir, gateway_report, gateway_assignment, "c" * 64,
+            assignment["required_checks"],
         )
         e1_bootstrap.check_bootstrap_review(self.home, gateway_report)
         e1_bootstrap.import_bootstrap_review_report(self.home, status_reader=status)

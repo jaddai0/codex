@@ -161,6 +161,114 @@ def _requirements(assignment: dict[str, Any]) -> list[str]:
     ]
 
 
+def _check_review_inspection(home: Path, assignment: dict[str, Any], review: dict[str, Any]) -> None:
+    """Match extracted review facts against files outside the frozen packet."""
+    inspection = review.get("inspection")
+    if not isinstance(inspection, dict) or set(inspection) != {
+        "source", "e0_cases", "model", "conclusion"
+    }:
+        raise ValueError("E1 bootstrap review lacks an evidence inspection")
+
+    package = read_json(Path(assignment["package_manifest"]["path"]))
+    source = inspection["source"]
+    source_file = "local-codex/mavis/mavis/e1_bootstrap.py"
+    checked_source = home / "e1/bootstrap/review-checkout" / source_file
+    if (not isinstance(source, dict)
+            or set(source) != {"revision", "package_tree_sha256", "checked_file",
+                               "checked_sha256", "source_excerpt"}
+            or source["revision"] != assignment["starting_revision"]
+            or source["package_tree_sha256"] != package["mavis_package_sha256"]
+            or source["checked_file"] != source_file
+            or source["checked_sha256"] != sha256_file(checked_source)
+            or not isinstance(source["source_excerpt"], str)
+            or len(source["source_excerpt"].strip()) < 20
+            or source["source_excerpt"] not in checked_source.read_text(encoding="utf-8")):
+        raise ValueError("E1 bootstrap review source inspection differs from installed source")
+
+    cases = inspection["e0_cases"]
+    summary = read_json(Path(assignment["e0_summary"]["path"]))
+    if not isinstance(cases, list) or len(cases) != len(E0_CASES):
+        raise ValueError("E1 bootstrap review did not inspect every E0 case")
+    for case, item in zip(E0_CASES, cases, strict=True):
+        receipt_path = (home / "evaluations/e0" / f"{case}.json").resolve()
+        if (not isinstance(item, dict)
+                or set(item) != {"case", "receipt_path", "receipt_sha256",
+                                     "observed_status", "cited_evidence"}
+                or item["case"] != case
+                or item["receipt_path"] != str(receipt_path)
+                or item["receipt_sha256"] != summary["case_receipts"][case]
+                or item["observed_status"] != read_json(receipt_path)["status"]
+                or item["observed_status"] != "pass"
+                or item["cited_evidence"] not in read_json(receipt_path)["evidence"]):
+            raise ValueError(f"E1 bootstrap review E0 inspection differs for {case}")
+
+    model = inspection["model"]
+    files = assignment["model_artifacts"]["files"]
+    config = read_json(Path(assignment["model_artifacts"]["model_path"]) / "config.json")
+    if (not isinstance(model, dict)
+            or set(model) != {"model_id", "weights_fingerprint", "cited_file",
+                                  "cited_sha256", "observed_architecture",
+                                  "observed_quantization"}
+            or model["model_id"] != assignment["model_identity"]["model_id"]
+            or model["weights_fingerprint"] != assignment["model_identity"]["weights_fingerprint"]
+            or not isinstance(model["cited_file"], str)
+            or not model["cited_file"].endswith(".safetensors")
+            or model["cited_sha256"] != files.get(model["cited_file"])
+            or model["observed_architecture"] != config["architectures"][0]
+            or model["observed_quantization"] !=
+            (config.get("quantization") or config.get("quantization_config"))):
+        raise ValueError("E1 bootstrap review model inspection differs from installed model")
+    if inspection["conclusion"] != {"matched": True, "issues": []}:
+        raise ValueError("E1 bootstrap review cannot accept unresolved inspection issues")
+
+
+def _check_terra_evidence(status: dict[str, Any], dispatch: dict[str, Any],
+                          review: dict[str, Any], report_path: Path,
+                          required_checks: list[str]) -> None:
+    evidence = status.get("verifier_evidence")
+    if (not isinstance(evidence, dict)
+            or set(evidence) != {"schema_version", "verifier_job_id", "verdict",
+                                 "target_sha256", "worker_report_sha256", "report_path",
+                                 "report_sha256", "findings"}
+            or evidence["schema_version"] != "model-gateway-terra-verifier-evidence/v1"
+            or evidence["verifier_job_id"] != review["verifier_job_id"]
+            or evidence["verdict"] != "accepted"
+            or evidence["target_sha256"] != status["acceptance"]["target_sha256"]
+            or evidence["worker_report_sha256"] != sha256_file(report_path)):
+        raise ValueError("E1 bootstrap lacks bound Terra verifier evidence")
+    path = Path(evidence["report_path"]) if isinstance(evidence["report_path"], str) else Path("")
+    worker_dir = Path(dispatch["job_dir"]).resolve(strict=True)
+    if (not path.is_absolute() or path.name != "report.md" or path.is_symlink()
+            or path.parent.is_symlink() or not path.is_file()
+            or path.parent.resolve() == worker_dir
+            or path.parent.parent.resolve() != worker_dir.parent
+            or evidence["report_sha256"] != sha256_file(path)
+            or evidence["report_sha256"] != status["acceptance"]["verifier_verdict_sha256"]):
+        raise ValueError("E1 bootstrap Terra report bytes differ from gateway acceptance")
+    verdict = read_json(path)
+    if (not isinstance(verdict, dict)
+            or set(verdict) != {"target_sha256", "verdict", "findings"}
+            or verdict != {key: evidence[key] for key in verdict}):
+        raise ValueError("E1 bootstrap Terra report differs from gateway status")
+    findings = evidence["findings"]
+    expected = {"assignment", "report", "receipt"} | {
+        f"check:{name}" for name in required_checks
+    }
+    if (not isinstance(findings, list) or len(findings) != len(expected)
+            or {item.get("evidence_ref") for item in findings if isinstance(item, dict)} != expected):
+        raise ValueError("E1 bootstrap Terra findings omit required evidence")
+    for item in findings:
+        if (not isinstance(item, dict)
+                or set(item) != {"evidence_ref", "sha256", "assessment", "observation"}
+                or item["assessment"] != "pass"
+                or not isinstance(item["sha256"], str)
+                or not re.fullmatch(r"[0-9a-f]{64}", item["sha256"])
+                or not isinstance(item["observation"], str)
+                or len(item["observation"].strip()) < 40
+                or len(item["observation"].split()) < 8):
+            raise ValueError("E1 bootstrap Terra finding is incomplete")
+
+
 def _git_revision(checkout: Path) -> str:
     result = subprocess.run(
         ["git", "-C", str(checkout), "rev-parse", "HEAD"],
@@ -326,8 +434,17 @@ def _gateway_arguments(
         "job_id": job_id,
         "task": (
             "Independently inspect the installed E0 case receipts, baseline, installed "
-            "package, and exact model artifact hashes in the context packet. Return a raw JSON "
-            "object with schema_version mavis.e1-bootstrap-review/v1, verdict, "
+            "package and its pinned source checkout, and exact model artifact hashes in the "
+            "context packet. Return a raw JSON object with schema_version "
+            "mavis.e1-bootstrap-review/v2, verdict, and inspection. Extract values from "
+            "the actual files, not just the frozen packet: source {revision, "
+            "package_tree_sha256, checked_file, checked_sha256, source_excerpt} using "
+            "local-codex/mavis/mavis/e1_bootstrap.py; e0_cases with one {case, receipt_path, "
+            "receipt_sha256, observed_status, cited_evidence} for every mandatory case in "
+            "order; model {model_id, weights_fingerprint, cited_file, cited_sha256, "
+            "observed_architecture, observed_quantization} citing a weight shard and the "
+            "actual config.json; and conclusion {matched: true, issues: []} only if all "
+            "inspected facts agree. Also include "
             "e0_summary_sha256, baseline_sha256, package_manifest_sha256, "
             "installed_candidate_digest, model_identity_digest, assignment_sha256, "
             f"gateway_worker_job_id ({job_id}), and verifier_job_id ({job_id}-terra). "
@@ -456,7 +573,7 @@ def check_bootstrap_review(home: Path, report_path: Path) -> dict[str, str]:
         raise ValueError("E1 bootstrap check must read the dispatched gateway report")
     review = read_json(report_path)
     if (
-        review.get("schema_version") != "mavis.e1-bootstrap-review/v1"
+        review.get("schema_version") != "mavis.e1-bootstrap-review/v2"
         or review.get("verdict") != "accepted"
         or review.get("e0_summary_sha256") != assignment["e0_summary"]["sha256"]
         or review.get("baseline_sha256") != assignment["baseline"]["sha256"]
@@ -470,6 +587,7 @@ def check_bootstrap_review(home: Path, report_path: Path) -> dict[str, str]:
         or review.get("verifier_job_id") != dispatch["verifier_job_id"]
     ):
         raise ValueError("E1 bootstrap review differs from frozen evidence")
+    _check_review_inspection(home, assignment, review)
     return {
         "schema_version": "mavis.e1-bootstrap-review-check/v1",
         "status": "pass",
@@ -540,7 +658,7 @@ def _review(home: Path, receipt: dict[str, Any], status_reader: Callable[[str], 
                         home / "verifications/e1-bootstrap/main.json", "independent review")
     _checked_ref(receipt.get("review_assignment"), assignment_path, "review assignment")
     review = read_json(path)
-    if (review.get("schema_version") != "mavis.e1-bootstrap-review/v1"
+    if (review.get("schema_version") != "mavis.e1-bootstrap-review/v2"
             or review.get("verdict") != "accepted"
             or review.get("e0_summary_sha256") != receipt["e0_summary"]["sha256"]
             or review.get("baseline_sha256") != receipt["baseline"]["sha256"]
@@ -550,6 +668,7 @@ def _review(home: Path, receipt: dict[str, Any], status_reader: Callable[[str], 
         raise ValueError("E1 bootstrap independent review does not match frozen evidence")
     if review.get("assignment_sha256") != sha256_file(assignment_path):
         raise ValueError("E1 bootstrap independent review changed assignment")
+    _check_review_inspection(home, assignment, review)
     job_id = review.get("gateway_worker_job_id")
     if not isinstance(job_id, str) or not job_id:
         raise ValueError("E1 bootstrap independent review has no gateway job")
@@ -582,6 +701,7 @@ def _review(home: Path, receipt: dict[str, Any], status_reader: Callable[[str], 
             or acceptance.get("target_sha256") != binding.get("target_sha256")
             or status.get("accepted") is not True):
         raise ValueError("E1 bootstrap review lacks exact independent gateway acceptance")
+    _check_terra_evidence(status, dispatch, review, path, assignment["required_checks"])
 
 
 def validate_bootstrap(
