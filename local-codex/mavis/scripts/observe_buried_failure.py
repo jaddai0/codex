@@ -12,11 +12,12 @@ from urllib.parse import quote
 
 from mavis.evaluations import installed_candidate_fingerprint
 from mavis.runtime import (RuntimeConfig, acquire_iris_model_drain,
-                           ensure_runtime, handoff_lease_fd, inventory, iris_drain_headers,
-                           load_model, loaded_generation_models, port_in_use,
+                           endpoint_alive, ensure_runtime, handoff_lease_fd, inventory,
+                           iris_drain_headers, load_model, loaded_generation_models,
+                           park_mavis_server,
                            request_json, require_idle_iris_handoff,
                            require_installed_selected_model, release_iris_model_drain,
-                           stop_server, wait_iris_model_drain,
+                           wait_iris_model_drain,
                            with_mavis_handoff_lease)
 from mavis.storage import write_json
 
@@ -53,7 +54,9 @@ def main() -> int:
     result: dict[str, object] = {"candidate": candidate, "repo": str(repo),
                                  "task_root": str(task)}
     lease_id: str | None = None
+    reservation = None
     try:
+        reservation = park_mavis_server(config)
         lease_id = acquire_iris_model_drain(config, owner="mavis-observe_buried_failure")
         result["drain_lease_id"] = lease_id
         wait_iris_model_drain(config, lease_id)
@@ -62,6 +65,9 @@ def main() -> int:
                      timeout=180, headers=iris_drain_headers(lease_id))
         if loaded(config.iris_endpoint):
             raise RuntimeError("IRIS model did not unload")
+        reservation.close()
+        reservation = None
+        ensure_runtime(config, load=False)
         load_model(config)
         prompt = (
             "Run python3 produce_log.py exactly once, without a pipe or redirect. "
@@ -99,40 +105,32 @@ def main() -> int:
         result["error"] = repr(exc)
     finally:
         try:
-            if loaded_generation_models(config.endpoint):
-                request_json(config.endpoint, model_path + "/unload", method="POST", timeout=180)
-            if loaded_generation_models(config.endpoint):
-                raise RuntimeError("Mavis model remained loaded after unload")
+            if reservation is None:
+                if loaded_generation_models(config.endpoint):
+                    request_json(config.endpoint, model_path + "/unload", method="POST", timeout=180)
+                if loaded_generation_models(config.endpoint):
+                    raise RuntimeError("Mavis model remained loaded after unload")
+                reservation = park_mavis_server(config)
         except BaseException as exc:
             result["mavis_unload_error"] = repr(exc)
-            try:
-                stop_server(config)
-                import time
-                for _ in range(100):
-                    if not port_in_use(config.endpoint):
-                        break
-                    time.sleep(0.2)
-                if port_in_use(config.endpoint):
-                    raise RuntimeError("Mavis listener remained after stop")
-                ensure_runtime(config, load=False)
-            except BaseException as recovery_exc:
-                result["mavis_stop_error"] = repr(recovery_exc)
         try:
-            if loaded_generation_models(config.endpoint):
-                raise RuntimeError("cannot restore IRIS while Mavis still holds the model")
+            if reservation is None or endpoint_alive(config.endpoint):
+                raise RuntimeError("cannot restore IRIS without an exclusive Mavis port reservation")
             if lease_id is None and not loaded(config.iris_endpoint):
                 raise RuntimeError("IRIS cannot be restored without a drain lease")
             if not loaded(config.iris_endpoint):
                 request_json(config.iris_endpoint, model_path + "/load", method="POST",
                              timeout=900, headers=iris_drain_headers(lease_id))
             result["iris_loaded"] = loaded(config.iris_endpoint)
-            result["mavis_loaded"] = bool(loaded_generation_models(config.endpoint))
+            result["mavis_loaded"] = False
             if lease_id is not None and result["iris_loaded"] and not result["mavis_loaded"]:
                 release_iris_model_drain(config, lease_id)
                 result["drain_released"] = True
             result["candidate_after"] = installed_candidate_fingerprint()
         except BaseException as exc:
             result["restore_error"] = repr(exc)
+        if reservation is not None:
+            reservation.close()
         write_json(task / "result.json", result)
     print(task / "result.json")
     return 0 if (result.get("mavis_exit") == 0 and result.get("rollout")
