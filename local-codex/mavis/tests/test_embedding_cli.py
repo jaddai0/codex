@@ -79,6 +79,8 @@ class EmbeddingCliTests(unittest.TestCase):
             self.assertTrue(any(hit["source"] == "embedding" for hit in result["hits"]))
         self.assertTrue(calls)
         self.assertTrue(all(call[1] == "/v1/embeddings" for call in calls))
+        self.assertTrue(all(call[2]["headers"] == {"X-OMLX-Require-Loaded": "true"}
+                            for call in calls))
         self.assertTrue(all(isinstance(call[2]["payload"]["input"], str) for call in calls))
         status, result = self.command("search", "needle exact fact")
         self.assertEqual(status, 0)

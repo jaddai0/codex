@@ -75,6 +75,7 @@ class LocalEmbeddingProvider:
             self.ready(lease_held=True)
             payload = self.request(
                 self.endpoint, "/v1/embeddings", method="POST", timeout=120,
+                headers={"X-OMLX-Require-Loaded": "true"},
                 payload={"model": self.identity.model, "input": text,
                          "encoding_format": "float"},
             )
