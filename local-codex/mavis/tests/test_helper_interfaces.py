@@ -58,6 +58,26 @@ class LibrarianEvidenceTests(unittest.TestCase):
                 [],
             )
 
+    def test_librarian_search_validates_offset(self):
+        with tempfile.TemporaryDirectory() as directory:
+            archive = TranscriptArchive(Path(directory), "conversation-1")
+            archive.append_segment(
+                [
+                    {"role": "user", "content": "decision alpha"},
+                    {"role": "user", "content": "decision beta"},
+                    {"role": "user", "content": "decision gamma"},
+                ]
+            )
+            librarian = LibrarianEvidence(archive)
+            page1 = librarian.search("decision", limit=2, offset=0)
+            self.assertEqual(len(page1), 2)
+            page2 = librarian.search("decision", limit=2, offset=2)
+            self.assertEqual(len(page2), 1)
+            with self.assertRaisesRegex(ValueError, "nonnegative"):
+                librarian.search("decision", offset=-1)
+            empty = librarian.search("decision", limit=10, offset=100)
+            self.assertEqual(empty, [])
+
 
 class OutputReaderTests(unittest.TestCase):
     def test_zero_failure_summary_remains_pass(self):

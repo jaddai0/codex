@@ -106,6 +106,7 @@ def build_parser() -> argparse.ArgumentParser:
     search.add_argument("conversation_id")
     search.add_argument("query")
     search.add_argument("--limit", type=int, default=20)
+    search.add_argument("--offset", type=int, default=0)
 
     subcommands.add_parser("pre-compact")
 
@@ -401,5 +402,5 @@ def main(argv: list[str] | None = None) -> int:
             print_json(queue.list(args.state))
         return 0
     archive = TranscriptArchive(home, args.conversation_id)
-    print_json(archive.search(args.query, args.limit))
+    print_json(archive.search(args.query, args.limit, args.offset))
     return 0

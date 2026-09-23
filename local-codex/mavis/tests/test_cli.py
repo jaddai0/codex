@@ -8,8 +8,54 @@ import tempfile
 import unittest
 from unittest.mock import patch
 
-from mavis.cli import main
+from mavis.cli import main, build_parser
 from mavis.objectives import ObjectiveStore
+from mavis.transcripts import TranscriptArchive
+
+
+class ArchiveSearchCliTests(unittest.TestCase):
+    def test_archive_search_cli_returns_requested_page(self):
+        with tempfile.TemporaryDirectory() as directory:
+            home = Path(directory)
+            archive = TranscriptArchive(home, "conv-1")
+            archive.append_segment([
+                {"role": "user", "content": "decision one"},
+                {"role": "user", "content": "decision two"},
+            ])
+            archive.append_segment([
+                {"role": "user", "content": "decision three"},
+                {"role": "user", "content": "decision four"},
+            ])
+            output = io.StringIO()
+            with patch.dict(os.environ, {"MAVIS_HOME": str(home)}), contextlib.redirect_stdout(output):
+                self.assertEqual(main(["archive-search", "conv-1", "decision",
+                                       "--limit", "2", "--offset", "2"]), 0)
+            hits = json.loads(output.getvalue())
+            self.assertEqual(len(hits), 2)
+            self.assertIn("decision three", hits[0]["text"])
+            self.assertIn("decision four", hits[1]["text"])
+            self.assertTrue(all(hit["sha256"] for hit in hits))
+
+    def test_archive_search_cli_accepts_offset_argument(self):
+        parser = build_parser()
+        args = parser.parse_args(
+            ["archive-search", "conv-1", "decision", "--offset", "10"]
+        )
+        self.assertEqual(args.offset, 10)
+        self.assertEqual(args.limit, 20)
+
+    def test_archive_search_cli_accepts_limit_and_offset_together(self):
+        parser = build_parser()
+        args = parser.parse_args(
+            ["archive-search", "conv-1", "decision", "--limit", "5", "--offset", "20"]
+        )
+        self.assertEqual(args.limit, 5)
+        self.assertEqual(args.offset, 20)
+
+    def test_archive_search_cli_defaults_offset_to_zero(self):
+        parser = build_parser()
+        args = parser.parse_args(["archive-search", "conv-1", "decision"])
+        self.assertEqual(args.offset, 0)
 
 
 class ObjectiveCliTests(unittest.TestCase):

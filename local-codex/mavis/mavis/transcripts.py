@@ -141,29 +141,40 @@ class TranscriptArchive:
         write_json(path, handoff)
         return path
 
-    def search(self, query: str, limit: int = 20) -> list[dict[str, Any]]:
+    def search(
+        self, query: str, limit: int = 20, offset: int = 0
+    ) -> list[dict[str, Any]]:
         if not query:
             raise ValueError("query cannot be empty")
+        if type(offset) is not int or offset < 0:
+            raise ValueError("offset must be nonnegative")
+        if type(limit) is not int or not 1 <= limit <= 200:
+            raise ValueError("limit must be 1..200")
         if not self.manifest_path.exists():
             return []
         results: list[dict[str, Any]] = []
+        matched = 0
         manifest = read_json(self.manifest_path)
         for segment in manifest["segments"]:
             path = Path(segment["path"])
             if not path.is_file() or sha256_file(path) != segment["sha256"]:
                 raise ValueError(f"transcript segment is missing or changed: {path}")
+            if len(results) >= limit:
+                continue
             for line_number, line in enumerate(
                 path.read_text(encoding="utf-8").splitlines(), 1
             ):
                 if query.casefold() in line.casefold():
-                    results.append(
-                        {
-                            "path": str(path),
-                            "line": line_number,
-                            "text": line,
-                            "sha256": segment["sha256"],
-                        }
-                    )
+                    if matched >= offset:
+                        results.append(
+                            {
+                                "path": str(path),
+                                "line": line_number,
+                                "text": line,
+                                "sha256": segment["sha256"],
+                            }
+                        )
+                    matched += 1
                     if len(results) >= limit:
-                        return results
+                        break
         return results
