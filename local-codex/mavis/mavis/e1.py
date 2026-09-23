@@ -312,21 +312,36 @@ def _trial_hashes(root: Path, home: Path, record: dict[str, Any], case: dict[str
         if (trial.get("bootstrap_receipt_path") != str(bootstrap_path.resolve())
                 or trial.get("bootstrap_receipt_sha256") != sha256_file(bootstrap_path)):
             raise ValueError("native E1 bootstrap receipt changed")
-        from .e1_bootstrap import validate_bootstrap
+        from . import e1_bootstrap
 
-        if bootstrap_cache is None:
-            bootstrap = validate_bootstrap(Path(home))
-        else:
-            if "validated" not in bootstrap_cache:
-                bootstrap_cache["validated"] = validate_bootstrap(Path(home))
-            bootstrap = bootstrap_cache["validated"]
         config = tomllib.loads(paths["config"].read_text(encoding="utf-8"))
         endpoint = config.get("model_providers", {}).get("omlx", {}).get("base_url")
         if not isinstance(endpoint, str) or trial.get("model_endpoint") != endpoint:
             raise ValueError("native E1 bootstrap model endpoint changed")
+        mapping_key = (endpoint, trial["selected_model"])
+        if bootstrap_cache is None or "model_mapping" not in bootstrap_cache:
+            observed_path = e1_bootstrap._inventory_model(
+                e1_bootstrap.inventory(endpoint), trial["selected_model"]
+            ).resolve(strict=True)
+            if bootstrap_cache is not None:
+                bootstrap_cache["model_mapping"] = (mapping_key, str(observed_path))
+        else:
+            cached_key, cached_path = bootstrap_cache["model_mapping"]
+            if cached_key != mapping_key:
+                raise ValueError("native E1 arms used different model endpoints or IDs")
+            observed_path = Path(cached_path)
+        if read_json(bootstrap_path).get("model_artifacts", {}).get("model_path") != str(observed_path):
+            raise ValueError("native E1 current endpoint model_path differs from bootstrap")
+        if bootstrap_cache is None:
+            bootstrap = e1_bootstrap.validate_bootstrap(Path(home))
+        else:
+            if "validated" not in bootstrap_cache:
+                bootstrap_cache["validated"] = e1_bootstrap.validate_bootstrap(Path(home))
+            bootstrap = bootstrap_cache["validated"]
         if (bootstrap.get("_source_path") != str(bootstrap_path.resolve())
                 or bootstrap.get("_source_sha256") != trial["bootstrap_receipt_sha256"]
                 or bootstrap.get("model_identity", {}).get("model_id") != trial["selected_model"]
+                or bootstrap.get("model_artifacts", {}).get("model_path") != str(observed_path)
                 or bootstrap.get("baseline") != {
                     "path": record["baseline"]["path"],
                     "sha256": record["baseline"]["sha256"],
@@ -334,7 +349,10 @@ def _trial_hashes(root: Path, home: Path, record: dict[str, Any], case: dict[str
                 or bootstrap.get("package_manifest") != {
                     "path": str(package_path.resolve()), "sha256": sha256_file(package_path)
                 }):
-            raise ValueError("native E1 bootstrap differs from frozen model or baseline")
+            raise ValueError("native E1 bootstrap differs from current endpoint model, frozen model or baseline")
+        if (sha256_file(observed_path / "config.json")
+                != bootstrap["model_artifacts"]["files"]["config.json"]):
+            raise ValueError("native E1 current endpoint model config differs from bootstrap")
         profile_hashes = {"bootstrap_receipt": sha256_file(bootstrap_path)}
         for name in ("e0_summary", "independent_review", "review_assignment", "baseline"):
             ref = bootstrap[name]

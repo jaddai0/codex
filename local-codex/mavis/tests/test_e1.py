@@ -487,6 +487,7 @@ class E1RunnerTests(unittest.TestCase):
             ("installed_candidate_fingerprint", lambda: fingerprint),
             ("_package_manifest_path", lambda: package),
             ("_model_root_path", lambda: model_root),
+            ("inventory", lambda _endpoint: [{"id": "exact-model", "model_path": str(model_path.resolve())}]),
             ("harness_job_status", status),
         ):
             active_patch = patch.object(e1_bootstrap, name, value)
@@ -595,7 +596,11 @@ class E1RunnerTests(unittest.TestCase):
     def test_native_bootstrap_pair_compares_without_active_profile(self):
         bootstrap, _, _, _ = self._paired_bootstrap_trials()
         self.assertFalse((self.home / "profiles/main/active.json").exists())
-        record = self.runner.compare_native("repair", "regression")
+        with (patch.object(e1_bootstrap, "inventory", wraps=e1_bootstrap.inventory) as inventory_reader,
+              patch.object(e1_bootstrap, "validate_bootstrap", wraps=e1_bootstrap.validate_bootstrap) as validator):
+            record = self.runner.compare_native("repair", "regression")
+            inventory_reader.assert_called_once_with("http://127.0.0.1:8001/v1")
+            validator.assert_called_once_with(self.home)
         self.assertEqual(record["state"], "compared")
         self.assertEqual(record["comparison"]["candidate"]["target_score"], 1)
         self.assertEqual(record["comparison"]["baseline"]["target_score"], 0)
@@ -664,6 +669,31 @@ class E1RunnerTests(unittest.TestCase):
         shard.write_bytes(b"different-weights")
         with self.assertRaisesRegex(ValueError, "model artifact bytes changed"):
             self.runner.store._check_comparison(self.runner.store.load("repair"))
+
+    def test_native_bootstrap_current_inventory_mapping_blocks_comparison(self):
+        self._paired_bootstrap_trials()
+        wrong = self.root / "wrong-model"
+        wrong.mkdir()
+        with patch.object(e1_bootstrap, "inventory", return_value=[
+            {"id": "exact-model", "model_path": str(wrong.resolve())}
+        ]) as inventory_reader:
+            with self.assertRaisesRegex(ValueError, "current endpoint model_path differs"):
+                self.runner.compare_native("repair", "regression")
+            inventory_reader.assert_called_once_with("http://127.0.0.1:8001/v1")
+        self.assertEqual(self.runner.store.load("repair")["state"], "candidate")
+        self.assertFalse((self.home / "e1/repair/native-candidate-trial-summary.json").exists())
+
+    def test_native_bootstrap_current_inventory_mapping_rechecked_after_compare(self):
+        self._paired_bootstrap_trials()
+        self.runner.compare_native("repair", "regression")
+        wrong = self.root / "wrong-model"
+        wrong.mkdir()
+        with patch.object(e1_bootstrap, "inventory", return_value=[
+            {"id": "exact-model", "model_path": str(wrong.resolve())}
+        ]) as inventory_reader:
+            with self.assertRaisesRegex(ValueError, "current endpoint model_path differs"):
+                self.runner.store._check_comparison(self.runner.store.load("repair"))
+            inventory_reader.assert_called_once_with("http://127.0.0.1:8001/v1")
 
     def test_native_dispatch_rejects_unbound_start_receipt(self):
         self._freeze()
