@@ -24,6 +24,12 @@ in the archive's own directory. The original SHA-256 and compressed SHA-256 stay
 in the manifest. Mavis reconstructs and hashes the exact original bytes before
 changing the manifest, then removes only the verified raw duplicate. Search and
 librarian citation checks verify both hashes and read compressed segments directly.
+Compression and restoration pin the archive's segments directory with a no-follow
+directory handle. Reads, generated files, and removals use that handle and check
+the file's inode and hash. If a directory change is detected before duplicate
+removal, Mavis reports failure and rolls back the manifest while retaining both
+copies. A change detected just after removal is reported without changing the
+manifest that points to the retained copy.
 An interrupted operation can reuse an already verified gzip or remove a verified
 raw duplicate. `restore` reconstructs raw files and checks hashes; `reopen`
 restores them before accepting new project activity.
