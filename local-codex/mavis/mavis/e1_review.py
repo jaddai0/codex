@@ -186,6 +186,7 @@ def dispatch_review(home: Path, record: dict[str, Any], *, job_id: str,
                     starter: Callable[[dict[str, Any]], dict[str, Any]]) -> dict[str, Any]:
     """Start an independent native reviewer against the frozen trial packet."""
     require_safe_id(job_id, "review job id")
+    verifier_job_id = require_safe_id(f"{job_id}-terra", "review verifier job id")
     assignment_path, receipt_path = _paths(home, record["experiment_id"])
     packet = read_json(assignment_path)
     facts = _facts(home, record)
@@ -221,6 +222,7 @@ def dispatch_review(home: Path, record: dict[str, Any], *, job_id: str,
     dispatch = {
         "schema_version": "mavis.e1-review-dispatch/v1",
         "experiment_id": record["experiment_id"], "job_id": job_id,
+        "verifier_job_id": verifier_job_id,
         "packet_path": str(assignment_path), "packet_sha256": sha256_file(assignment_path),
         "arguments_digest": _digest(arguments),
         "gateway_assignment_path": str(gateway_assignment),
@@ -229,6 +231,76 @@ def dispatch_review(home: Path, record: dict[str, Any], *, job_id: str,
     }
     write_json(dispatch_path, dispatch)
     return dispatch
+
+
+def check_review_report(home: Path, record: dict[str, Any], report_path: Path) -> dict[str, str]:
+    """Check the exact paired evidence and raw worker report before gateway completion."""
+    assignment_path, receipt_path = _paths(home, record["experiment_id"])
+    assignment = read_json(assignment_path)
+    facts = _facts(home, record)
+    dispatch_path = assignment_path.parent / "review-dispatch.json"
+    dispatch = read_json(dispatch_path)
+    report = Path(dispatch.get("report_path") or "")
+    if Path(report_path).resolve() != report.resolve():
+        raise ValueError("E1 review check must read the dispatched gateway report")
+    owner = assignment.get("owner")
+    review_checkout = (assignment_path.parent / "checkouts" / "baseline" /
+                       read_json(assignment_path.parent / "cases.json")["regression"])
+    if (record.get("state") != "compared"
+            or assignment.get("schema_version") != "mavis.e1-review-assignment/v1"
+            or assignment.get("objective_id") != record["experiment_id"]
+            or assignment.get("scope") != record["scope"]
+            or assignment.get("cwd") != str(review_checkout.resolve())
+            or assignment.get("starting_revision") != facts["review_checkout_revision"]
+            or assignment.get("owned_paths") != [str(receipt_path)]
+            or assignment.get("required_checks") != ["independent-e1-review"]
+            or assignment.get("facts") != facts
+            or assignment.get("facts_digest") != _digest(facts)
+            or assignment.get("requirements") != _requirements(facts)
+            or not isinstance(owner, dict) or set(owner) != {"provider", "model", "harness"}
+            or (owner.get("provider"), owner.get("harness")) != ("minimax", "opencode")
+            or owner in [worker["owner"] for worker in facts["candidate_workers"]]):
+        raise ValueError("E1 review check lost its frozen paired bundle or independent owner")
+    job_id = require_safe_id(dispatch.get("job_id"), "review job id")
+    verifier_job_id = require_safe_id(f"{job_id}-terra", "review verifier job id")
+    gateway_path = Path(dispatch.get("gateway_assignment_path") or "")
+    gateway_assignment = read_json(gateway_path)
+    expected = _gateway_arguments(assignment, assignment_path, job_id)
+    if (dispatch.get("schema_version") != "mavis.e1-review-dispatch/v1"
+            or dispatch.get("experiment_id") != record["experiment_id"]
+            or dispatch.get("verifier_job_id") != verifier_job_id
+            or dispatch.get("packet_path") != str(assignment_path)
+            or dispatch.get("packet_sha256") != sha256_file(assignment_path)
+            or dispatch.get("arguments_digest") != _digest(expected)
+            or dispatch.get("gateway_assignment_sha256") != sha256_file(gateway_path)
+            or any(gateway_assignment.get(key) != value for key, value in expected.items() if key != "job_id")
+            or not report.is_absolute() or not gateway_path.is_absolute()
+            or report.parent.resolve() != Path(dispatch.get("job_dir") or "").resolve()
+            or gateway_path.parent.resolve() != Path(dispatch.get("job_dir") or "").resolve()):
+        raise ValueError("E1 review check lost its exact gateway assignment")
+    receipt = read_json(report)
+    if (receipt.get("schema_version") != "mavis.e1-review/v1"
+            or receipt.get("experiment_id") != record["experiment_id"]
+            or receipt.get("verdict") not in {"accepted", "rejected"}
+            or receipt.get("assignment_sha256") != sha256_file(assignment_path)
+            or receipt.get("facts_digest") != assignment["facts_digest"]
+            or receipt.get("gateway_worker_job_id") != job_id):
+        raise ValueError("E1 review check found a changed or incomplete worker report")
+    findings = receipt.get("case_findings")
+    if not isinstance(findings, dict) or set(findings) != set(facts["case_ids"]):
+        raise ValueError("E1 review check lacks case-specific findings")
+    for case_id, finding in findings.items():
+        if (not isinstance(finding, dict) or set(finding) != {"finding", "evidence"}
+                or not isinstance(finding["finding"], str) or not finding["finding"].strip()
+                or len(finding["finding"]) > 4000
+                or finding["evidence"] != facts["case_evidence"][case_id]):
+            raise ValueError("E1 review check found changed case evidence")
+    if len({job_id, verifier_job_id, record["comparison"]["candidate"]["candidate_job_id"]}) != 3:
+        raise ValueError("E1 reviewer, verifier, and candidate worker must be distinct")
+    return {"schema_version": "mavis.e1-review-check/v1", "status": "pass",
+            "assignment_sha256": sha256_file(assignment_path),
+            "report_sha256": sha256_file(report), "facts_digest": assignment["facts_digest"],
+            "bundle_digest": facts["bundle_digest"]}
 
 
 def import_review_report(home: Path, record: dict[str, Any],
@@ -296,6 +368,7 @@ def validate_review(home: Path, record: dict[str, Any], receipt_path: Path,
     expected_gateway = _gateway_arguments(assignment, assignment_path, dispatch.get("job_id"))
     if (dispatch.get("schema_version") != "mavis.e1-review-dispatch/v1"
             or dispatch.get("experiment_id") != record["experiment_id"]
+            or dispatch.get("verifier_job_id") != f"{dispatch.get('job_id')}-terra"
             or dispatch.get("packet_path") != str(assignment_path)
             or dispatch.get("packet_sha256") != sha256_file(assignment_path)
             or dispatch.get("gateway_assignment_sha256") != sha256_file(gateway_assignment_path)
@@ -331,7 +404,9 @@ def validate_review(home: Path, record: dict[str, Any], receipt_path: Path,
     binding = status.get("mavis_binding")
     acceptance = status["acceptance"]
     verifier_job_id = acceptance["verifier_job_id"]
-    if len({worker_job_id, verifier_job_id, record["comparison"]["candidate"]["candidate_job_id"]}) != 3:
+    if (verifier_job_id != dispatch.get("verifier_job_id")
+            or len({worker_job_id, verifier_job_id,
+                    record["comparison"]["candidate"]["candidate_job_id"]}) != 3):
         raise ValueError("E1 review worker and verifier must be independent")
     expected_binding = {
         "schema_version": "model-gateway-mavis-objective-binding/v1",
