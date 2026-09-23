@@ -306,5 +306,22 @@ class MaintenanceCliTests(unittest.TestCase):
                     )
 
 
+class LauncherRoutingTests(unittest.TestCase):
+    def test_service_commands_reach_python_without_loading_a_model(self):
+        root = Path(__file__).resolve().parents[3]
+        launcher = root / "local-codex" / "bin" / "local-codex"
+        share = root / "local-codex" / "mavis"
+        with tempfile.TemporaryDirectory() as directory:
+            env = {**os.environ, "LOCAL_CODEX_SHARE_DIR": str(share),
+                   "MAVIS_HOME": str(Path(directory) / "service"),
+                   "CODEX_HOME": str(Path(directory) / "codex")}
+            for command in ("objective", "archive-retention", "maintenance", "e1"):
+                with self.subTest(command=command):
+                    run = subprocess.run([str(launcher), command, "--help"],
+                                         env=env, text=True, capture_output=True, timeout=15)
+                    self.assertEqual(run.returncode, 0, run.stderr)
+                    self.assertIn("usage: mavis-service", run.stdout)
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -58,9 +58,15 @@ class _PinnedSegments:
         self.root_fd = root_fd
         self.fd = os.open("segments", os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW,
                           dir_fd=root_fd)
-        self.root_identity = (os.fstat(root_fd).st_dev, os.fstat(root_fd).st_ino)
-        self.identity = (os.fstat(self.fd).st_dev, os.fstat(self.fd).st_ino)
-        self.assert_attached()
+        try:
+            root_stat = os.fstat(root_fd)
+            segment_stat = os.fstat(self.fd)
+            self.root_identity = (root_stat.st_dev, root_stat.st_ino)
+            self.identity = (segment_stat.st_dev, segment_stat.st_ino)
+            self.assert_attached()
+        except BaseException:
+            os.close(self.fd)
+            raise
 
     def __enter__(self):
         return self

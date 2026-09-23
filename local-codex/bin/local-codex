@@ -9,12 +9,19 @@ core_binary=${LOCAL_CODEX_BIN:-${share_dir}/local-codex-core}
 model_args=()
 gateway_env_args=()
 
-if [[ ${1:-} == e1 ]]; then
+case "${1:-}" in
+  runtime|objective|run|archive-search|archive-retention|storage-pressure|pre-compact|project-index|project-memory|eval|e1|maintenance)
   export CODEX_HOME=${CODEX_HOME:-$runtime_home}
+  export MAVIS_HOME=${MAVIS_HOME:-${HOME}/.local-codex/mavis-service}
+  if [[ "$MAVIS_HOME" != /* ]]; then
+    print -u2 "mavis: MAVIS_HOME must be an absolute path"
+    exit 2
+  fi
   export LOCAL_CODEX_SHARE_DIR="$share_dir"
   export PYTHONPATH="${share_dir}${PYTHONPATH:+:${PYTHONPATH}}"
   exec python3 -m mavis "$@"
-fi
+  ;;
+esac
 
 if [[ -n ${LOCAL_CODEX_MODEL:-} ]]; then
   model_args=(--model "$LOCAL_CODEX_MODEL")
