@@ -100,6 +100,33 @@ class HelperEvaluationTests(unittest.TestCase):
             self.assertEqual(evaluate(home, suite, MODEL, BASE_URL, ask=ask)["status"], "test-only")
             self.assertEqual(first_session.followup_context()["query"], "old question")
 
+    def test_followup_query_does_not_offer_stale_citations(self):
+        with tempfile.TemporaryDirectory() as directory:
+            home = Path(directory)
+            archive = TranscriptArchive(home, "one-history")
+            archive.append_segment([{"content": "Decision: keep the blue engine"}])
+            archive.append_segment([{"content": "Decision: delete stale paths"}])
+            previous = archive.search("blue engine")[0]
+            HelperSession(home, "librarian", context_id="one-history").store_query_context(
+                "Which engine?", [{key: previous[key] for key in ("path", "line", "sha256")}
+                ])
+            current = archive.search("stale paths")[0]
+            citation = {key: current[key] for key in ("path", "line", "sha256")}
+            suite = {"schema_version": SUITE_VERSION, "role": "librarian", "cases": [
+                {"id": "followup", "conversation_id": "one-history",
+                 "question": "What happens to stale paths?", "search_terms": ["stale paths"],
+                 "followup": True, "expected_answer_terms": ["delete stale paths"],
+                 "expected_source_terms": ["delete stale paths"]}
+            ]}
+
+            def ask(*args):
+                user = json.loads(args[2][1]["content"])
+                self.assertEqual(user["followup"], {"query": "Which engine?"})
+                return {"answer": "Delete stale paths.", "uncertainty": "No other context.",
+                        "citations": [citation]}
+
+            self.assertEqual(evaluate(home, suite, MODEL, BASE_URL, ask=ask)["status"], "test-only")
+
     def test_output_known_format_uses_host_parser_before_model(self):
         with tempfile.TemporaryDirectory() as directory:
             home = Path(directory)
@@ -225,6 +252,18 @@ class HelperEvaluationTests(unittest.TestCase):
             with self.assertRaisesRegex(ValueError, "incomplete"):
                 _completion(BASE_URL, MODEL, [], 1)
 
+    def test_helper_requests_bind_role_schema_and_disable_thinking(self):
+        for role, expected_field in (("librarian", "citations"),
+                                     ("output reader", "observations")):
+            payload = json.loads(_request_bytes(MODEL, [
+                {"role": "system", "content": f"You are the Mavis {role}."}
+            ]))
+            self.assertEqual(payload["chat_template_kwargs"], {"enable_thinking": False})
+            self.assertEqual(payload["response_format"]["type"], "json_schema")
+            self.assertTrue(payload["response_format"]["json_schema"]["strict"])
+            self.assertIn(expected_field,
+                          payload["response_format"]["json_schema"]["schema"]["properties"])
+
     def test_service_model_path_and_bytes_are_bound_to_result(self):
         with tempfile.TemporaryDirectory() as directory:
             home = Path(directory)
@@ -269,11 +308,23 @@ class HelperEvaluationTests(unittest.TestCase):
                 evaluate(home, suite, MODEL, BASE_URL, model_path=model,
                          inventory_reader=lambda _: [{**row, "model_path": str(home)}],
                          status_reader=status, settings_reader=settings)
+            default_row = {key: value for key, value in row.items() if key != "settings"}
+            defaults = evaluate(home, suite, MODEL, BASE_URL, model_path=model,
+                                inventory_reader=lambda _: [default_row],
+                                status_reader=status, settings_reader=settings)
+            self.assertEqual(defaults["model_binding"]["settings_source"], "global-default")
+            self.assertEqual(defaults["model_binding"]["effective_sampling"]["max_context_window"], 8192)
             with self.assertRaisesRegex(ValueError, "effective settings evidence"):
                 evaluate(home, suite, MODEL, BASE_URL, model_path=model,
-                         inventory_reader=lambda _: [{key: value for key, value in row.items()
-                                                       if key != "settings"}],
+                         inventory_reader=lambda _: [{**row, "settings": None}],
                          status_reader=status, settings_reader=settings)
+            auto = evaluate(home, suite, MODEL, BASE_URL, model_path=model,
+                            inventory_reader=lambda _: [{**default_row, "thinking_default": None,
+                                                          "thinking_forced": False,
+                                                          "thinking_modes": ["auto", "off"]}],
+                            status_reader=status, settings_reader=settings)
+            self.assertEqual(auto["model_binding"]["effective_thinking"], "auto")
+            self.assertEqual(auto["model_binding"]["thinking_source"], "service-auto")
             versions = iter(["0.7.0.dev4", "0.7.0.dev5"])
             changed = evaluate(home, suite, MODEL, BASE_URL, model_path=model,
                                inventory_reader=inventory,
