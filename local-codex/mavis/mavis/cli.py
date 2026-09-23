@@ -8,6 +8,7 @@ import os
 import sys
 from pathlib import Path
 
+from .archive_hygiene import ArchiveRetention, storage_pressure
 from .evidence import run_command
 from .e1 import E1Runner
 from .e1_bootstrap import (check_bootstrap_review, create_bootstrap,
@@ -112,6 +113,24 @@ def build_parser() -> argparse.ArgumentParser:
     search.add_argument("query")
     search.add_argument("--limit", type=int, default=20)
     search.add_argument("--offset", type=int, default=0)
+
+    retention = subcommands.add_parser("archive-retention")
+    retention_sub = retention.add_subparsers(dest="retention_command", required=True)
+    retention_register = retention_sub.add_parser("register")
+    retention_register.add_argument("project_id")
+    retention_register.add_argument("--conversation", action="append", required=True)
+    retention_register.add_argument("--objective", action="append", default=[])
+    retention_close = retention_sub.add_parser("close")
+    retention_close.add_argument("project_id")
+    retention_close.add_argument("--protect", action="append", default=[])
+    retention_compact = retention_sub.add_parser("compact")
+    retention_compact.add_argument("project_id")
+    retention_restore = retention_sub.add_parser("restore")
+    retention_restore.add_argument("project_id")
+    retention_reopen = retention_sub.add_parser("reopen")
+    retention_reopen.add_argument("project_id")
+    storage = subcommands.add_parser("storage-pressure")
+    storage.add_argument("--prune-reproducible-cache", action="store_true")
 
     subcommands.add_parser("pre-compact")
 
@@ -310,6 +329,23 @@ def main(argv: list[str] | None = None) -> int:
         handoff["evidence_links"].append(str(segment or archive.manifest_path))
         archive.write_handoff(handoff)
         print_json({"continue": True})
+        return 0
+    if args.command == "archive-retention":
+        retention = ArchiveRetention(home)
+        if args.retention_command == "register":
+            result = retention.register(args.project_id, args.conversation, args.objective)
+        elif args.retention_command == "close":
+            result = retention.close(args.project_id, protected_paths=args.protect)
+        elif args.retention_command == "restore":
+            result = retention.restore(args.project_id)
+        elif args.retention_command == "reopen":
+            result = retention.reopen(args.project_id)
+        else:
+            result = retention.compact(args.project_id)
+        print_json(result)
+        return 0
+    if args.command == "storage-pressure":
+        print_json(storage_pressure(home, prune=args.prune_reproducible_cache))
         return 0
     if args.command == "runtime":
         config = runtime_config(args)

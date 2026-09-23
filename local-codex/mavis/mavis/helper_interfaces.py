@@ -51,13 +51,13 @@ class LibrarianEvidence:
         if not self.archive.manifest_path.is_file():
             raise ValueError("transcript archive has no manifest")
         manifest = read_json(self.archive.manifest_path)
-        archived = set()
+        archived = {}
         for item in manifest["segments"]:
             try:
                 resolved = self.archive.resolve_segment_file(item["path"])
             except ValueError:
                 continue
-            archived.add((str(resolved), item["sha256"]))
+            archived[(str(resolved), item["sha256"])] = item
         allowed = set()
         for item in evidence:
             if (
@@ -65,21 +65,19 @@ class LibrarianEvidence:
                 or not {"path", "line", "sha256", "text"} <= item.keys()
             ):
                 continue
-            if (item["path"], item["sha256"]) not in archived:
+            segment = archived.get((item["path"], item["sha256"]))
+            if segment is None:
                 continue
             try:
-                path = self.archive.resolve_segment_file(item["path"])
+                self.archive.verify_segment(segment)
             except ValueError:
                 continue
-            if sha256_file(path) != item["sha256"]:
-                continue
-            lines = path.read_text(encoding="utf-8").splitlines()
             line = item["line"]
-            if (
-                isinstance(line, int)
-                and 1 <= line <= len(lines)
-                and lines[line - 1] == item["text"]
-            ):
+            if type(line) is not int or line < 1:
+                continue
+            actual = next((text.rstrip("\n") for number, text in enumerate(
+                self.archive.segment_lines(segment), 1) if number == line), None)
+            if actual == item["text"]:
                 allowed.add((item["path"], line, item["sha256"]))
         for item in citations:
             if not isinstance(item, dict) or set(item) != {"path", "line", "sha256"}:
@@ -90,8 +88,12 @@ class LibrarianEvidence:
             key = (item["path"], line, item["sha256"])
             if key not in allowed:
                 raise ValueError("citation is outside the verified evidence packet")
-            path = Path(item["path"])
-            if not path.is_file() or sha256_file(path) != item["sha256"]:
+            segment = archived.get((item["path"], item["sha256"]))
+            if segment is None:
+                raise ValueError("cited source is no longer in the archive")
+            try:
+                self.archive.verify_segment(segment)
+            except ValueError:
                 raise ValueError("cited source changed after retrieval")
         return answer
 
