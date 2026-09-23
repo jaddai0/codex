@@ -1,17 +1,57 @@
 from pathlib import Path
 import json
+import os
 import subprocess
 import tempfile
 import unittest
 from unittest.mock import patch
 
-from mavis.evaluations import E0_CASES, E0Evaluator, native_review_completed
+from mavis.evaluations import (E0_CASES, E0Evaluator,
+                               installed_candidate_fingerprint, native_review_completed)
 from mavis.e0_tasks import prepare_small_repository
 from mavis.runtime import RuntimeConfig
 from mavis.storage import sha256_file
 
 
 class E0EvaluationTests(unittest.TestCase):
+    def test_installed_candidate_tracks_launcher_and_profile_code(self):
+        with tempfile.TemporaryDirectory() as directory:
+            home = Path(directory)
+            files = (
+                ".local/share/local-codex/local-codex-core",
+                ".local/share/local-codex/prepare_runtime.py",
+                ".local/share/local-codex/launch_core.py",
+                ".local/share/local-codex/base-instructions.md",
+                ".local/share/local-codex/persona.toml",
+                ".local/share/local-codex/mavis/__init__.py",
+                ".local/bin/mavis",
+                "Desktop/Mavis.command",
+            )
+            for name in files:
+                path = home / name
+                path.parent.mkdir(parents=True, exist_ok=True)
+                path.write_text(name)
+            with patch("mavis.evaluations.Path.home", return_value=home), patch.dict(os.environ, {}, clear=True):
+                baseline = installed_candidate_fingerprint()
+                for name in files:
+                    path = home / name
+                    path.write_text(name + " changed")
+                    changed = installed_candidate_fingerprint()
+                    self.assertNotEqual(baseline, changed, name)
+                    path.write_text(name)
+                for name in ("MAVIS_BIN", "LOCAL_CODEX_SHARE_DIR", "LOCAL_CODEX_BIN", "LOCAL_CODEX_MODEL"):
+                    with patch.dict(os.environ, {name: str(home / "alternate")}):
+                        with self.assertRaisesRegex(ValueError, name):
+                            installed_candidate_fingerprint()
+                with patch.dict(os.environ, {"MAVIS_HOME": str(home / "alternate")}):
+                    with self.assertRaisesRegex(ValueError, "MAVIS_HOME"):
+                        installed_candidate_fingerprint()
+                with patch.dict(os.environ, {"PYTHONPATH": str(home / "alternate")}):
+                    with self.assertRaisesRegex(ValueError, "Python package path"):
+                        installed_candidate_fingerprint()
+                with patch.dict(os.environ, {"PYTHONPATH": str(home / ".local/share/local-codex")}):
+                    self.assertEqual(installed_candidate_fingerprint(), baseline)
+
     def test_native_review_accepts_completed_structured_cli_receipt_only(self):
         verdict = "ACCEPT\nExact tests passed and protected file hash matched."
         result = {

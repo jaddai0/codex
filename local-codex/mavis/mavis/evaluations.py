@@ -37,14 +37,39 @@ E0_CASES = (
     "isolation-recovery",
 )
 
+E0_RUNTIME_OVERRIDES = (
+    "MAVIS_BIN",
+    "LOCAL_CODEX_SHARE_DIR",
+    "LOCAL_CODEX_BIN",
+    "LOCAL_CODEX_HOME",
+    "LOCAL_CODEX_MODEL",
+    "OMLX_BASE_URL",
+    "IRIS_OMLX_BASE_URL",
+    "MAVIS_MODEL_DIR",
+    "MAVIS_OMLX_BIN",
+    "MAVIS_GATEWAY_ROOT",
+    "MAVIS_GATEWAY_ENV_FILE",
+)
+
 
 def _now() -> str:
     return datetime.now(timezone.utc).isoformat()
 
 
 def installed_candidate_fingerprint() -> dict[str, str]:
-    """Bind E0 live work to the exact installed core, launcher, and service code."""
+    """Bind E0 live work to every installed executable that prepares Mavis."""
+    overrides = [name for name in E0_RUNTIME_OVERRIDES if os.environ.get(name)]
+    if overrides:
+        raise ValueError(f"E0 requires the canonical installed runtime; overrides set: {', '.join(overrides)}")
     share = Path.home() / ".local" / "share" / "local-codex"
+    service_home = Path.home() / ".local-codex" / "mavis-service"
+    if os.environ.get("MAVIS_HOME") and Path(os.environ["MAVIS_HOME"]).resolve() != service_home.resolve():
+        raise ValueError("E0 requires the canonical MAVIS_HOME")
+    python_path = os.environ.get("PYTHONPATH")
+    python_paths = python_path.split(os.pathsep) if python_path is not None else []
+    if os.environ.get("PYTHONHOME") or any(not path or Path(path).resolve() != share.resolve() for path in python_paths):
+        raise ValueError("E0 requires the installed Python package path only")
+    command = Path.home() / ".local" / "bin" / "mavis"
     package = share / "mavis"
     digest = hashlib.sha256()
     files = sorted(package.rglob("*.py"))
@@ -56,6 +81,11 @@ def installed_candidate_fingerprint() -> dict[str, str]:
     return {
         "core_sha256": sha256_file(share / "local-codex-core"),
         "launcher_sha256": sha256_file(Path.home() / "Desktop" / "Mavis.command"),
+        "command_sha256": sha256_file(command),
+        "prepare_runtime_sha256": sha256_file(share / "prepare_runtime.py"),
+        "launch_core_sha256": sha256_file(share / "launch_core.py"),
+        "instructions_template_sha256": sha256_file(share / "base-instructions.md"),
+        "persona_template_sha256": sha256_file(share / "persona.toml"),
         "service_sha256": digest.hexdigest(),
     }
 
