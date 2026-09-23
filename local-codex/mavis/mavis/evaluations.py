@@ -473,7 +473,7 @@ class E0Evaluator:
                      if event.get("type") == "event_msg"
                      and event.get("payload", {}).get("type") == "task_complete"]
             if (not final or marker not in (final[-1] or "")
-                    or not re.search(r"exited with code\s*`?1`?", final[-1], re.IGNORECASE)):
+                    or not re.search(r"(?:exited with code|failed with exit code)\s*`?1`?\b", final[-1], re.IGNORECASE)):
                 continue
             if marker in primary:
                 continue
