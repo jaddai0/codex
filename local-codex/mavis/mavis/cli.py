@@ -143,6 +143,11 @@ def build_parser() -> argparse.ArgumentParser:
 
     e1 = subcommands.add_parser("e1")
     e1_sub = e1.add_subparsers(dest="e1_command", required=True)
+    trial = e1_sub.add_parser("trial")
+    trial.add_argument("experiment_id")
+    trial.add_argument("arm", choices=("baseline", "candidate"))
+    trial.add_argument("case_id")
+    trial.add_argument("task", nargs=argparse.REMAINDER)
     seed = e1_sub.add_parser("seed-active")
     seed.add_argument("scope")
     seed.add_argument("config", type=Path)
@@ -339,6 +344,21 @@ def main(argv: list[str] | None = None) -> int:
         print_json(result)
         return 0 if result["status"] == "pass" else 1
     if args.command == "e1":
+        if args.e1_command == "trial":
+            if args.task[:1] != ["--"] or len(args.task) != 2:
+                raise ValueError("E1 trial needs exactly one task after --")
+            from trial_runtime import run_trial
+
+            print_json(
+                {
+                    "receipt": str(
+                        run_trial(
+                            args.experiment_id, args.arm, args.case_id, args.task[1]
+                        )
+                    )
+                }
+            )
+            return 0
         runner = E1Runner(home)
         store = ExperimentStore(home)
         if args.e1_command == "seed-active":
@@ -359,9 +379,14 @@ def main(argv: list[str] | None = None) -> int:
         elif args.e1_command == "coverage":
             result = runner.coverage(args.experiment_id)
         elif args.e1_command == "dispatch-candidate":
-            result = runner.dispatch_candidate(args.experiment_id, args.case_id,
-                                               job_id=args.job_id, lane=args.lane,
-                                               model=args.model, task=args.task)
+            result = runner.dispatch_candidate(
+                args.experiment_id,
+                args.case_id,
+                job_id=args.job_id,
+                lane=args.lane,
+                model=args.model,
+                task=args.task,
+            )
         elif args.e1_command == "compare":
             result = runner.compare(
                 args.experiment_id, args.candidate_job_id, args.candidate_report

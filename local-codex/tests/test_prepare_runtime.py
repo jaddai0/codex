@@ -32,6 +32,7 @@ class PrepareRuntimeTests(unittest.TestCase):
             share.mkdir()
             shutil.copy(MODULE_PATH, share / "prepare_runtime.py")
             shutil.copy(MODULE_PATH.parent / "launch_core.py", share / "launch_core.py")
+            shutil.copy(MODULE_PATH.parent / "generation_lease.py", share / "generation_lease.py")
             (share / "persona.toml").write_text('name = "Mavis"\n')
             (share / "base-instructions.md").write_text("Base instructions\n")
             stub = share / "mavis"
