@@ -3,6 +3,7 @@
 
 import json
 from pathlib import Path
+import shutil
 import sys
 import tempfile
 import unittest
@@ -15,6 +16,7 @@ sys.path.insert(0, str(ROOT / "mavis/tests"))
 
 from mavis import e1_bootstrap
 from mavis.evaluations import E0_CASES
+from mavis.package_provenance import package_tree_sha256
 from mavis.storage import read_json, sha256_file, write_json
 from test_e1 import E1RunnerTests
 import trial_runtime
@@ -44,6 +46,10 @@ class E1BootstrapTests(unittest.TestCase):
         self.share.mkdir()
         (self.share / "base-instructions.md").write_text("Base instructions\n")
         (self.share / "persona.toml").write_text('name = "Mavis"\n')
+        for name in ("launch_core.py", "prepare_runtime.py", "generation_lease.py"):
+            shutil.copyfile(ROOT / name, self.share / name)
+        shutil.copytree(ROOT / "mavis/mavis", self.share / "mavis",
+                        ignore=shutil.ignore_patterns("__pycache__", "*.pyc"))
         self.core = self.share / "local-codex-core"
         self.core.write_text("#!/bin/sh\nexit 0\n")
         self.core.chmod(0o755)
@@ -56,6 +62,12 @@ class E1BootstrapTests(unittest.TestCase):
             "core_binary": str(self.core.resolve()), "core_sha256": sha256_file(self.core),
             "launcher": str(self.launcher), "launcher_sha256": sha256_file(self.launcher),
             "trial_runtime_sha256": sha256_file(ROOT / "trial_runtime.py"),
+            "launch_core_sha256": sha256_file(self.share / "launch_core.py"),
+            "prepare_runtime_sha256": sha256_file(self.share / "prepare_runtime.py"),
+            "generation_lease_sha256": sha256_file(self.share / "generation_lease.py"),
+            "base_instructions_sha256": sha256_file(self.share / "base-instructions.md"),
+            "persona_sha256": sha256_file(self.share / "persona.toml"),
+            "mavis_package_sha256": package_tree_sha256(self.share / "mavis"),
         })
         e0 = self.home / "evaluations/e0"
         cases = {}
@@ -97,7 +109,7 @@ class E1BootstrapTests(unittest.TestCase):
             "receipt": {"job_id": job_id, "exit_code": 0},
             "acceptance": {"accepted": True, "job_id": job_id, "verifier": "terra",
                            "verifier_job_id": "terra-job", "target_sha256": "a" * 64,
-                           "evidence_sha256": "b" * 64, "report_sha256_on_disk": "c" * 64,
+                           "evidence_sha256": "b" * 64, "report_sha256_on_disk": sha256_file(self.review),
                            "verifier_verdict_sha256": "d" * 64},
             "mavis_binding": {"objective_id": "e1-bootstrap-main",
                               "report_sha256": sha256_file(self.review)},
@@ -134,6 +146,15 @@ class E1BootstrapTests(unittest.TestCase):
         self.fingerprint["service_sha256"] = "c" * 64
         with self.assertRaisesRegex(ValueError, "current installed E0"):
             trial_runtime.trial_binding(self.home, "repair", "baseline", "regression")
+
+    def test_old_all_pass_summary_without_installed_binding_requires_fresh_e0(self):
+        summary = read_json(self.summary)
+        for key in ("installed_candidate", "model_id", "case_receipts"):
+            summary.pop(key)
+        write_json(self.summary, summary)
+        with self.assertRaisesRegex(ValueError, "current installed E0"):
+            self._create()
+        self.assertFalse((self.home / "e1/bootstrap/main.json").exists())
 
     def test_tampered_summary_review_and_package_fail_closed(self):
         self._create()
@@ -178,6 +199,13 @@ class E1BootstrapTests(unittest.TestCase):
         write_json(self.review, review)
         with self.assertRaisesRegex(ValueError, "independent gateway acceptance"):
             self._create()
+
+    def test_review_acceptance_must_attest_exact_review_bytes(self):
+        status = self._status("review-job")
+        status["acceptance"]["report_sha256_on_disk"] = "f" * 64
+        with patch.object(e1_bootstrap, "harness_job_status", return_value=status):
+            with self.assertRaisesRegex(ValueError, "independent gateway acceptance"):
+                self._create()
 
     def test_accepted_profile_path_remains_authoritative(self):
         self._create()
