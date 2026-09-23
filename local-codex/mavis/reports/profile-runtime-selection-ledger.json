@@ -1,15 +1,81 @@
 {
   "schema_version": "work-closeout/v1",
   "task": "Wire accepted Mavis main profile selection into source launcher without live model loading",
-  "constraint": {"binding": "evidence", "statement": "Only settings faithfully applied by Codex may be marked active or recorded as effective.", "evidence": ["Inspected ProfileStore, prepare_runtime.py, installed launcher source, profile schema, and Phase 1/3 plan."]},
+  "constraint": {
+    "binding": "evidence",
+    "statement": "Only settings faithfully applied by Codex may be marked active or recorded as effective.",
+    "evidence": [
+      "Inspected ProfileStore, prepare_runtime.py, installed launcher source, profile schema, and Phase 1/3 plan."
+    ]
+  },
   "status": "complete",
-  "uncertainty": ["Installed Codex and oMLX end-to-end acceptance remains a separate gate; no E1 comparison was claimed."],
-  "rejected_alternatives": ["Rejected accepting tool or retrieval candidate settings that the launcher cannot apply.", "Rejected a prepared-only receipt as proof of process launch."],
+  "uncertainty": [
+    "Installed Codex and oMLX end-to-end acceptance remains a separate gate; no E1 comparison was claimed."
+  ],
+  "rejected_alternatives": [
+    "Rejected accepting tool or retrieval candidate settings that the launcher cannot apply.",
+    "Rejected a prepared-only receipt as proof of process launch."
+  ],
   "requirements": [
-    {"id": "selection", "requirement": "Resolve accepted main model before oMLX ensure and apply exact model ID and system prompt to Codex config.", "status": "pass", "command": "python3 -m unittest discover -s local-codex/tests -p test_prepare_runtime.py -v", "artifact": "local-codex/prepare_runtime.py", "evidence": ["13 tests passed; A, B, and rollback to A generated matching TOML model and catalog prompt; the source launcher passed model B to the stub runtime."]},
-    {"id": "activation", "requirement": "Reject unsupported candidate keys and retain prior active version on restore.", "status": "pass", "command": "PYTHONPATH=local-codex/mavis python3 -m unittest discover -s local-codex/mavis/tests -v", "artifact": "local-codex/mavis/mavis/profiles.py", "evidence": ["95 tests passed; unsupported compaction setting rejected before activation and restored profile records prior version 2."]},
-    {"id": "receipt", "requirement": "Retain a host-observed process launch receipt with exact profile identity and effective config hashes.", "status": "pass", "command": "python3 -m unittest discover -s local-codex/tests -p test_prepare_runtime.py -v", "artifact": "local-codex/launch_core.py", "evidence": ["Stub core process spawned and exited; receipt recorded process ID, exit code, selected model, version, and config hash."]},
-    {"id": "install-source", "requirement": "Ship selector and launch receipt writer through the installed launcher source without modifying the live install.", "status": "pass", "command": "zsh -n local-codex/bin/local-codex && python3 -m compileall -q local-codex/prepare_runtime.py local-codex/launch_core.py local-codex/mavis/mavis && git diff --check", "artifact": "local-codex/install.sh", "evidence": ["Launcher syntax, Python compilation, and diff checks passed; install script stages launch_core.py."]},
-    {"id": "report", "requirement": "Document source proof and remaining installed-runtime and E1 gaps.", "status": "pass", "command": "test -s local-codex/mavis/reports/profile-runtime-selection.md", "artifact": "local-codex/mavis/reports/profile-runtime-selection.md", "evidence": ["Report separates source fixture and stub launch from live model and E1 acceptance."]}
+    {
+      "id": "selection",
+      "requirement": "Resolve accepted main model before oMLX ensure and apply exact model ID and system prompt to Codex config.",
+      "status": "pass",
+      "command": "python3 -m unittest discover -s local-codex/tests -p test_prepare_runtime.py -v",
+      "artifact": "local-codex/prepare_runtime.py",
+      "evidence": [
+        "15 tests passed; A, B, and rollback to A generated matching TOML model and catalog prompt; the source launcher passed model B to the stub runtime."
+      ]
+    },
+    {
+      "id": "activation",
+      "requirement": "Reject unsupported candidate keys and retain prior active version on restore.",
+      "status": "pass",
+      "command": "PYTHONPATH=local-codex/mavis python3 -m unittest discover -s local-codex/mavis/tests -v",
+      "artifact": "local-codex/mavis/mavis/profiles.py",
+      "evidence": [
+        "95 tests passed; unsupported compaction setting rejected before activation and restored profile records prior version 2."
+      ]
+    },
+    {
+      "id": "receipt",
+      "requirement": "Retain a host-observed process launch receipt with exact profile identity and effective config hashes.",
+      "status": "pass",
+      "command": "python3 -m unittest discover -s local-codex/tests -p test_prepare_runtime.py -v",
+      "artifact": "local-codex/launch_core.py",
+      "evidence": [
+        "Stub core process spawned and exited; receipt recorded process ID, exit code, selected model, version, and config hash."
+      ]
+    },
+    {
+      "id": "rollback-and-overrides",
+      "requirement": "Reject stale profile pointers after experiment rollback and reject CLI/config-profile overrides before startup and spawn.",
+      "status": "pass",
+      "command": "python3 -m unittest discover -s local-codex/tests -p test_prepare_runtime.py -q",
+      "artifact": "local-codex/tests/test_prepare_runtime.py",
+      "evidence": [
+        "15 tests passed; real ExperimentStore.rollback leaves stale profile pointer and launch rejects it; fixture repairs evidence hash and still fails active-pointer check; prepared receipt cannot spawn after rollback; config and named-profile overrides reject before stub runtime ensure."
+      ]
+    },
+    {
+      "id": "install-source",
+      "requirement": "Ship selector and launch receipt writer through the installed launcher source without modifying the live install.",
+      "status": "pass",
+      "command": "zsh -n local-codex/bin/local-codex && python3 -m compileall -q local-codex/prepare_runtime.py local-codex/launch_core.py local-codex/mavis/mavis && git diff --check",
+      "artifact": "local-codex/install.sh",
+      "evidence": [
+        "Launcher syntax, Python compilation, and diff checks passed; install script stages launch_core.py."
+      ]
+    },
+    {
+      "id": "report",
+      "requirement": "Document source proof and remaining installed-runtime and E1 gaps.",
+      "status": "pass",
+      "command": "test -s local-codex/mavis/reports/profile-runtime-selection.md",
+      "artifact": "local-codex/mavis/reports/profile-runtime-selection.md",
+      "evidence": [
+        "Report separates source fixture and stub launch from live model and E1 acceptance."
+      ]
+    }
   ]
 }

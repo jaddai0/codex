@@ -84,6 +84,8 @@ def accepted_main_profile(mavis_home: Path) -> dict[str, object] | None:
     pointer_path = role_root / "active.json"
     if not pointer_path.exists():
         return None
+    from mavis.experiments import ExperimentStore
+
     pointer = json.loads(pointer_path.read_text(encoding="utf-8"))
     version = pointer.get("version")
     if type(version) is not int or version < 1:
@@ -105,6 +107,29 @@ def accepted_main_profile(mavis_home: Path) -> dict[str, object] | None:
             raise ValueError(f"active main profile {name} is outside Mavis home")
         if hashlib.sha256(evidence_path.read_bytes()).hexdigest() != retained["sha256"]:
             raise ValueError(f"active main profile {name} evidence changed")
+    experiment_path = Path(profile["accepted_experiment"]["path"]).resolve()
+    verification_path = Path(profile["verifier_receipt"]["path"]).resolve()
+    experiment_store = ExperimentStore(mavis_home)
+    active_experiment = experiment_store.active("main")
+    experiment_id = active_experiment.get("experiment_id")
+    if not isinstance(experiment_id, str) or experiment_path != experiment_store._record_path(experiment_id).resolve():
+        raise ValueError("active main profile differs from active promoted experiment")
+    experiment = json.loads(experiment_path.read_text(encoding="utf-8"))
+    if (experiment.get("schema_version") != "mavis.experiment-lifecycle/v1"
+            or experiment.get("state") != "promoted"
+            or experiment.get("scope") != "main"
+            or experiment.get("candidate") != active_experiment["configuration"]
+            or experiment_id not in profile.get("experiments", [])):
+        raise ValueError("active main profile has no matching promoted experiment")
+    review = experiment.get("review") or {}
+    if (review.get("verdict") != "accepted" or review.get("path") != str(verification_path)
+            or review.get("sha256") != profile["verifier_receipt"]["sha256"]
+            or verification_path.parent != (mavis_home / "verifications" / "experiments").resolve()):
+        raise ValueError("active main profile verifier does not match promoted experiment")
+    candidate = experiment_store._read_snapshot(active_experiment["configuration"])
+    if candidate != {"prompts": profile.get("prompts"), "tool_settings": profile.get("tool_settings"),
+                     "retrieval": (profile.get("context_policy") or {}).get("retrieval", {})}:
+        raise ValueError("active main profile configuration differs from promoted candidate")
     identity = profile.get("model_identity")
     if not isinstance(identity, dict) or not isinstance(identity.get("model_id"), str) or not identity["model_id"]:
         raise ValueError("active main profile requires exact model_identity.model_id")
@@ -437,6 +462,7 @@ def main() -> int:
             "previous_version": accepted.get("previous_version"),
             "profile_path": accepted["_source_path"],
             "profile_sha256": accepted["_source_sha256"],
+            "mavis_home": str(args.mavis_home.resolve()),
             "model_identity": accepted["model_identity"],
             "selected_model": selected,
             "effective_system_prompt_sha256": hashlib.sha256(base_instructions.encode()).hexdigest(),

@@ -49,6 +49,9 @@ fi
 
 profile_model=$(python3 "$share_dir/prepare_runtime.py" \
   --mavis-home "$MAVIS_HOME" --resolve-model "${model_args[@]}")
+if [[ -f "$MAVIS_HOME/profiles/main/active.json" ]]; then
+  python3 "$share_dir/launch_core.py" --check-args -- "$@"
+fi
 
 PYTHONPATH="${share_dir}${PYTHONPATH:+:${PYTHONPATH}}" \
 python3 -m mavis runtime ensure \
@@ -74,14 +77,6 @@ export MAVIS_PRECOMPACT_REQUIRED=1
 export MAVIS_RAW_OUTPUT_REQUIRED=1
 export PYTHONPATH="${share_dir}${PYTHONPATH:+:${PYTHONPATH}}"
 if [[ -n "$launch_receipt" ]]; then
-  for argument in "$@"; do
-    case "$argument" in
-      --model|-m|--model=*|model=*)
-        print -u2 "mavis: model override conflicts with accepted main profile"
-        exit 2
-        ;;
-    esac
-  done
   exec python3 "$share_dir/launch_core.py" --receipt "$launch_receipt" -- "$core_binary" "$@"
 fi
 exec "$core_binary" "$@"
