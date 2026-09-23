@@ -1,4 +1,4 @@
-"""Run the installed E0 repair, then a separate read-only native ZCode review."""
+"""Run the installed E0 repair, then a separate read-only native Terra review."""
 
 from __future__ import annotations
 
@@ -10,8 +10,9 @@ import sys
 import time
 from urllib.parse import quote
 
-from mavis.e0_tasks import prepare_small_repository
-from mavis.evaluations import installed_candidate_fingerprint, native_review_completed
+from mavis.e0_tasks import prepare_small_repository, small_repository_review_prompt
+from mavis.e2_tasks import codex_terra_review_completed, terra_review_command
+from mavis.evaluations import installed_candidate_fingerprint
 from mavis.runtime import (RuntimeConfig, endpoint_alive, ensure_runtime, inventory,
                            load_model, request_json, stop_server)
 from mavis.storage import sha256_file, write_json
@@ -24,7 +25,7 @@ def main() -> int:
     model_path = f"/v1/models/{quote(config.model, safe='')}"
     manifest_path = prepare_small_repository(service)
     manifest = json.loads(manifest_path.read_text())
-    repo = Path(manifest["repo"])
+    repo = Path(manifest["repo"]).resolve()
     task = manifest_path.parent
 
     def loaded(endpoint: str) -> bool:
@@ -89,35 +90,32 @@ def main() -> int:
         print(task / "handoff-summary.json")
         return 1
 
-    review_prompt = (
-        "Read-only independent review of the installed Mavis repair in this repository. "
-        f"Read {manifest_path} and its baseline log. Check git status and diff, run "
-        "python3 -m unittest discover -s tests -q, verify user-notes.txt still matches "
-        "the manifest hash, and assess whether package/pricing.py correctly fixes the "
-        "seeded failure without hiding it. Do not edit files. Begin your final response "
-        "with ACCEPT or REJECT, followed by concise evidence."
-    )
-    with (task / "terra-review.jsonl").open("wb") as log:
-        review = subprocess.run(["zcode", "--json", "--mode", "yolo",
-                                 "--disallowed-tools", "Edit,Write", "--cwd", str(repo),
-                                 "--prompt", review_prompt], cwd=repo,
-                                stdout=log, stderr=subprocess.STDOUT,
+    review_text = task / "terra-review.txt"
+    review_argv = terra_review_command(
+        repo, review_text, small_repository_review_prompt(manifest_path))
+    with (task / "terra-review.jsonl").open("wb") as log, \
+            (task / "terra-review.stderr.log").open("wb") as stderr:
+        review = subprocess.run(review_argv, cwd=repo, stdin=subprocess.DEVNULL,
+                                stdout=log, stderr=stderr,
                                 env={**os.environ, "PYTHONDONTWRITEBYTECODE": "1"},
                                 timeout=900)
     review_log = (task / "terra-review.jsonl").read_text()
-    start = review_log.find("{")
+    response = review_text.read_text() if review_text.is_file() else ""
     try:
-        response = json.loads(review_log[start:])["response"] if start >= 0 else ""
-    except (json.JSONDecodeError, KeyError):
-        response = ""
-    (task / "terra-review.txt").write_text(response)
+        review_thread_id = codex_terra_review_completed(review_log, response)
+    except ValueError:
+        review_thread_id = None
     write_json(task / "installed-run.json", {
         "schema_version": "mavis.e0-installed-run/v1", "candidate": candidate,
         "mavis_log_sha256": sha256_file(task / "installed-mavis-repair.jsonl"),
         "terra_log_sha256": sha256_file(task / "terra-review.jsonl"),
+        "terra_stderr_sha256": sha256_file(task / "terra-review.stderr.log"),
+        "terra_text_sha256": sha256_file(review_text) if review_text.is_file() else None,
+        "review_argv": review_argv, "review_exit": review.returncode,
+        "review_thread_id": review_thread_id,
     })
     print(manifest_path)
-    return 0 if review.returncode == 0 and native_review_completed(review_log, response) else 1
+    return 0 if review.returncode == 0 and review_thread_id else 1
 
 
 if __name__ == "__main__":

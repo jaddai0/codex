@@ -233,6 +233,9 @@ class E0Evaluator:
 
     def _small_repository(self, case: str) -> dict[str, Any]:
         """Recheck an installed Mavis repair and its separate native Terra review."""
+        from .e0_tasks import small_repository_review_prompt
+        from .e2_tasks import codex_terra_review_completed, terra_review_command
+
         candidates = sorted(
             (self.root / "tasks").glob("*/manifest.json"),
             key=lambda path: path.stat().st_mtime,
@@ -242,15 +245,21 @@ class E0Evaluator:
             task_root = manifest_path.parent
             mavis_log = task_root / "installed-mavis-repair.jsonl"
             terra_log = task_root / "terra-review.jsonl"
+            terra_stderr = task_root / "terra-review.stderr.log"
             terra_result = task_root / "terra-review.txt"
             installed_run = task_root / "installed-run.json"
-            if not all(path.is_file() for path in (mavis_log, terra_log, terra_result, installed_run)):
+            if not all(path.is_file() for path in (mavis_log, terra_log, terra_stderr,
+                                                   terra_result, installed_run)):
                 continue
             observed_run = json.loads(installed_run.read_text())
             if observed_run.get("candidate") != installed_candidate_fingerprint():
                 continue
             if observed_run.get("mavis_log_sha256") != sha256_file(mavis_log) or observed_run.get("terra_log_sha256") != sha256_file(terra_log):
                 raise ValueError("E0 installed task logs changed after observation")
+            if (observed_run.get("terra_stderr_sha256") != sha256_file(terra_stderr)
+                    or observed_run.get("terra_text_sha256") != sha256_file(terra_result)
+                    or observed_run.get("review_exit") != 0):
+                raise ValueError("E0 Terra review output or exit changed")
             manifest = json.loads(manifest_path.read_text())
             repo = Path(manifest["repo"]).resolve()
             if repo != (task_root / "repo").resolve() or not repo.is_dir():
@@ -271,7 +280,15 @@ class E0Evaluator:
             mavis_events = [json.loads(line) for line in mavis_log.read_text().splitlines() if line.startswith("{")]
             terra_output = terra_log.read_text()
             mavis_finished = any(event.get("type") == "turn.completed" for event in mavis_events)
-            terra_finished = native_review_completed(terra_output, terra_result.read_text())
+            review_argv = terra_review_command(
+                repo, terra_result, small_repository_review_prompt(manifest_path))
+            if observed_run.get("review_argv") != review_argv:
+                raise ValueError("E0 Terra review command changed")
+            try:
+                terra_finished = observed_run.get("review_thread_id") == codex_terra_review_completed(
+                    terra_output, terra_result.read_text())
+            except ValueError:
+                terra_finished = False
             patch_seen = any(
                 event.get("type") == "item.completed"
                 and event.get("item", {}).get("type") == "file_change"

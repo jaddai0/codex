@@ -8,7 +8,8 @@ from unittest.mock import patch
 
 from mavis.evaluations import (E0_CASES, E0Evaluator, _safe_buried_inspection,
                                installed_candidate_fingerprint, native_review_completed)
-from mavis.e0_tasks import prepare_small_repository
+from mavis.e0_tasks import prepare_small_repository, small_repository_review_prompt
+from mavis.e2_tasks import terra_review_command
 from mavis.runtime import RuntimeConfig
 from mavis.storage import sha256_file
 
@@ -101,6 +102,52 @@ class E0EvaluationTests(unittest.TestCase):
             )
             self.assertNotEqual(result.returncode, 0)
             self.assertIn("test_discount_reduces_price", result.stderr)
+
+    def test_small_repository_requires_bound_native_terra_acceptance(self):
+        with tempfile.TemporaryDirectory() as directory:
+            home = Path(directory)
+            evaluator = E0Evaluator(home, RuntimeConfig(home=home))
+            manifest_path = prepare_small_repository(home)
+            task = manifest_path.parent
+            repo = (task / "repo").resolve()
+            (repo / "package" / "pricing.py").write_text(
+                "def apply_discount(subtotal: int, discount: int) -> int:\n"
+                "    return subtotal - discount\n")
+            mavis_log = task / "installed-mavis-repair.jsonl"
+            mavis_log.write_text(json.dumps({"type": "turn.completed"}) + "\n" + json.dumps({
+                "type": "item.completed", "item": {"type": "file_change", "changes": [
+                    {"path": str(repo / "package" / "pricing.py")}]}}) + "\n")
+            verdict = "ACCEPT: both tests pass and user notes are intact."
+            events = [
+                {"type": "thread.started", "thread_id": "native-terra"},
+                {"type": "turn.started"},
+                {"type": "item.completed", "item": {"type": "agent_message", "text": verdict}},
+                {"type": "turn.completed"},
+            ]
+            terra_log = task / "terra-review.jsonl"
+            terra_log.write_text("".join(json.dumps(event) + "\n" for event in events))
+            stderr = task / "terra-review.stderr.log"
+            stderr.write_text("")
+            review_text = task / "terra-review.txt"
+            review_text.write_text(verdict)
+            observed = {
+                "candidate": {"core_sha256": "a" * 64},
+                "mavis_log_sha256": sha256_file(mavis_log),
+                "terra_log_sha256": sha256_file(terra_log),
+                "terra_stderr_sha256": sha256_file(stderr),
+                "terra_text_sha256": sha256_file(review_text),
+                "review_argv": terra_review_command(
+                    repo, review_text, small_repository_review_prompt(manifest_path)),
+                "review_exit": 0, "review_thread_id": "native-terra",
+            }
+            (task / "installed-run.json").write_text(json.dumps(observed))
+            with patch("mavis.evaluations.installed_candidate_fingerprint",
+                       return_value=observed["candidate"]):
+                self.assertEqual(evaluator._small_repository("small-repository")["status"], "pass")
+                observed["review_argv"][3] = "another-model"
+                (task / "installed-run.json").write_text(json.dumps(observed))
+                with self.assertRaisesRegex(ValueError, "command changed"):
+                    evaluator._small_repository("small-repository")
 
     def test_full_e0_never_passes_when_real_worker_cases_are_missing(self):
         with tempfile.TemporaryDirectory() as directory:
