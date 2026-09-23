@@ -4,6 +4,7 @@ from pathlib import Path
 import fcntl
 import hashlib
 import json
+import tomllib
 import shutil
 import subprocess
 from typing import Any
@@ -12,6 +13,7 @@ from .evidence import parse_test_output, run_command
 from .experiments import ExperimentStore, _digest, candidate_assignment_requirements
 from .gateway import harness_assignment_start
 from .objectives import _validate_gateway_status
+from .package_provenance import package_tree_sha256
 from .storage import read_json, require_safe_id, sha256_file, write_json
 
 
@@ -174,7 +176,8 @@ def _argv_hash(argv: list[str]) -> str:
 
 
 def _trial_hashes(root: Path, home: Path, record: dict[str, Any], case: dict[str, Any],
-                  arm: str, result: dict[str, Any]) -> dict[str, str]:
+                  arm: str, result: dict[str, Any],
+                  bootstrap_cache: dict[str, Any] | None = None) -> dict[str, Any]:
     """Recheck the installed host's launch and core observation for one checked case.
 
     This proves startup identity and the source of the checked checkout. The
@@ -257,32 +260,88 @@ def _trial_hashes(root: Path, home: Path, record: dict[str, Any], case: dict[str
     if (not effective.strip() or paths["instructions"].read_text(encoding="utf-8") != effective):
         raise ValueError("native E1 instruction bytes differ from frozen prompt")
     package_path = Path(trial.get("package_manifest") or "")
+    if package_path.resolve() != (core.parent / "install-manifest.json").resolve():
+        raise ValueError("native E1 package manifest is outside the installed core")
     package = read_json(package_path)
     launcher = Path(package.get("launcher", ""))
     runtime_source = package_path.parent / "trial_runtime.py"
+    installed_inputs = {
+        "trial_runtime": runtime_source,
+        "launch_core": package_path.parent / "launch_core.py",
+        "prepare_runtime": package_path.parent / "prepare_runtime.py",
+        "generation_lease": package_path.parent / "generation_lease.py",
+        "base_instructions": package_path.parent / "base-instructions.md",
+        "persona": package_path.parent / "persona.toml",
+    }
     if (trial.get("package_manifest_sha256") != sha256_file(package_path)
             or package.get("schema_version") != "mavis.installed-core/v1"
             or package.get("core_binary") != str(core.resolve())
             or package.get("core_sha256") != trial["core_sha256"]
-            or package.get("trial_runtime_sha256") != sha256_file(runtime_source)
+            or any(package.get(f"{name}_sha256") != sha256_file(path)
+                   for name, path in installed_inputs.items())
+            or package.get("mavis_package_sha256") != package_tree_sha256(package_path.parent / "mavis")
             or not launcher.is_file()
             or package.get("launcher_sha256") != sha256_file(launcher)):
         raise ValueError("native E1 installed core provenance changed")
-    profile_path = Path(trial.get("accepted_profile_path") or "")
-    if (not trial.get("accepted_profile_id")
-            or trial.get("accepted_profile_sha256") != sha256_file(profile_path)):
-        raise ValueError("native E1 accepted profile changed")
-    profile = read_json(profile_path)
-    if (profile.get("profile_id") != trial["accepted_profile_id"]
-            or profile.get("model_identity", {}).get("model_id") != trial["selected_model"]):
-        raise ValueError("native E1 model differs from accepted profile")
-    pointer = read_json(Path(home) / "profiles" / "main" / "active.json")
-    version = pointer.get("version")
-    if (type(version) is not int or version < 1
-            or profile_path.resolve() != (Path(home) / "profiles" / "main" / f"v{version}.json").resolve()
-            or pointer.get("path") != str(profile_path.resolve())
-            or profile.get("status") != "active" or profile.get("role") != "main"):
-        raise ValueError("native E1 accepted main profile pointer changed")
+    source = trial.get("profile_source", "accepted-main")
+    if source == "accepted-main":
+        if trial.get("bootstrap_receipt_path") is not None or trial.get("bootstrap_receipt_sha256") is not None:
+            raise ValueError("native E1 accepted profile has a bootstrap binding")
+        profile_path = Path(trial.get("accepted_profile_path") or "")
+        if (not trial.get("accepted_profile_id")
+                or trial.get("accepted_profile_sha256") != sha256_file(profile_path)):
+            raise ValueError("native E1 accepted profile changed")
+        profile = read_json(profile_path)
+        if (profile.get("profile_id") != trial["accepted_profile_id"]
+                or profile.get("model_identity", {}).get("model_id") != trial["selected_model"]):
+            raise ValueError("native E1 model differs from accepted profile")
+        pointer = read_json(Path(home) / "profiles" / "main" / "active.json")
+        version = pointer.get("version")
+        if (type(version) is not int or version < 1
+                or profile_path.resolve() != (Path(home) / "profiles" / "main" / f"v{version}.json").resolve()
+                or pointer.get("path") != str(profile_path.resolve())
+                or profile.get("status") != "active" or profile.get("role") != "main"):
+            raise ValueError("native E1 accepted main profile pointer changed")
+        profile_hashes = {"profile": sha256_file(profile_path)}
+    elif source == "e0-bootstrap":
+        if any(trial.get(key) is not None for key in (
+            "accepted_profile_id", "accepted_profile_path", "accepted_profile_sha256"
+        )):
+            raise ValueError("native E1 bootstrap trial contains an accepted-profile claim")
+        bootstrap_path = Path(home) / "e1" / "bootstrap" / "main.json"
+        if (trial.get("bootstrap_receipt_path") != str(bootstrap_path.resolve())
+                or trial.get("bootstrap_receipt_sha256") != sha256_file(bootstrap_path)):
+            raise ValueError("native E1 bootstrap receipt changed")
+        from .e1_bootstrap import validate_bootstrap
+
+        if bootstrap_cache is None:
+            bootstrap = validate_bootstrap(Path(home))
+        else:
+            if "validated" not in bootstrap_cache:
+                bootstrap_cache["validated"] = validate_bootstrap(Path(home))
+            bootstrap = bootstrap_cache["validated"]
+        config = tomllib.loads(paths["config"].read_text(encoding="utf-8"))
+        endpoint = config.get("model_providers", {}).get("omlx", {}).get("base_url")
+        if not isinstance(endpoint, str) or trial.get("model_endpoint") != endpoint:
+            raise ValueError("native E1 bootstrap model endpoint changed")
+        if (bootstrap.get("_source_path") != str(bootstrap_path.resolve())
+                or bootstrap.get("_source_sha256") != trial["bootstrap_receipt_sha256"]
+                or bootstrap.get("model_identity", {}).get("model_id") != trial["selected_model"]
+                or bootstrap.get("baseline") != {
+                    "path": record["baseline"]["path"],
+                    "sha256": record["baseline"]["sha256"],
+                }
+                or bootstrap.get("package_manifest") != {
+                    "path": str(package_path.resolve()), "sha256": sha256_file(package_path)
+                }):
+            raise ValueError("native E1 bootstrap differs from frozen model or baseline")
+        profile_hashes = {"bootstrap_receipt": sha256_file(bootstrap_path)}
+        for name in ("e0_summary", "independent_review", "review_assignment", "baseline"):
+            ref = bootstrap[name]
+            profile_hashes[f"bootstrap_{name}"] = sha256_file(Path(ref["path"]))
+        profile_hashes["bootstrap_model_artifacts"] = bootstrap["model_artifacts"]["files"]
+    else:
+        raise ValueError("native E1 trial has an unsupported profile source")
     event = read_json(paths["observation"])
     event_expected = {
         "schema_version": "mavis.e1-effective-config/v1", "trial_id": trial["trial_id"],
@@ -314,8 +373,10 @@ def _trial_hashes(root: Path, home: Path, record: dict[str, Any], case: dict[str
             if sha256_file(target) != trial.get(digest_key):
                 raise ValueError("native E1 gateway source changed")
     return {"receipt": sha256_file(trial_path), "transcript": sha256_file(transcript_path),
-            "package": sha256_file(package_path), "profile": sha256_file(profile_path),
+            "package": sha256_file(package_path), **profile_hashes,
             "base_instructions": sha256_file(template_path), "snapshot": sha256_file(snapshot_path),
+            "installed_inputs": {name: sha256_file(path) for name, path in installed_inputs.items()},
+            "installed_mavis_package": package_tree_sha256(package_path.parent / "mavis"),
             **{name: sha256_file(path) for name, path in paths.items()}}
 
 
@@ -337,6 +398,7 @@ def validate_e1_bundle(home: Path, record: dict[str, Any], *, require_trials: bo
         "cases": {},
     }
     scores = {}
+    bootstrap_cache: dict[str, Any] = {}
     for arm in ("baseline", "candidate"):
         bundle["cases"][arm] = {}
         passes = {}
@@ -395,7 +457,9 @@ def validate_e1_bundle(home: Path, record: dict[str, Any], *, require_trials: bo
                 "checks": check_hashes,
             }
             if require_trials or (record.get("comparison") and record["comparison"][arm].get("e1_native_trial")):
-                bundle["cases"][arm][case_id]["trial"] = _trial_hashes(root, home, record, case, arm, result)
+                bundle["cases"][arm][case_id]["trial"] = _trial_hashes(
+                    root, home, record, case, arm, result, bootstrap_cache
+                )
         scores[arm] = sum(passes[case_id] for case_id in manifest["held_out"]) / len(
             manifest["held_out"]
         )
@@ -635,7 +699,9 @@ class E1Runner:
             candidate = trials["candidate"][case["id"]]
             if any(baseline.get(key) != candidate.get(key) for key in (
                 "selected_model", "model_provider", "core_binary", "core_sha256",
-                "package_manifest_sha256", "accepted_profile_id", "accepted_profile_sha256",
+                "package_manifest_sha256", "profile_source", "accepted_profile_id", "accepted_profile_sha256",
+                "bootstrap_receipt_path", "bootstrap_receipt_sha256",
+                "model_endpoint",
                 "gateway_launcher_sha256", "gateway_env_sha256",
             )):
                 raise ValueError("native E1 arms did not use the same installed model and core")
@@ -643,7 +709,9 @@ class E1Runner:
                 raise ValueError("native E1 arms used the same effective prompt")
             identity = tuple(baseline.get(key) for key in (
                 "selected_model", "model_provider", "core_binary", "core_sha256",
-                "package_manifest_sha256", "accepted_profile_id", "accepted_profile_sha256",
+                "package_manifest_sha256", "profile_source", "accepted_profile_id", "accepted_profile_sha256",
+                "bootstrap_receipt_path", "bootstrap_receipt_sha256",
+                "model_endpoint",
             ))
             if common_identity is None:
                 common_identity = identity

@@ -240,9 +240,9 @@ class ExperimentStore:
             record = self._load(experiment_id)
             if record["state"] != "compared":
                 raise ValueError("only a compared candidate can be reviewed")
-            self._check_comparison(record)
             if record["comparison"]["candidate"].get("e1_native_trial"):
                 raise ValueError("native E1 trial needs a separate installed-trial review adapter before staging")
+            self._check_comparison(record)
             path = Path(receipt_path).resolve()
             if (self.home / "verifications" / "experiments").resolve() != path.parent:
                 raise ValueError("review receipt must be in the separate verification store")
