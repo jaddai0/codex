@@ -1,6 +1,7 @@
 from pathlib import Path
 import hashlib
 import json
+import copy
 import signal
 import subprocess
 import tempfile
@@ -140,6 +141,13 @@ class E1RunnerTests(unittest.TestCase):
         package_dir = share / "mavis"
         package_dir.mkdir(exist_ok=True)
         (package_dir / "__init__.py").write_text("# fixture package\n")
+        committed_package = self.repo / "local-codex/mavis/mavis/__init__.py"
+        if not committed_package.exists():
+            committed_package.parent.mkdir(parents=True)
+            committed_package.write_bytes((package_dir / "__init__.py").read_bytes())
+            subprocess.run(["git", "-C", str(self.repo), "add", "local-codex/mavis/mavis/__init__.py"], check=True)
+            subprocess.run(["git", "-C", str(self.repo), "commit", "-qm", "fixture package"], check=True)
+        source_revision = subprocess.check_output(["git", "-C", str(self.repo), "rev-parse", "HEAD"], text=True).strip()
         launcher = self.root / "installed-mavis-command"
         launcher.write_text("fixture launcher")
         package_path = share / "install-manifest.json"
@@ -154,6 +162,7 @@ class E1RunnerTests(unittest.TestCase):
             "base_instructions_sha256": sha256_file(template),
             "persona_sha256": sha256_file(share / "persona.toml"),
             "mavis_package_sha256": package_tree_sha256(package_dir),
+            "source_repository": str(self.repo), "source_revision": source_revision,
         })
         profile = self.home / "profiles" / "main" / "v1.json"
         write_json(profile, {"profile_id": "accepted", "role": "main", "status": "active",
@@ -429,93 +438,165 @@ class E1RunnerTests(unittest.TestCase):
         self._paired_trials()
         (self.home / "profiles/main/active.json").unlink()
         package = self.root / "installed-share/install-manifest.json"
-        fingerprint = {"core_sha256": read_json(package)["core_sha256"], "service_sha256": "b" * 64}
+        fingerprint = {
+            "core_sha256": read_json(package)["core_sha256"],
+            "service_sha256": "b" * 64,
+        }
         e0 = self.home / "evaluations/e0"
         case_hashes = {}
         for case in E0_CASES:
             path = e0 / f"{case}.json"
-            write_json(path, {"schema_version": "mavis.evaluation-case/v1", "suite": "e0",
-                              "case": case, "status": "pass", "evidence": ["host fixture"]})
+            write_json(
+                path,
+                {
+                    "schema_version": "mavis.evaluation-case/v1",
+                    "suite": "e0",
+                    "case": case,
+                    "status": "pass",
+                    "evidence": ["host fixture"],
+                },
+            )
             case_hashes[case] = sha256_file(path)
         summary = e0 / "summary.json"
-        write_json(summary, {
-            "schema_version": "mavis.evaluation-suite/v1", "suite": "e0", "status": "pass",
-            "mandatory_cases": list(E0_CASES),
-            "results": [{"case": case, "status": "pass"} for case in E0_CASES],
-            "installed_candidate": fingerprint, "model_id": "exact-model",
-            "case_receipts": case_hashes,
-        })
+        write_json(
+            summary,
+            {
+                "schema_version": "mavis.evaluation-suite/v1",
+                "suite": "e0",
+                "status": "pass",
+                "mandatory_cases": list(E0_CASES),
+                "results": [{"case": case, "status": "pass"} for case in E0_CASES],
+                "installed_candidate": fingerprint,
+                "model_id": "exact-model",
+                "case_receipts": case_hashes,
+            },
+        )
         model_root = self.root / "models"
         model_path = model_root / "exact-model"
         model_path.mkdir(parents=True)
-        write_json(model_path / "config.json", {
-            "architectures": ["QwenFixture"], "quantization": {"bits": 4},
-        })
+        write_json(
+            model_path / "config.json",
+            {
+                "architectures": ["QwenFixture"],
+                "quantization": {"bits": 4},
+            },
+        )
         write_json(model_path / "tokenizer.json", {"version": "fixture"})
         write_json(model_path / "tokenizer_config.json", {"bos_token": "<s>"})
         (model_path / "chat_template.jinja").write_text("{{ prompt }}")
         (model_path / "model-00001.safetensors").write_bytes(b"weights-one")
-        owner = {"provider": "zcode", "model": "zcode-reviewer", "harness": "zcode"}
+        owner = {"provider": "zai", "model": "zcode-reviewer", "harness": "zcode"}
         assignment_path = self.home / "e1/bootstrap/review-assignment.json"
         review = self.home / "verifications/e1-bootstrap/main.json"
+        gateway_dir = self.root / "bootstrap-gateway-job"
+        gateway_dir.mkdir()
+        gateway_assignment = gateway_dir / "assignment.json"
+        gateway_report = gateway_dir / "report.md"
+
+        def start(arguments):
+            saved = {key: value for key, value in arguments.items() if key != "job_id"}
+            saved.update(report_dir="", verifier_required=True)
+            write_json(gateway_assignment, saved)
+            return {
+                "success": True,
+                "started": True,
+                "accepted": False,
+                "job_id": arguments["job_id"],
+                "job_dir": str(gateway_dir),
+                "assignment_path": str(gateway_assignment),
+                "report_path": str(gateway_report),
+            }
 
         def status(job_id):
+            target = "c" * 64
             return {
-                "job_id": job_id, "state": "completed", "exit_code": 0, "accepted": True,
+                "job_id": job_id,
+                "state": "completed",
+                "exit_code": 0,
+                "accepted": True,
                 "receipt": {"job_id": job_id, "exit_code": 0},
-                "acceptance": {"accepted": True, "job_id": job_id, "verifier": "terra",
-                               "verifier_job_id": "terra-job",
-                               "target_sha256": sha256_file(assignment_path),
-                               "evidence_sha256": "b" * 64,
-                               "report_sha256_on_disk": sha256_file(review),
-                               "verifier_verdict_sha256": "d" * 64},
+                "acceptance": {
+                    "accepted": True,
+                    "job_id": job_id,
+                    "verifier": "terra",
+                    "verifier_job_id": "review-job-terra",
+                    "target_sha256": target,
+                    "evidence_sha256": "b" * 64,
+                    "report_sha256_on_disk": sha256_file(gateway_report),
+                    "verifier_verdict_sha256": "d" * 64,
+                },
                 "mavis_binding": {
-                    "schema_version": "mavis.e1-bootstrap-gateway-binding/v1",
-                    "objective_id": "e1-bootstrap-main", "scope": "main",
-                    "cwd": assignment["cwd"], "owner": owner,
+                    "schema_version": "model-gateway-mavis-objective-binding/v1",
+                    "objective_id": "e1-bootstrap-main",
+                    "cwd": assignment["cwd"],
+                    "owner": owner,
                     "starting_revision": assignment["starting_revision"],
                     "changed_revision": assignment["starting_revision"],
                     "owned_paths": assignment["owned_paths"],
                     "requirements": assignment["requirements"],
                     "required_checks": assignment["required_checks"],
-                    "assignment_sha256": sha256_file(assignment_path),
-                    "report_sha256": sha256_file(review),
-                    "target_sha256": sha256_file(assignment_path),
+                    "assignment_sha256": sha256_file(gateway_assignment),
+                    "report_sha256": sha256_file(gateway_report),
+                    "target_sha256": target,
                 },
             }
+
         for name, value in (
             ("installed_candidate_fingerprint", lambda: fingerprint),
             ("_package_manifest_path", lambda: package),
             ("_model_root_path", lambda: model_root),
-            ("inventory", lambda _endpoint: [{"id": "exact-model", "model_path": str(model_path.resolve())}]),
+            (
+                "inventory",
+                lambda _endpoint: [
+                    {"id": "exact-model", "model_path": str(model_path.resolve())}
+                ],
+            ),
             ("harness_job_status", status),
         ):
             active_patch = patch.object(e1_bootstrap, name, value)
             active_patch.start()
             self.addCleanup(active_patch.stop)
         assignment = e1_bootstrap.prepare_bootstrap_review(
-            self.home, owner,
-            inventory_reader=lambda _: [{"id": "exact-model", "model_path": str(model_path.resolve())}],
+            self.home,
+            owner,
+            inventory_reader=lambda _: [
+                {"id": "exact-model", "model_path": str(model_path.resolve())}
+            ],
         )
+        e1_bootstrap.dispatch_bootstrap_review(self.home, "review-job", starter=start)
         baseline = self.runner.store.active("main")["configuration"]
-        write_json(review, {
-            "schema_version": "mavis.e1-bootstrap-review/v1", "verdict": "accepted",
-            "e0_summary_sha256": sha256_file(summary), "baseline_sha256": baseline["sha256"],
-            "package_manifest_sha256": sha256_file(package),
-            "installed_candidate_digest": e1_bootstrap._digest(fingerprint),
-            "model_identity_digest": e1_bootstrap._digest(assignment["model_identity"]),
-            "assignment_sha256": sha256_file(assignment_path),
-            "gateway_worker_job_id": "review-job", "verifier_job_id": "terra-job",
-        })
+        write_json(
+            gateway_report,
+            {
+                "schema_version": "mavis.e1-bootstrap-review/v1",
+                "verdict": "accepted",
+                "e0_summary_sha256": sha256_file(summary),
+                "baseline_sha256": baseline["sha256"],
+                "package_manifest_sha256": sha256_file(package),
+                "installed_candidate_digest": e1_bootstrap._digest(fingerprint),
+                "model_identity_digest": e1_bootstrap._digest(
+                    assignment["model_identity"]
+                ),
+                "assignment_sha256": sha256_file(assignment_path),
+                "gateway_worker_job_id": "review-job",
+                "verifier_job_id": "review-job-terra",
+            },
+        )
+        e1_bootstrap.check_bootstrap_review(self.home, gateway_report)
+        e1_bootstrap.import_bootstrap_review_report(self.home, status_reader=status)
         bootstrap = e1_bootstrap.create_bootstrap(self.home, review)
         for arm in ("baseline", "candidate"):
             for case_id in ("regression", "held-a", "held-b"):
                 path = self.home / "e1" / "repair" / "trials" / arm / f"{case_id}.json"
                 receipt = read_json(path)
-                receipt.update(profile_source="e0-bootstrap", accepted_profile_id=None,
-                               accepted_profile_path=None, accepted_profile_sha256=None,
-                               bootstrap_receipt_path=bootstrap["_source_path"],
-                               bootstrap_receipt_sha256=bootstrap["_source_sha256"])
+                receipt.update(
+                    profile_source="e0-bootstrap",
+                    accepted_profile_id=None,
+                    accepted_profile_path=None,
+                    accepted_profile_sha256=None,
+                    bootstrap_receipt_path=bootstrap["_source_path"],
+                    bootstrap_receipt_sha256=bootstrap["_source_sha256"],
+                )
                 write_json(path, receipt)
         return bootstrap, summary, review, package
 
@@ -826,6 +907,79 @@ class E1RunnerTests(unittest.TestCase):
         review.write_bytes(review.read_bytes() + b" ")
         with self.assertRaises(ValueError):
             self.runner.store._check_comparison(self.runner.store.load("repair"))
+
+    def test_bootstrap_gateway_status_rejects_forged_or_revoked_acceptance(self):
+        self._paired_bootstrap_trials()
+        original = e1_bootstrap.harness_job_status("review-job")
+        for name, mutate in (
+            ("revoked", lambda value: value.update(accepted=False)),
+            (
+                "wrong target",
+                lambda value: value["acceptance"].update(target_sha256="0" * 64),
+            ),
+            (
+                "wrong gateway assignment",
+                lambda value: value["mavis_binding"].update(assignment_sha256="0" * 64),
+            ),
+            (
+                "wrong owner",
+                lambda value: value["mavis_binding"].update(
+                    owner={"provider": "forged"}
+                ),
+            ),
+            (
+                "stale revision",
+                lambda value: value["mavis_binding"].update(changed_revision="0" * 40),
+            ),
+        ):
+            with self.subTest(name=name):
+                forged = copy.deepcopy(original)
+                mutate(forged)
+                with patch.object(
+                    e1_bootstrap, "harness_job_status", return_value=forged
+                ):
+                    with self.assertRaises(ValueError):
+                        e1_bootstrap.validate_bootstrap(self.home)
+
+
+    def test_bootstrap_review_checkout_rejects_stale_installed_source(self):
+        self._paired_bootstrap_trials()
+        checkout = self.home / "e1/bootstrap/review-checkout"
+        (checkout / "local-codex/mavis/mavis/__init__.py").write_text("# changed\n")
+        with self.assertRaisesRegex(ValueError, "checkout has changed files"):
+            e1_bootstrap.validate_bootstrap(self.home)
+
+
+    def test_bootstrap_prepare_reuses_only_exact_orphan_checkout(self):
+        _, _, review, _ = self._paired_bootstrap_trials()
+        packet = self.home / "e1/bootstrap/review-assignment.json"
+        original = read_json(packet)
+        for path in (
+            packet,
+            self.home / "e1/bootstrap/review-dispatch.json",
+            self.home / "e1/bootstrap/main.json",
+            review,
+        ):
+            path.unlink()
+        owner = original["owner"]
+        inventory_reader = lambda _: [
+            {
+                "id": "exact-model",
+                "model_path": str((self.root / "models/exact-model").resolve()),
+            }
+        ]
+        recovered = e1_bootstrap.prepare_bootstrap_review(
+            self.home, owner, inventory_reader=inventory_reader
+        )
+        self.assertEqual(recovered["cwd"], original["cwd"])
+        self.assertEqual(recovered["starting_revision"], original["starting_revision"])
+        packet.unlink()
+        (Path(original["cwd"]) / "stray.txt").write_text("unreviewed")
+        with self.assertRaisesRegex(ValueError, "checkout has changed files"):
+            e1_bootstrap.prepare_bootstrap_review(
+                self.home, owner, inventory_reader=inventory_reader
+            )
+
 
     def test_native_bootstrap_model_bytes_invalidate_recorded_comparison(self):
         self._paired_bootstrap_trials()
