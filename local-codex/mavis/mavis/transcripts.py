@@ -100,8 +100,10 @@ class TranscriptArchive:
 
     @staticmethod
     def _read_json_at(directory_fd: int, name: str) -> dict[str, Any]:
-        descriptor = os.open(name, os.O_RDONLY | os.O_NOFOLLOW, dir_fd=directory_fd)
+        descriptor = os.open(name, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK, dir_fd=directory_fd)
         with os.fdopen(descriptor, "r", encoding="utf-8") as stream:
+            if not stat.S_ISREG(os.fstat(stream.fileno()).st_mode):
+                raise ValueError("archive JSON is not a regular file")
             value = json.load(stream)
         if not isinstance(value, dict):
             raise ValueError("archive manifest must be an object")
@@ -228,6 +230,7 @@ class TranscriptArchive:
         handoff["schema_version"] = "mavis.compaction-handoff/v1"
         handoff["conversation_id"] = self.conversation_id
         handoff["manifest"] = str(self.manifest_path.resolve())
+        handoff["manifest_sha256"] = sha256_file(self.manifest_path)
         handoff["written_at"] = datetime.now(timezone.utc).isoformat()
         path = self.root / "handoffs" / f"{uuid.uuid4().hex}.json"
         try:
@@ -241,7 +244,67 @@ class TranscriptArchive:
             self._write_json_at(handoffs_fd, path.name, handoff)
         finally:
             os.close(handoffs_fd)
+        self._write_json_at(root_fd, "latest-handoff.json", {
+            "schema_version": "mavis.latest-handoff/v1",
+            "conversation_id": self.conversation_id,
+            "name": path.name,
+            "sha256": sha256_file(path),
+        })
         return path
+
+    def load_latest_handoff(self) -> dict[str, Any] | None:
+        """Read the committed handoff and verify its archived source evidence."""
+        with self._locked() as root_fd:
+            if not (self.root / "latest-handoff.json").exists():
+                if (self.root / "handoffs").exists() and any(
+                    (self.root / "handoffs").iterdir()
+                ):
+                    raise ValueError("handoff pointer is missing")
+                return None
+            pointer = self._read_json_at(root_fd, "latest-handoff.json")
+            name = pointer.get("name")
+            if (pointer.get("schema_version") != "mavis.latest-handoff/v1"
+                    or pointer.get("conversation_id") != self.conversation_id
+                    or not isinstance(name, str)
+                    or len(name) != 37 or not name.endswith(".json")
+                    or any(char not in "0123456789abcdef" for char in name[:-5])):
+                raise ValueError("handoff pointer is invalid")
+            handoffs_fd = os.open("handoffs", os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW,
+                                  dir_fd=root_fd)
+            try:
+                descriptor = os.open(name, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK,
+                                     dir_fd=handoffs_fd)
+                with os.fdopen(descriptor, "rb") as stream:
+                    if not stat.S_ISREG(os.fstat(stream.fileno()).st_mode):
+                        raise ValueError("handoff is not a regular file")
+                    if os.fstat(stream.fileno()).st_size > 16_384:
+                        raise ValueError("handoff exceeds archive size limit")
+                    raw = stream.read()
+            finally:
+                os.close(handoffs_fd)
+            if hashlib.sha256(raw).hexdigest() != pointer.get("sha256"):
+                raise ValueError("handoff changed after recording")
+            handoff = json.loads(raw)
+            if (not isinstance(handoff, dict)
+                    or handoff.get("schema_version") != "mavis.compaction-handoff/v1"
+                    or handoff.get("conversation_id") != self.conversation_id
+                    or handoff.get("manifest") != str(self.manifest_path.resolve())
+                    or not all(isinstance(handoff.get(field), list) for field in HANDOFF_FIELDS)
+                    or not isinstance(handoff.get("unknown_fields"), list)
+                    or not isinstance(handoff.get("source_turn_id"), str)
+                    or not handoff["source_turn_id"]):
+                raise ValueError("handoff metadata is invalid")
+            if self.manifest_path.is_symlink() or sha256_file(self.manifest_path) != handoff.get("manifest_sha256"):
+                raise ValueError("handoff manifest changed after recording")
+            manifest = self._read_json_at(root_fd, "manifest.json")
+            if (manifest.get("schema_version") != "mavis.transcript-manifest/v1"
+                    or manifest.get("conversation_id") != self.conversation_id
+                    or not isinstance(manifest.get("segments"), list)
+                    or not manifest["segments"]):
+                raise ValueError("handoff manifest is invalid")
+            for segment in manifest["segments"]:
+                self.verify_segment(segment)
+            return handoff
 
     def resolve_segment_file(self, declared_path: str | Path) -> Path:
         """Resolve and validate a manifest segment path.

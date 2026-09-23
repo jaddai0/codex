@@ -61,6 +61,79 @@ class ArchiveSearchCliTests(unittest.TestCase):
 
 
 class ObjectiveCliTests(unittest.TestCase):
+    def test_missing_handoff_blocks_compact_but_allows_first_resume(self):
+        with tempfile.TemporaryDirectory() as directory:
+            request = {"hook_event_name": "SessionStart", "session_id": "session-new", "source": "resume"}
+            for source, expected in (("resume", True), ("compact", False)):
+                request["source"] = source
+                output = io.StringIO()
+                with patch.dict(os.environ, {"MAVIS_HOME": directory}), patch("sys.stdin", io.StringIO(json.dumps(request))), contextlib.redirect_stdout(output):
+                    self.assertEqual(main(["compaction-handoff"]), 0)
+                self.assertEqual(json.loads(output.getvalue())["continue"], expected)
+
+    def test_compaction_handoff_reaches_compact_and_resume_context(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            codex_home = root / "codex"
+            codex_home.mkdir()
+            rollout = codex_home / "rollout.jsonl"
+            rollout.write_text(
+                json.dumps({"type": "session_meta", "payload": {"id": "session-3"}}) + "\n"
+            )
+            environment = {"MAVIS_HOME": str(root / "mavis"), "CODEX_HOME": str(codex_home)}
+            pre = {"hook_event_name": "PreCompact", "session_id": "session-3",
+                   "turn_id": "turn-3", "trigger": "manual", "transcript_path": str(rollout)}
+            with patch.dict(os.environ, environment), patch("sys.stdin", io.StringIO(json.dumps(pre))), contextlib.redirect_stdout(io.StringIO()):
+                self.assertEqual(main(["pre-compact"]), 0)
+            for source in ("compact", "resume"):
+                output = io.StringIO()
+                request = {"hook_event_name": "SessionStart", "session_id": "session-3", "source": source}
+                with patch.dict(os.environ, environment), patch("sys.stdin", io.StringIO(json.dumps(request))), contextlib.redirect_stdout(output):
+                    self.assertEqual(main(["compaction-handoff"]), 0)
+                result = json.loads(output.getvalue())
+                self.assertTrue(result["continue"])
+                context = result["hookSpecificOutput"]["additionalContext"]
+                self.assertIn('"source_turn_id": "turn-3"', context)
+                self.assertIn('"manifest_sha256":', context)
+                self.assertIn('"unknown_fields":', context)
+            output = io.StringIO()
+            request["source"] = "startup"
+            with patch.dict(os.environ, environment), patch("sys.stdin", io.StringIO(json.dumps(request))), contextlib.redirect_stdout(output):
+                self.assertEqual(main(["compaction-handoff"]), 0)
+            self.assertEqual(json.loads(output.getvalue()), {"continue": True})
+            with rollout.open("a", encoding="utf-8") as stream:
+                stream.write(json.dumps({"type": "event_msg", "payload": {"type": "task_complete"}}) + "\n")
+            pre["turn_id"] = "turn-4"
+            with patch.dict(os.environ, environment), patch("sys.stdin", io.StringIO(json.dumps(pre))), contextlib.redirect_stdout(io.StringIO()):
+                self.assertEqual(main(["pre-compact"]), 0)
+            request["source"] = "compact"
+            output = io.StringIO()
+            with patch.dict(os.environ, environment), patch("sys.stdin", io.StringIO(json.dumps(request))), contextlib.redirect_stdout(output):
+                self.assertEqual(main(["compaction-handoff"]), 0)
+            context = json.loads(output.getvalue())["hookSpecificOutput"]["additionalContext"]
+            self.assertIn('"source_turn_id": "turn-4"', context)
+            self.assertNotIn('"source_turn_id": "turn-3"', context)
+
+    def test_compaction_handoff_stops_on_changed_evidence(self):
+        for target in ("handoff", "manifest", "segment", "pointer"):
+            with self.subTest(target=target), tempfile.TemporaryDirectory() as directory:
+                home = Path(directory)
+                archive = TranscriptArchive(home, "session-4")
+                segment = archive.append_segment([{"type": "session_meta", "payload": {"id": "session-4"}}])
+                handoff = archive.write_handoff({
+                    "goals": [], "accepted_decisions": [], "completed_requirements": [],
+                    "current_changes": [], "recent_work": [], "unresolved_failures": [],
+                    "evidence_links": [], "unknown_fields": [], "source_turn_id": "turn-4",
+                })
+                changed = {"handoff": handoff, "manifest": archive.manifest_path,
+                           "segment": segment, "pointer": archive.root / "latest-handoff.json"}[target]
+                changed.write_bytes(b"{}" if target == "pointer" else changed.read_bytes() + b" ")
+                request = {"hook_event_name": "SessionStart", "session_id": "session-4", "source": "compact"}
+                output = io.StringIO()
+                with patch.dict(os.environ, {"MAVIS_HOME": str(home)}), patch("sys.stdin", io.StringIO(json.dumps(request))), contextlib.redirect_stdout(output):
+                    self.assertEqual(main(["compaction-handoff"]), 0)
+                self.assertFalse(json.loads(output.getvalue())["continue"])
+
     def test_pre_compact_imports_matching_rollout_and_writes_handoff(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)

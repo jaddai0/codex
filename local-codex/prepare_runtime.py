@@ -21,20 +21,26 @@ ALLOWED_HOSTS = {"127.0.0.1", "localhost", "::1"}
 SUPPORTED_MODEL_TYPES = {"llm", "vlm"}
 MAVIS_ARCHIVE_COMMAND = "python3 -m mavis pre-compact"
 MAVIS_ARCHIVE_STATUS = "Mavis transcript archive v1"
+MAVIS_HANDOFF_COMMAND = "python3 -m mavis compaction-handoff"
+MAVIS_HANDOFF_STATUS = "Mavis verified compaction handoff v1"
 
 
 def mavis_archive_hook_hash() -> str:
+    return mavis_command_hook_hash("pre_compact", MAVIS_ARCHIVE_COMMAND, MAVIS_ARCHIVE_STATUS)
+
+
+def mavis_command_hook_hash(event_name: str, command: str, status: str) -> str:
     # Mirrors Codex's normalized TOML hook identity: absent fields are omitted,
     # and the command timeout defaults to 600 seconds.
     identity = {
-        "event_name": "pre_compact",
+        "event_name": event_name,
         "hooks": [
             {
                 "type": "command",
-                "command": MAVIS_ARCHIVE_COMMAND,
+                "command": command,
                 "timeout": 600,
                 "async": False,
-                "statusMessage": MAVIS_ARCHIVE_STATUS,
+                "statusMessage": status,
             }
         ],
     }
@@ -313,6 +319,10 @@ def write_profile(
     catalog_path = home / "omlx-models.json"
     hook_key = f"{(home / 'config.toml').resolve()}:pre_compact:0:0"
     hook_hash = mavis_archive_hook_hash()
+    handoff_hook_key = f"{(home / 'config.toml').resolve()}:session_start:0:0"
+    handoff_hook_hash = mavis_command_hook_hash(
+        "session_start", MAVIS_HANDOFF_COMMAND, MAVIS_HANDOFF_STATUS
+    )
     instructions_line = (f"model_instructions_file = {json.dumps(str(accepted_instructions_path.resolve()))}\n"
                          if accepted_instructions_path else "")
     profile = f"""model = {json.dumps(selected)}
@@ -350,6 +360,16 @@ statusMessage = {json.dumps(MAVIS_ARCHIVE_STATUS)}
 
 [hooks.state.{json.dumps(hook_key)}]
 trusted_hash = {json.dumps(hook_hash)}
+
+[[hooks.SessionStart]]
+
+[[hooks.SessionStart.hooks]]
+type = "command"
+command = {json.dumps(MAVIS_HANDOFF_COMMAND)}
+statusMessage = {json.dumps(MAVIS_HANDOFF_STATUS)}
+
+[hooks.state.{json.dumps(handoff_hook_key)}]
+trusted_hash = {json.dumps(handoff_hook_hash)}
 
 [model_providers.omlx]
 name = "Local oMLX"

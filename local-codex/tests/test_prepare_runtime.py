@@ -391,6 +391,18 @@ class PrepareRuntimeTests(unittest.TestCase):
                 parsed["hooks"]["state"][key]["trusted_hash"],
                 prepare_runtime.mavis_archive_hook_hash(),
             )
+            self.assertEqual(
+                parsed["hooks"]["SessionStart"][0]["hooks"][0]["command"],
+                "python3 -m mavis compaction-handoff",
+            )
+            handoff_key = f"{(home / 'config.toml').resolve()}:session_start:0:0"
+            self.assertEqual(
+                parsed["hooks"]["state"][handoff_key]["trusted_hash"],
+                prepare_runtime.mavis_command_hook_hash(
+                    "session_start", prepare_runtime.MAVIS_HANDOFF_COMMAND,
+                    prepare_runtime.MAVIS_HANDOFF_STATUS,
+                ),
+            )
 
     def test_profile_preserves_local_user_sections(self):
         with tempfile.TemporaryDirectory() as directory:
