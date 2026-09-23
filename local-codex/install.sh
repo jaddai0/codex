@@ -23,11 +23,12 @@ cp -R "$repo_root/local-codex/mavis/mavis" "$install_share/mavis"
 find "$install_share/mavis" -type d -exec chmod 0755 {} +
 find "$install_share/mavis" -type f -exec chmod 0644 {} +
 
-python3 - "$install_share" "$install_bin/mavis" <<'PY'
+PYTHONPATH="$install_share${PYTHONPATH:+:$PYTHONPATH}" python3 - "$install_share" "$install_bin/mavis" <<'PY'
 import hashlib
 import json
 from pathlib import Path
 import sys
+from mavis.package_provenance import package_tree_sha256
 
 share = Path(sys.argv[1]).resolve()
 launcher = Path(sys.argv[2]).resolve()
@@ -39,6 +40,8 @@ manifest = {
     "launcher": str(launcher),
     "launcher_sha256": hashlib.sha256(launcher.read_bytes()).hexdigest(),
     "trial_runtime_sha256": hashlib.sha256((share / "trial_runtime.py").read_bytes()).hexdigest(),
+    "launch_core_sha256": hashlib.sha256((share / "launch_core.py").read_bytes()).hexdigest(),
+    "mavis_package_sha256": package_tree_sha256(share / "mavis"),
 }
 path = share / "install-manifest.json"
 temporary = share / ".install-manifest.json.tmp"

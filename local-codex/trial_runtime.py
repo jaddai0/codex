@@ -13,6 +13,7 @@ import subprocess
 import sys
 
 from mavis.e1 import E1Runner, _clean_revision
+from mavis.package_provenance import package_tree_sha256
 from mavis.runtime import RuntimeConfig, endpoint_alive, ensure_runtime, inventory
 from mavis.storage import read_json, require_safe_id, sha256_file
 from prepare_runtime import (
@@ -165,6 +166,8 @@ def _prepare_trial_locked(
             or Path(package.get("core_binary", "")).resolve() != core_binary.resolve()
             or package.get("core_sha256") != sha256_file(core_binary)
             or package.get("trial_runtime_sha256") != sha256_file(Path(__file__))
+            or package.get("launch_core_sha256") != sha256_file(package_manifest.parent / "launch_core.py")
+            or package.get("mavis_package_sha256") != package_tree_sha256(package_manifest.parent / "mavis")
             or not launcher.is_file()
             or package.get("launcher_sha256") != sha256_file(launcher)
         ):
@@ -423,6 +426,8 @@ def validate_trial_receipt(receipt: dict) -> None:
             or package.get("core_binary") != receipt["core_binary"]
             or package.get("core_sha256") != receipt["core_sha256"]
             or package.get("trial_runtime_sha256") != sha256_file(Path(__file__))
+            or package.get("launch_core_sha256") != sha256_file(package_path.parent / "launch_core.py")
+            or package.get("mavis_package_sha256") != package_tree_sha256(package_path.parent / "mavis")
             or not launcher.is_file()
             or package.get("launcher_sha256") != sha256_file(launcher)
             or receipt.get("core_provenance") != "installed-package"
@@ -475,6 +480,8 @@ def run_trial(experiment_id: str, arm: str, case_id: str, task: str) -> Path:
         or package.get("core_binary") != str(core_binary)
         or package.get("core_sha256") != sha256_file(core_binary)
         or package.get("trial_runtime_sha256") != sha256_file(Path(__file__))
+        or package.get("launch_core_sha256") != sha256_file(share / "launch_core.py")
+        or package.get("mavis_package_sha256") != package_tree_sha256(share / "mavis")
         or not launcher.is_file()
         or package.get("launcher_sha256") != sha256_file(launcher)
     ):
