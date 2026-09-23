@@ -25,6 +25,34 @@ CATALOG_TEST = ["python3", "-m", "unittest", "tests.test_catalog", "-q"]
 FULL_TEST = ["python3", "-m", "unittest", "discover", "-s", "tests", "-q"]
 
 
+def first_task_prompt(nonce: str) -> str:
+    return (
+        f"Task receipt E2_{nonce}. Read BLUEPRINT.md and inspect this repository. "
+        "Work on the catalog package only: fix its discounted subtotal and input "
+        "checks, then run python3 -m unittest tests.test_catalog -q and report "
+        "the actual result. Preserve BLUEPRINT.md, tests, user-notes.txt, and "
+        "private-draft.txt. Do not touch checkout yet and do not commit."
+    )
+
+
+def resume_task_prompt(nonce: str) -> str:
+    return (
+        f"Continue task receipt E2_{nonce} after compaction. Catalog is already "
+        "fixed. Now fix the checkout package, check downstream invoice behavior, "
+        "run python3 -m unittest discover -s tests -q, and report the real result. "
+        "Preserve the blueprint, tests, user-notes.txt, private-draft.txt, and "
+        "the catalog repair. Do not commit."
+    )
+
+
+def task_launch_commands(repo: Path, session_id: str, nonce: str) -> tuple[list[str], list[str]]:
+    launcher = str(Path.home() / "Desktop" / "Mavis.command")
+    first = [launcher, "--no-daemon", "--no-alt-screen", "-C", str(repo), first_task_prompt(nonce)]
+    resumed = [launcher, "resume", "--no-daemon", "--no-alt-screen", "-C",
+               str(repo), session_id, resume_task_prompt(nonce)]
+    return first, resumed
+
+
 def _git(repo: Path, *args: str) -> str:
     return subprocess.check_output(["git", "-C", str(repo), *args], text=True).strip()
 
@@ -227,6 +255,69 @@ def _rollout_records(path: Path) -> tuple[bytes, list[dict]]:
     return data, records
 
 
+def _user_turn(records: list[dict], prompt: str, session_id: str) -> tuple[int, str]:
+    matches: list[tuple[int, str]] = []
+    for index, event in enumerate(records):
+        payload = event.get("payload", {})
+        item = payload.get("item", {}) if isinstance(payload, dict) else {}
+        if (event.get("type") != "event_msg" or payload.get("type") != "item_completed"
+                or payload.get("thread_id") != session_id or not isinstance(item, dict)
+                or item.get("type") != "UserMessage"):
+            continue
+        content = item.get("content")
+        if (isinstance(content, list) and len(content) == 1
+                and isinstance(content[0], dict)
+                and content[0].get("type") == "text" and content[0].get("text") == prompt):
+            turn_id = payload.get("turn_id")
+            if not isinstance(turn_id, str) or not turn_id:
+                raise ValueError("E2 user prompt lacks a native turn id")
+            matches.append((index, turn_id))
+    if len(matches) != 1:
+        raise ValueError("E2 prompt did not identify exactly one native user turn")
+    return matches[0]
+
+
+def _completed_prompt_turn(records: list[dict], prompt: str, session_id: str, expected_turn: str) -> tuple[int, int]:
+    user_index, turn = _user_turn(records, prompt, session_id)
+    if turn != expected_turn:
+        raise ValueError("E2 prompt belongs to a different native turn")
+    started = [i for i, row in enumerate(records) if row.get("type") == "event_msg"
+               and row.get("payload", {}).get("type") == "task_started"
+               and row.get("payload", {}).get("turn_id") == turn]
+    completed = [i for i, row in enumerate(records) if row.get("type") == "event_msg"
+                 and row.get("payload", {}).get("type") == "task_complete"
+                 and row.get("payload", {}).get("turn_id") == turn]
+    if (len(started) != 1 or len(completed) != 1
+            or not started[0] < user_index < completed[0]):
+        raise ValueError("E2 native task turn did not complete around the exact prompt")
+    return user_index, completed[0]
+
+
+def matching_first_rollout(session_root: Path, repo: Path, prompt: str, started: float) -> tuple[Path, str, str]:
+    """Find exactly one native session carrying this launch's unique user prompt."""
+    candidates: list[tuple[Path, str, str]] = []
+    for path in session_root.glob("**/rollout-*.jsonl"):
+        if path.stat().st_mtime < started - 2:
+            continue
+        if prompt.encode() not in path.read_bytes():
+            continue
+        _data, rows = _rollout_records(path)
+        meta = rows[0]
+        session = meta.get("payload", {}).get("id")
+        if (meta.get("type") != "session_meta"
+                or meta.get("payload", {}).get("cwd") != str(repo)
+                or not isinstance(session, str) or not session):
+            continue
+        try:
+            _index, turn = _user_turn(rows, prompt, session)
+        except ValueError:
+            continue
+        candidates.append((path.resolve(), session, turn))
+    if len(candidates) != 1:
+        raise ValueError("E2 launch prompt did not identify exactly one new fixture rollout")
+    return candidates[0]
+
+
 def terra_review_prompt(manifest_path: Path, rollout: Path) -> str:
     return (
         "Read-only independent review of the held-out installed Mavis work. "
@@ -310,6 +401,15 @@ def verify_heldout(manifest_path: Path) -> dict[str, object]:
             or result["first_pid"] == result["resume_pid"]
             or result.get("iris_loaded") is not True or result.get("mavis_loaded") is not False):
         raise ValueError("E2 installed process restart or model handoff did not complete")
+    nonce = result.get("prompt_nonce")
+    if not isinstance(nonce, str) or not re.fullmatch(r"[0-9a-f]{32}", nonce):
+        raise ValueError("E2 launch nonce is missing")
+    session = result.get("session_id")
+    if not isinstance(session, str) or not session:
+        raise ValueError("E2 native session id is missing")
+    first_command, resumed_command = task_launch_commands(Path(final_state["repo"]), session, nonce)
+    if result.get("first_argv") != first_command or result.get("resume_argv") != resumed_command:
+        raise ValueError("E2 installed launcher or resume command changed")
     rollout = Path(result["rollout"]).resolve(strict=True)
     data, records = _rollout_records(rollout)
     prefix_bytes = result.get("first_rollout_bytes")
@@ -322,11 +422,18 @@ def verify_heldout(manifest_path: Path) -> dict[str, object]:
     first, later = records[:prefix_count], records[prefix_count:]
     if (first[0].get("type") != "session_meta"
             or first[0].get("payload", {}).get("cwd") != final_state["repo"]
-            or first[0].get("payload", {}).get("id") != result.get("session_id")
-            or not any(row.get("type") == "compacted" for row in first)
-            or not any(row.get("type") == "event_msg" and row.get("payload", {}).get("type") == "task_complete" for row in first)
-            or not any(row.get("type") == "event_msg" and row.get("payload", {}).get("type") == "task_complete" for row in later)):
-        raise ValueError("E2 compaction or resumed task completion is unproved")
+            or first[0].get("payload", {}).get("id") != session
+            or first[0].get("payload", {}).get("session_id") != session):
+        raise ValueError("E2 selected rollout belongs to a different session")
+    _first_user, first_complete = _completed_prompt_turn(
+        first, first_task_prompt(nonce), session, result.get("first_turn_id"))
+    _resume_user, resume_complete = _completed_prompt_turn(
+        later, resume_task_prompt(nonce), session, result.get("resume_turn_id"))
+    if (result.get("first_turn_id") == result.get("resume_turn_id")
+            or not any(index > first_complete and row.get("type") == "compacted"
+                       for index, row in enumerate(first))
+            or resume_complete <= 0):
+        raise ValueError("E2 compaction or matching resumed task completion is unproved")
     review_log = task / "terra-review.jsonl"
     review_stderr = task / "terra-review.stderr.log"
     review_text = task / "terra-review.txt"
