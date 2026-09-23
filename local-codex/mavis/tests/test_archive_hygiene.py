@@ -252,7 +252,7 @@ class ArchiveRetentionTests(unittest.TestCase):
             self.assertFalse(original.exists())
             with patch.object(ArchiveRetention, "sweep_due", return_value=report) as sweep:
                 self.assertIsNone(queue.claim_next(foreground_active=False))
-                sweep.assert_called_once()
+                sweep.assert_not_called()
             self.assertEqual(retention.sweep_due(now=closed + timedelta(days=31))["projects"], [])
 
     def test_reproducible_cache_is_only_pruned_on_pressure(self):

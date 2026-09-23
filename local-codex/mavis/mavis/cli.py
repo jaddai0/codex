@@ -24,6 +24,7 @@ from .e0_tasks import prepare_small_repository
 from .e2_tasks import prepare_heldout, verify_heldout
 from .evaluations import E0_CASES, E0Evaluator
 from .maintenance import MaintenanceQueue
+from .maintenance_runtime import tick as maintenance_tick
 from .objectives import ObjectiveStore
 from .project_memory import ProjectMemory, KINDS
 from .retrieval import ProjectIndex
@@ -271,6 +272,7 @@ def build_parser() -> argparse.ArgumentParser:
     maintenance_sub = maintenance.add_subparsers(
         dest="maintenance_command", required=True
     )
+    maintenance_sub.add_parser("tick")
     enqueue = maintenance_sub.add_parser("enqueue")
     enqueue.add_argument(
         "interval", choices=("immediate", "daily", "weekly", "monthly")
@@ -579,6 +581,9 @@ def main(argv: list[str] | None = None) -> int:
         )
         return 0
     if args.command == "maintenance":
+        if args.maintenance_command == "tick":
+            print_json(maintenance_tick(home))
+            return 0
         queue = MaintenanceQueue(home)
         if args.maintenance_command == "enqueue":
             payload = json.loads(args.payload)
