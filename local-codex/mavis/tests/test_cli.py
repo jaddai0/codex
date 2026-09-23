@@ -2,6 +2,7 @@ import contextlib
 import io
 import json
 import os
+import time
 from pathlib import Path
 import subprocess
 import tempfile
@@ -9,6 +10,7 @@ import unittest
 from unittest.mock import patch
 
 from mavis.cli import main, build_parser
+from mavis.maintenance import MaintenanceQueue
 from mavis.objectives import ObjectiveStore
 from mavis.transcripts import TranscriptArchive
 
@@ -217,6 +219,91 @@ class ObjectiveCliTests(unittest.TestCase):
             self.assertEqual(len(retained), 1)
             receipt = json.loads(Path(retained[0]["path"]).read_text(encoding="utf-8"))
             self.assertEqual(receipt["verdict"], "pass")
+
+
+class MaintenanceCliTests(unittest.TestCase):
+    def test_cancel_cli_returns_cancelled_job(self):
+        with tempfile.TemporaryDirectory() as directory:
+            home = Path(directory)
+            queue = MaintenanceQueue(home)
+            job = queue.enqueue("daily", "review", {"key": "value"})
+            time.sleep(0.01)
+            output = io.StringIO()
+            with (
+                patch.dict(os.environ, {"MAVIS_HOME": str(home)}),
+                contextlib.redirect_stdout(output),
+            ):
+                self.assertEqual(
+                    main(
+                        [
+                            "maintenance",
+                            "cancel",
+                            job["job_id"],
+                            "--reason",
+                            "obsolete",
+                        ]
+                    ),
+                    0,
+                )
+            cancelled = json.loads(output.getvalue())
+            self.assertEqual(cancelled["state"], "cancelled")
+            self.assertEqual(cancelled["detail"], "obsolete")
+            self.assertEqual(cancelled["payload"], {"key": "value"})
+            self.assertNotEqual(cancelled["updated_at"], job["created_at"])
+            self.assertEqual(queue.get(job["job_id"])["state"], "cancelled")
+
+    def test_cancel_cli_parser_accepts_job_id_and_reason(self):
+        parser = build_parser()
+        args = parser.parse_args(
+            ["maintenance", "cancel", "job-1", "--reason", "obsolete"]
+        )
+        self.assertEqual(args.job_id, "job-1")
+        self.assertEqual(args.reason, "obsolete")
+
+    def test_cancel_cli_requires_reason(self):
+        parser = build_parser()
+        with self.assertRaises(SystemExit):
+            parser.parse_args(["maintenance", "cancel", "job-1"])
+
+    def test_cancel_cli_rejects_running_job(self):
+        with tempfile.TemporaryDirectory() as directory:
+            home = Path(directory)
+            queue = MaintenanceQueue(home)
+            job = queue.enqueue("weekly", "review", {})
+            self.assertIsNotNone(queue.claim_next(foreground_active=False))
+            with (
+                patch.dict(os.environ, {"MAVIS_HOME": str(home)}),
+                contextlib.redirect_stdout(io.StringIO()),
+            ):
+                with self.assertRaisesRegex(ValueError, "cannot cancel"):
+                    main(
+                        [
+                            "maintenance",
+                            "cancel",
+                            job["job_id"],
+                            "--reason",
+                            "too late",
+                        ]
+                    )
+
+    def test_cancel_cli_rejects_unknown_job(self):
+        with tempfile.TemporaryDirectory() as directory:
+            home = Path(directory)
+            MaintenanceQueue(home)
+            with (
+                patch.dict(os.environ, {"MAVIS_HOME": str(home)}),
+                contextlib.redirect_stdout(io.StringIO()),
+            ):
+                with self.assertRaises(KeyError):
+                    main(
+                        [
+                            "maintenance",
+                            "cancel",
+                            "missing",
+                            "--reason",
+                            "nobody",
+                        ]
+                    )
 
 
 if __name__ == "__main__":

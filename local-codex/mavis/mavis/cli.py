@@ -194,6 +194,9 @@ def build_parser() -> argparse.ArgumentParser:
     )
     enqueue.add_argument("kind")
     enqueue.add_argument("--payload", default="{}")
+    cancel = maintenance_sub.add_parser("cancel")
+    cancel.add_argument("job_id")
+    cancel.add_argument("--reason", required=True)
     maintenance_list = maintenance_sub.add_parser("list")
     maintenance_list.add_argument("--state")
     return parser
@@ -398,6 +401,8 @@ def main(argv: list[str] | None = None) -> int:
             if not isinstance(payload, dict):
                 raise ValueError("maintenance payload must be a JSON object")
             print_json(queue.enqueue(args.interval, args.kind, payload))
+        elif args.maintenance_command == "cancel":
+            print_json(queue.cancel(args.job_id, reason=args.reason))
         else:
             print_json(queue.list(args.state))
         return 0
