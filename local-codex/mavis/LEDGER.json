@@ -10,10 +10,11 @@
   },
   "status": "partial",
   "uncertainty": [
-    "The candidate from 37aaea616 is installed with its prior installation backed up. Its current installed E0 run passed all ten mandatory cases while IRIS remained loaded and the shared GPU lease was released.",
-    "Phase 2 memory and helper interfaces pass source tests. Fixed-corpus embedding and isolated local helper comparisons completed, and the installed project index passed changed-file, rename, and deletion checks. Installed embedding and helper use, repeated-compaction quality, and completed-task benefit remain open. A repeated-compaction trial completed two handoffs, but the final answer omitted the required marker prefix; the question was made explicit and awaits rerun.",
-    "Phase 3 E1 has native assignment plumbing and strict source gates, but current installed candidate activation, a real paired comparison, independent promotion, and rollback remain open.",
-    "The current Rust core suite ran 4,591 tests and had 278 failures, largely in missing cross-package test binaries and code-mode environment cases. Nine tests named for Mavis passed. The broad Rust gate remains open while its helper dependencies and remaining failures are investigated.",
+    "Installed candidate 003c908e1 passed all ten E0 cases after a fresh rebuild. The prior installation is retained at ~/.local/share/local-codex-backups/mavis-before-003c908e1.",
+    "Phase 2 installed index freshness and two-compaction decision recovery passed. Helper isolation has source and local-service proof; measured benefit to completed work remains open.",
+    "Phase 3 E1 has source gates and native assignment plumbing. A real paired comparison, independent promotion, and rollback remain open.",
+    "Phase 4 held-out two-package work passed across compaction and restart with independent Terra acceptance. Broader large-project, conflict, flaky-dependency, and tool-discovery coverage remains open.",
+    "The Rust core suite ran 4,591 tests and had 278 failures from environment and cross-package cases; the Mavis-focused Rust tests passed. The broad suite remains an open gate.",
     "Hosted Jev returned one typed answer under the local capped ledger; external invoice reconciliation and a local Jev candidate remain open."
   ],
   "rejected_alternatives": [
@@ -35,17 +36,14 @@
     {
       "id": "phase-1",
       "requirement": "Deliver a useful isolated Mavis with objectives, evidence, compaction, delegation, Jev, parsing, search, and interruption recovery; pass E0 plus two independently verified real tasks.",
-      "status": "reject",
-      "command": "Installed Desktop Mavis E0 observers and python3 -m mavis eval e0 under sequential IRIS/Mavis handoff; installed Mavis maintenance task in isolated checkout; PYTHONDONTWRITEBYTECODE=1 python3 -m unittest discover -s tests -q; independent read-only review and two-thread SQLite race canary",
-      "artifact": "/Users/dustinpainter/.local-codex/mavis-service/evaluations/e0/summary.json",
+      "status": "pass",
+      "command": "PYTHONDONTWRITEBYTECODE=1 PYTHONPATH=~/.local/share/local-codex python3 local-codex/mavis/scripts/run_final_e0_with_handoff.py; observe_small_repository.py; python3 -m unittest discover -s local-codex/mavis/tests -q",
+      "artifact": "/Users/dustinpainter/.local-codex/mavis-service/evaluations/e0/final-installed-shared.json",
       "evidence": [
-        "Installed E0 summary at /Users/dustinpainter/.local-codex/mavis-service/evaluations/e0/summary.json passed all ten mandatory cases on service SHA-256 15710e90443d08fb0aa03196d7197dc428ec97094d831f61274a450225bbf957 and core SHA-256 969723b0eb97773fca6814d21ef89091cfcad32eaa9a845b0dc079a1bf92f618. The handoff receipt at segment-boundary-installed/result.json records e0_exit=0, matching before/after candidate fingerprints, IRIS restored, and Mavis unloaded.",
-        "The installed Mavis small-repository maintenance repair passed exact tests, preserved the unrelated dirty note, and independent native ZCode review accepted in /Users/dustinpainter/.local-codex/mavis-service/evaluations/e0/tasks/3db16fdd5d6e4c7da62c3c35216b349e.",
-        "A distinct bounded real maintenance task completed: installed Mavis fixed Boolean citation validation in an isolated checkout, exited 0 after seven focused tests, and independent review accepted the two-file patch; /Users/dustinpainter/.Codex/reports/mavis-librarian-fix-independent-review-2026-09-22.md.",
-        "The installed Mavis multi-file maintenance cancellation run at /Users/dustinpainter/.local-codex/mavis-service/evaluations/phase1/maintenance-control-live/result.json exited 0 with IRIS restored, Mavis unloaded, and matching candidate fingerprints. Mavis authored the queue, CLI, and matching tests in four files. Independent review ACCEPT at /Users/dustinpainter/.Codex/reports/mavis-maintenance-control-independent-review-2026-09-22.md; unpiped full suite 131 tests passed, a real CLI subprocess passed, and a two-thread serialized race canary plus regression passed. The only coordinator addition was the two-thread regression test closing review P2.",
-        "The unified source candidate passed 291 Mavis package tests after helper contract repairs; the 125 host tests passed before those package-only changes. Syntax and architecture checks passed. This does not transfer the older installed E0 pass to the current candidate; its installed E0 rerun is pending.",
-        "The codex-core suite ran 4,591 tests, with 278 failures in cross-package binaries and other environment or feature cases. Nine Mavis-named Rust tests passed; the broad core suite remains an open gate.",
-        "The current package suite passed 295 tests before the shared E0 gate added two passing focused tests. The 37aaea616 installed package matches its committed source hash and retains the prior installation in a backup. All ten installed E0 cases passed in run 97ec37af8abf442a93102dbe5c58f596; final-installed-shared.json records tool_roundtrip_exit=0, e0_exit=0, IRIS stayed loaded, Mavis unloaded, and gpu_lease_released=true. The candidate-matched small repair received separate native Terra acceptance. The gateway native worker was reverified by a fresh independent Terra job."
+        "Installed candidate 003c908e1 passed all ten E0 cases in run fcd45a6933fc4608a9d0caaebd7f8089. The observer recorded the same before/after candidate fingerprint, IRIS loaded, Mavis unloaded, and the GPU lease released.",
+        "The candidate-matched small repository task at /Users/dustinpainter/.local-codex/mavis-service/evaluations/e0/tasks/25c962288169439a8d9449d0b6ff7ed4 repaired its failing test, preserved the dirty note, and received a completed accepting native Terra review.",
+        "The current installed candidate completed a separate two-package task across compaction and process restart. The host full suite passed seven tests and native Terra independently accepted the result at /Users/dustinpainter/.local-codex/mavis-service/evaluations/e2/tasks/f0a3a0f52eda4c58aa82a2f60276a0ab/verification.json.",
+        "The source Mavis suite passed 300 tests with two skips after the whole-tax-percentage fixture repair; focused E2 tests passed again after formatting."
       ]
     },
     {
@@ -53,12 +51,13 @@
       "requirement": "Deliver project memory, retrieval, librarian, and output reader with stale/deleted-code and isolation proof.",
       "status": "reject",
       "command": "PYTHONDONTWRITEBYTECODE=1 PYTHONPATH=local-codex/mavis python3 -m unittest discover -s local-codex/mavis/tests -q",
-      "artifact": "local-codex/mavis/reports/phase2-helper-interfaces.md",
+      "artifact": "/Users/dustinpainter/.local-codex/mavis-service/evaluations/phase2/repeated-compaction-eeeaf251c4cf41f2a7a8bdc2b1026900/result.json",
       "evidence": [
         "Project retrieval handles stale/deleted/renamed paths and hash-verified global records. Librarian/output-reader evidence boundaries, zero-failure parsing, and bounded archive paging are implemented; the current Mavis source suite passed 289 tests.",
         "A fixed 16-question direct-MLX comparison measured Qwen3 Embedding 0.6B at 12/16 expected files in the top five and the installed 8B model at 13/16. Real-model branch, changed-file, rename, and deletion freshness checks passed; see phase2-embedding-comparison.md.",
         "On Mavis port 8001, both Qwen3.5-0.8B and pinned 4B passed two librarian and four output-reader cases after strict schema and follow-up repairs. Pre/post inventories matched and Mavis unloaded; see phase2-helper-candidates-2026-09-23.md. These are source/local-service cases. Installed helper integration, repeated compactions, real long-log work, and completed-task benefit remain open.",
-        "Phase 2 repeated-compaction observer uses the shared GPU lease without unloading IRIS; focused private-terminal tests passed. The f6094a8f5 installed project index found changed content before refresh, then reflected rename and deletion in /Users/dustinpainter/.local-codex/mavis-service/evaluations/phase2/installed-index-f6094a8f5-4s5vx1g3/result.json. A current installed trial completed two compactions and three process starts, but answered only sqlite-before-postgres rather than the complete P2 marker. The question was made explicit; an all-pass repeated-compaction receipt remains open."
+        "Phase 2 repeated-compaction observer uses the shared GPU lease without unloading IRIS; focused private-terminal tests passed. The f6094a8f5 installed project index found changed content before refresh, then reflected rename and deletion in /Users/dustinpainter/.local-codex/mavis-service/evaluations/phase2/installed-index-f6094a8f5-4s5vx1g3/result.json. A current installed trial completed two compactions and three process starts, but answered only sqlite-before-postgres rather than the complete P2 marker. The question was made explicit; an all-pass repeated-compaction receipt remains open.",
+        "The installed repeated-compaction run recovered the exact early P2 decision after two handoffs and three TUI process starts. The installed index freshness run at installed-index-37aaea616-2jaauk5s passed changed-file lookup, hash refresh, rename, and deletion. Current E0 also passed the buried full-output failure case. Completed-task benefit of helpers remains unmeasured."
       ]
     },
     {
@@ -76,11 +75,12 @@
       "id": "phase-4",
       "requirement": "Pass a held-out multi-package task across compaction and restart.",
       "status": "reject",
-      "command": "python3 -m mavis eval phase4",
-      "artifact": "~/.local-codex/mavis-service/evaluations/phase4",
+      "command": "PYTHONDONTWRITEBYTECODE=1 PYTHONPATH=~/.local/share/local-codex python3 local-codex/mavis/scripts/observe_heldout_e2.py",
+      "artifact": "/Users/dustinpainter/.local-codex/mavis-service/evaluations/e2/tasks/f0a3a0f52eda4c58aa82a2f60276a0ab/verification.json",
       "evidence": [
-        "Pending after Phase 3.",
-        "The held-out observer now uses a private pseudo-terminal, shared GPU admission, and automated /compact and /exit. Two simulated-terminal tests and focused E2 source tests passed; the installed held-out task remains pending after current E0 acceptance."
+        "An initial installed six-test run was rejected by Terra because fractional tax escaped the blueprint. The fixture added that case, the source package passed 300 tests, and installed candidate 003c908e1 passed fresh E0.",
+        "The fresh seven-test held-out task passed catalog then checkout across compaction and process restart. Host checks passed 3/3 and 7/7; Terra independently accepted; the protected blueprint, tests, dirty note, and untracked draft retained their hashes. IRIS stayed loaded and the GPU lease was released.",
+        "Broader large-repository, ambiguous-failure, flaky-dependency, concurrent-worktree, decomposition, and tool-discovery shards remain open."
       ]
     },
     {
@@ -110,8 +110,9 @@
       "command": "git worktree list --porcelain; git status --porcelain; git worktree remove/move for verified paths; cmp and shasum -a 256 for retained artifacts; installed Mavis harness_job_status canary",
       "artifact": "/Users/dustinpainter/Dev-Projects/Mavis/evidence/checkout-consolidation.json",
       "evidence": [
-        "Forty-one obsolete worktree folders were removed and every recorded Git commit remains reachable; two active source checkouts are grouped under Mavis/checkouts.",
-        "The embedding index, two snapshot candidates, and raw-output formatting patch have recorded SHA-256 hashes under Mavis/evidence. The installed gateway status canary succeeded after its path moved."
+        "Forty-two obsolete worktrees were removed. Their branches and Git commits remain reachable; the exact paths and heads are recorded in /Users/dustinpainter/Dev-Projects/Mavis/evidence/checkout-consolidation.json.",
+        "The original 49 GB local-codex checkout was removed after its sole report-formatting diff was saved with SHA-256 under Mavis/evidence. One top-level Mavis folder remains under Dev-Projects, with two active source checkouts and retained unique evidence.",
+        "The installed Mavis package, runtime receipts, and IRIS services remain at their live paths. The installed gateway status canary succeeded after the source checkout moved."
       ]
     }
   ]
