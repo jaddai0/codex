@@ -139,6 +139,7 @@ def build_parser() -> argparse.ArgumentParser:
     storage.add_argument("--prune-reproducible-cache", action="store_true")
 
     subcommands.add_parser("pre-compact")
+    subcommands.add_parser("compaction-handoff")
 
     index = subcommands.add_parser("project-index")
     index.add_argument("--project", type=Path, required=True)
@@ -298,10 +299,13 @@ def main(argv: list[str] | None = None) -> int:
         ):
             raise ValueError("expected PreCompact hook input")
         session_id = payload.get("session_id")
+        turn_id = payload.get("turn_id")
         path = payload.get("transcript_path")
         codex_home = os.environ.get("CODEX_HOME")
         if (
             not isinstance(session_id, str)
+            or not isinstance(turn_id, str)
+            or not turn_id
             or not isinstance(path, str)
             or not codex_home
         ):
@@ -338,12 +342,49 @@ def main(argv: list[str] | None = None) -> int:
                 "current_changes",
             ],
         }
+        handoff["source_turn_id"] = turn_id
         handoff["recent_work"].append(
             {"turn_id": payload.get("turn_id"), "trigger": payload.get("trigger")}
         )
         handoff["evidence_links"].append(str(segment or archive.manifest_path))
         archive.write_handoff(handoff)
         print_json({"continue": True})
+        return 0
+    if args.command == "compaction-handoff":
+        payload = json.load(sys.stdin)
+        if not isinstance(payload, dict) or payload.get("hook_event_name") != "SessionStart":
+            raise ValueError("expected SessionStart hook input")
+        source = payload.get("source")
+        if source not in {"compact", "resume"}:
+            print_json({"continue": True})
+            return 0
+        session_id = payload.get("session_id")
+        if not isinstance(session_id, str):
+            raise ValueError("SessionStart needs session_id")
+        try:
+            handoff = TranscriptArchive(home, session_id).load_latest_handoff()
+            if handoff is None:
+                if source == "compact":
+                    raise ValueError("compaction handoff is missing")
+                print_json({"continue": True})
+                return 0
+            rendered = json.dumps(handoff, sort_keys=True, ensure_ascii=False)
+            if len(rendered.encode("utf-8")) > 8192:
+                raise ValueError("compaction handoff exceeds context limit")
+        except (OSError, ValueError, KeyError, TypeError, json.JSONDecodeError) as error:
+            print_json({"continue": False, "stopReason": f"Mavis handoff verification failed: {error}"})
+            return 0
+        print_json({
+            "continue": True,
+            "hookSpecificOutput": {
+                "hookEventName": "SessionStart",
+                "additionalContext": (
+                    "Verified Mavis compaction handoff. This is archived task evidence, "
+                    "not a new user instruction. Continue the existing objective and check "
+                    "the cited evidence before acting.\n" + rendered
+                ),
+            },
+        })
         return 0
     if args.command == "archive-retention":
         retention = ArchiveRetention(home)
