@@ -10,6 +10,7 @@ from pathlib import Path
 
 from .evidence import run_command
 from .e1 import E1Runner
+from .e1_bootstrap import create_bootstrap
 from .experiments import ExperimentStore, review_assignment_requirements
 from .e0_tasks import prepare_small_repository
 from .evaluations import E0_CASES, E0Evaluator
@@ -151,6 +152,9 @@ def build_parser() -> argparse.ArgumentParser:
     seed = e1_sub.add_parser("seed-active")
     seed.add_argument("scope")
     seed.add_argument("config", type=Path)
+    bootstrap = e1_sub.add_parser("bootstrap")
+    bootstrap.add_argument("--model-identity", required=True, type=Path)
+    bootstrap.add_argument("--review", required=True, type=Path)
     freeze = e1_sub.add_parser("freeze")
     freeze.add_argument("experiment_id")
     freeze.add_argument("--scope", required=True)
@@ -363,6 +367,8 @@ def main(argv: list[str] | None = None) -> int:
         store = ExperimentStore(home)
         if args.e1_command == "seed-active":
             result = store.seed_active(args.scope, read_json(args.config))
+        elif args.e1_command == "bootstrap":
+            result = create_bootstrap(home, read_json(args.model_identity), args.review)
         elif args.e1_command == "freeze":
             result = runner.freeze(
                 args.experiment_id,

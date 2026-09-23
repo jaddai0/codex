@@ -117,6 +117,25 @@ class E0EvaluationTests(unittest.TestCase):
             self.assertEqual(statuses["small-repository"], "blocked")
             self.assertEqual(statuses["external-harness"], "blocked")
 
+    def test_passing_e0_summary_binds_installed_candidate_model_and_case_receipts(self):
+        with tempfile.TemporaryDirectory() as directory:
+            home = Path(directory)
+            evaluator = E0Evaluator(home, RuntimeConfig(home=home, model="model-a"))
+            def passing_case(case):
+                return evaluator._receipt(case, "pass", ["retained host evidence"])
+            with (
+                patch.object(evaluator, "run_case", side_effect=passing_case),
+                patch("mavis.evaluations.installed_candidate_fingerprint",
+                      return_value={"core_sha256": "a" * 64}),
+            ):
+                summary = evaluator.run()
+            self.assertEqual(summary["model_id"], "model-a")
+            self.assertEqual(summary["installed_candidate"], {"core_sha256": "a" * 64})
+            self.assertEqual(set(summary["case_receipts"]), set(E0_CASES))
+            for case in E0_CASES:
+                self.assertEqual(summary["case_receipts"][case],
+                                 sha256_file(evaluator.root / f"{case}.json"))
+
     def test_buried_failure_and_compaction_require_live_receipts(self):
         with tempfile.TemporaryDirectory() as directory:
             evaluator = E0Evaluator(
