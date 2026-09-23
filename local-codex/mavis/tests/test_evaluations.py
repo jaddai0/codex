@@ -63,6 +63,12 @@ class E0EvaluationTests(unittest.TestCase):
         }
         log = "ZCode Built-in skipped (not-due)\n" + json.dumps(result, indent=2)
         self.assertTrue(native_review_completed(log, verdict))
+        bold_verdict = "**ACCEPT**\nExact tests passed and protected file hash matched."
+        result["response"] = bold_verdict
+        self.assertTrue(native_review_completed("ZCode Built-in skipped (not-due)\n" + json.dumps(result), bold_verdict))
+        result["response"] = "ACCEPTABLE\nThis is not an acceptance heading."
+        self.assertFalse(native_review_completed(json.dumps(result), result["response"]))
+        result["response"] = verdict
         self.assertFalse(native_review_completed(log, "ACCEPT\nDifferent finding"))
         result["projection"]["status"] = "running"
         self.assertFalse(native_review_completed(json.dumps(result), verdict))

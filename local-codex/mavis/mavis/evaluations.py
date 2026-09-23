@@ -113,6 +113,8 @@ def _safe_buried_inspection(command: str) -> bool:
 
 def native_review_completed(log: str, verdict: str) -> bool:
     """Recognize a completed native ZCode stream or its structured CLI result."""
+    heading = verdict.lstrip().splitlines()[0].strip() if verdict.strip() else ""
+    accepted = bool(re.match(r"^(?:\*\*)?ACCEPT(?:\*\*)?(?:$|[\s:.-])", heading))
     events = []
     for line in log.splitlines():
         if line.startswith("{"):
@@ -122,7 +124,7 @@ def native_review_completed(log: str, verdict: str) -> bool:
                 events = []
                 break
     if any(event.get("type") == "turn.completed" for event in events):
-        return verdict.lstrip().startswith("ACCEPT")
+        return accepted
     start = log.find("{")
     if start < 0:
         return False
@@ -142,7 +144,7 @@ def native_review_completed(log: str, verdict: str) -> bool:
         and projection.get("status") == "idle"
         and isinstance(response, str)
         and response == verdict
-        and response.lstrip().startswith("ACCEPT")
+        and accepted
     )
 
 
