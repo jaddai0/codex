@@ -1,0 +1,46 @@
+{
+  "schema_version": "work-closeout/v1",
+  "task": "Phase 2 operational output inspection route",
+  "status": "complete",
+  "constraint": {
+    "binding": "evidence",
+    "statement": "The installed command route did not expose OutputReader for existing host receipts.",
+    "evidence": ["local-codex/mavis/mavis/cli.py", "local-codex/bin/local-codex"]
+  },
+  "rejected_alternatives": [],
+  "requirements": [
+    {
+      "id": "host-envelope",
+      "requirement": "Inspect an existing host receipt with hash-bound raw output and an authoritative host result.",
+      "status": "pass",
+      "command": "PYTHONPATH=local-codex/mavis python3 -m unittest local-codex/mavis/tests/test_output_inspection.py -v",
+      "artifact": "local-codex/mavis/mavis/output_inspection.py",
+      "evidence": ["Five tests passed: known count, irregular output, changed raw bytes, foreign receipt, and unavailable local model cases."]
+    },
+    {
+      "id": "model-guard",
+      "requirement": "Allow an explicit local small-model observation on irregular output without changing host evidence.",
+      "status": "pass",
+      "command": "PYTHONPATH=local-codex/mavis python3 -m unittest local-codex/mavis/tests/test_output_inspection.py -v",
+      "artifact": "local-codex/mavis/tests/test_output_inspection.py",
+      "evidence": ["Injected model answer cited an exact line; forged success and invented lines were rejected; oversized logs withheld the model request and kept verified host evidence."]
+    },
+    {
+      "id": "launcher",
+      "requirement": "Route the new output command through the local-codex launcher.",
+      "status": "pass",
+      "command": "PYTHONPATH=local-codex/mavis python3 -m unittest local-codex/mavis/tests/test_cli.py local-codex/mavis/tests/test_output_inspection.py -v",
+      "artifact": "local-codex/bin/local-codex",
+      "evidence": ["Nineteen CLI and receipt tests passed; the launcher output help path reached Mavis without loading a model."]
+    },
+    {
+      "id": "source-gates",
+      "requirement": "Keep receipt schema and objective verification intact.",
+      "status": "pass",
+      "command": "PYTHONPATH=local-codex/mavis python3 -m unittest discover -s local-codex/mavis/tests -v",
+      "artifact": "local-codex/mavis/mavis/cli.py",
+      "evidence": ["All 255 Mavis source tests passed; architecture, syntax, and whitespace checks passed. The launcher route addition passed its focused test afterward."]
+    }
+  ],
+  "uncertainty": ["No installed Mavis package or live local model transport was tested in this isolated source checkout."]
+}
