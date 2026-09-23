@@ -12,7 +12,7 @@ import uuid
 
 from .archive_hygiene import ArchiveRetention, ForegroundYield, RETENTION_DAYS, _parse, _stamp
 from .maintenance import HOST_KINDS, MaintenanceQueue
-from .runtime import inventory
+from .runtime import handoff_lease_fd, inventory
 from .storage import read_json, sha256_file, write_json
 
 
@@ -35,9 +35,12 @@ def _lock_available(path: Path) -> bool:
         os.close(descriptor)
 
 
-def host_admission(home: Path, *, iris_endpoint: str = "http://127.0.0.1:8000/v1") -> tuple[bool, str]:
+def host_admission(home: Path, *, iris_endpoint: str = "http://127.0.0.1:8000/v1",
+                   lease_held: bool = False) -> tuple[bool, str]:
     """Defer unless the Mavis lease and read-only IRIS signals are clear."""
-    if not _lock_available(Path(home) / "generation.lock"):
+    if lease_held:
+        handoff_lease_fd()
+    if not lease_held and not _lock_available(Path(home) / "generation.lock"):
         return False, "Mavis foreground generation owns its host lease"
     try:
         records = inventory(iris_endpoint)
@@ -57,7 +60,8 @@ def host_admission(home: Path, *, iris_endpoint: str = "http://127.0.0.1:8000/v1
     if any(marker in command for command in processes.stdout.splitlines()
            for marker in BENCHMARK_MARKERS):
         return False, "a local model benchmark process is active"
-    return True, "Mavis lease free; no loaded IRIS generation model or known benchmark"
+    lease_state = "Mavis lease held by caller" if lease_held else "Mavis lease free"
+    return True, f"{lease_state}; no loaded IRIS generation model or known benchmark"
 
 
 def _due_project(retention: ArchiveRetention, now: datetime) -> str | None:

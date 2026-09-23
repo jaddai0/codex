@@ -19,6 +19,9 @@ from .e1_bootstrap_gateway import (complete_bootstrap_review, start_bootstrap_ve
 from .e1_review import check_review_report
 from .e1_review_gateway import (complete_review, start_review_verifier,
                                 verify_and_import_review)
+from .embedding_index import EmbeddingIdentity
+from .embedding_index import EmbeddingIndex
+from .embedding_provider import DEFAULT_ENDPOINT, INDEX_VERSION, LocalEmbeddingProvider
 from .experiments import ExperimentStore, review_assignment_requirements
 from .e0_tasks import prepare_small_repository
 from .e2_tasks import prepare_heldout, verify_heldout
@@ -60,6 +63,23 @@ def runtime_config(args: argparse.Namespace) -> RuntimeConfig:
 
 def print_json(payload: object) -> None:
     print(json.dumps(payload, indent=2, sort_keys=True))
+
+
+def _embedding_provider(args: argparse.Namespace, home: Path) -> LocalEmbeddingProvider:
+    if not args.embedding_model or not args.embedding_revision or not args.embedding_dimensions:
+        raise ValueError("embeddings need --embedding-model, --embedding-revision, and --embedding-dimensions")
+    return LocalEmbeddingProvider(
+        identity=EmbeddingIdentity(args.embedding_model, args.embedding_revision,
+                                   INDEX_VERSION, args.embedding_dimensions),
+        home=home, endpoint=args.embedding_endpoint,
+    )
+
+
+def _embedding_options(parser: argparse.ArgumentParser) -> None:
+    parser.add_argument("--embedding-model")
+    parser.add_argument("--embedding-revision")
+    parser.add_argument("--embedding-dimensions", type=int)
+    parser.add_argument("--embedding-endpoint", default=DEFAULT_ENDPOINT)
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -146,10 +166,15 @@ def build_parser() -> argparse.ArgumentParser:
     index_sub = index.add_subparsers(dest="index_command", required=True)
     index_sub.add_parser("refresh")
     index_sub.add_parser("status")
+    vector_refresh = index_sub.add_parser("refresh-embeddings")
+    _embedding_options(vector_refresh)
+    vector_refresh.add_argument("--rebuild", action="store_true")
     index_search = index_sub.add_parser("search")
     index_search.add_argument("query")
     index_search.add_argument("--limit", type=int, default=20)
     index_search.add_argument("--offset", type=int, default=0)
+    index_search.add_argument("--embeddings", action="store_true")
+    _embedding_options(index_search)
     index_symbol = index_sub.add_parser("symbol")
     index_symbol.add_argument("name")
     index_symbol.add_argument("--limit", type=int, default=20)
@@ -606,9 +631,32 @@ def main(argv: list[str] | None = None) -> int:
         if args.index_command == "refresh":
             print_json(index.refresh())
         elif args.index_command == "status":
-            print_json(index.status())
+            status = index.status()
+            status["embedding"] = EmbeddingIndex(index).status()
+            print_json(status)
+        elif args.index_command == "refresh-embeddings":
+            try:
+                provider = _embedding_provider(args, home)
+                print_json(index.refresh_embeddings(provider, rebuild=args.rebuild))
+            except Exception as exc:
+                print_json({"status": "failed", "embedding_error": {
+                    "type": type(exc).__name__, "message": str(exc)}})
+                return 2
         elif args.index_command == "search":
-            print_json(index.search(args.query, args.limit, args.offset))
+            provider = None
+            provider_error = None
+            if args.embeddings:
+                try:
+                    provider = _embedding_provider(args, home)
+                    provider.ready()
+                except Exception as exc:
+                    provider_error = {"type": type(exc).__name__, "message": str(exc)}
+            hits = index.search(args.query, args.limit, args.offset,
+                                embedding_provider=provider)
+            if args.embeddings:
+                print_json({"hits": hits, "embedding_error": provider_error or index.last_embedding_error})
+            else:
+                print_json(hits)
         elif args.index_command == "symbol":
             print_json(index.symbol(args.name, args.limit, args.offset))
         else:
