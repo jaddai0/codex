@@ -9,6 +9,7 @@ from pathlib import Path
 import signal
 import subprocess
 import sys
+import os
 
 from prepare_runtime import accepted_main_profile, atomic_write
 
@@ -19,12 +20,21 @@ def digest(path: Path) -> str:
 
 def check_profile_cli_arguments(arguments: list[str]) -> None:
     """Refuse Codex flags that can change an accepted profile's effective runtime."""
-    long_flags = ("--model", "--profile", "--config", "--oss", "--local-provider",
-                  "--enable", "--disable")
+    long_flags = (
+        "--model",
+        "--profile",
+        "--config",
+        "--oss",
+        "--local-provider",
+        "--enable",
+        "--disable",
+    )
     for argument in arguments:
         if argument == "--":
             break
-        if argument in long_flags or any(argument.startswith(flag + "=") for flag in long_flags):
+        if argument in long_flags or any(
+            argument.startswith(flag + "=") for flag in long_flags
+        ):
             raise ValueError(f"{argument} can override an accepted main profile")
         if argument.startswith(("-m", "-p", "-c")) and not argument.startswith("--"):
             raise ValueError(f"{argument} can override an accepted main profile")
@@ -44,7 +54,9 @@ def launch(receipt_path: Path | None, argv: list[str]) -> int:
             if digest(Path(receipt[f"{name}_path"])) != receipt[f"{name}_sha256"]:
                 raise ValueError(f"profile {name} changed after preparation")
         if receipt["instructions_sha256"] != receipt["effective_system_prompt_sha256"]:
-            raise ValueError("accepted instructions differ from recorded effective prompt")
+            raise ValueError(
+                "accepted instructions differ from recorded effective prompt"
+            )
         if digest(Path(receipt["profile_path"])) != receipt["profile_sha256"]:
             raise ValueError("accepted profile changed after preparation")
         active = accepted_main_profile(Path(receipt["mavis_home"]))
@@ -59,29 +71,170 @@ def launch(receipt_path: Path | None, argv: list[str]) -> int:
             "model_instructions_file": receipt["instructions_path"],
         }
         overrides = [f"{key}={json.dumps(value)}" for key, value in bindings.items()]
-        launch_argv = [argv[0], *(item for override in overrides for item in ("-c", override)), *argv[1:]]
+        launch_argv = [
+            argv[0],
+            *(item for override in overrides for item in ("-c", override)),
+            *argv[1:],
+        ]
         receipt["binding_overrides"] = overrides
     child = subprocess.Popen(launch_argv)
     if receipt is not None:
-        receipt.update({"state": "spawned", "spawned_at": datetime.now(timezone.utc).isoformat(),
-                        "core_binary": str(Path(argv[0]).resolve()), "core_pid": child.pid})
+        receipt.update(
+            {
+                "state": "spawned",
+                "spawned_at": datetime.now(timezone.utc).isoformat(),
+                "core_binary": str(Path(argv[0]).resolve()),
+                "core_pid": child.pid,
+            }
+        )
         try:
-            atomic_write(receipt_path, json.dumps(receipt, indent=2, sort_keys=True) + "\n")
+            atomic_write(
+                receipt_path, json.dumps(receipt, indent=2, sort_keys=True) + "\n"
+            )
         except BaseException:
             child.terminate()
             child.wait()
             raise
+
     def forward(signum, _frame):
         if child.poll() is None:
             child.send_signal(signum)
+
     for signum in (signal.SIGINT, signal.SIGTERM):
         signal.signal(signum, forward)
     return_code = child.wait()
     if receipt is not None:
-        receipt.update({"state": "exited", "exited_at": datetime.now(timezone.utc).isoformat(),
-                        "core_exit_code": return_code})
+        receipt.update(
+            {
+                "state": "exited",
+                "exited_at": datetime.now(timezone.utc).isoformat(),
+                "core_exit_code": return_code,
+            }
+        )
         atomic_write(receipt_path, json.dumps(receipt, indent=2, sort_keys=True) + "\n")
     return return_code if return_code >= 0 else 128 - return_code
+
+
+def launch_trial(receipt_path: Path, argv: list[str]) -> int:
+    """Run a frozen E1 arm; process exit alone never establishes trial success."""
+    from trial_runtime import validate_trial_receipt
+
+    if not argv:
+        raise ValueError("E1 core command is required")
+    check_profile_cli_arguments(argv[1:])
+    receipt = json.loads(receipt_path.read_text(encoding="utf-8"))
+    validate_trial_receipt(receipt)
+    bindings = {
+        "model": receipt["selected_model"],
+        "model_provider": "omlx",
+        "model_catalog_json": receipt["catalog_path"],
+        "model_instructions_file": receipt["instructions_path"],
+    }
+    overrides = [f"{key}={json.dumps(value)}" for key, value in bindings.items()]
+    launch_argv = [
+        argv[0],
+        *(item for override in overrides for item in ("-c", override)),
+        *argv[1:],
+    ]
+    receipt["binding_overrides"] = overrides
+    environment = os.environ.copy()
+    environment.update(
+        {
+            "CODEX_HOME": receipt["runtime_home"],
+            "MAVIS_HOME": receipt["mavis_home"],
+            "MAVIS_E1_TRIAL_ID": receipt["trial_id"],
+            "MAVIS_E1_EFFECTIVE_CONFIG_EVENT": receipt["observation_path"],
+            "MAVIS_E1_CATALOG_PATH": receipt["catalog_path"],
+            "MAVIS_PRECOMPACT_REQUIRED": "1",
+            "MAVIS_RAW_OUTPUT_REQUIRED": "1",
+        }
+    )
+    share = str(Path(receipt["core_binary"]).parent)
+    environment["PYTHONPATH"] = share + (
+        os.pathsep + environment["PYTHONPATH"] if environment.get("PYTHONPATH") else ""
+    )
+    checkout = Path(receipt["checkout"])
+    with (
+        Path(receipt["stdout_path"]).open("xb") as stdout,
+        Path(receipt["stderr_path"]).open("xb") as stderr,
+    ):
+        child = subprocess.Popen(
+            launch_argv, cwd=checkout, env=environment, stdout=stdout, stderr=stderr
+        )
+        receipt.update(
+            {
+                "state": "spawned",
+                "spawned_at": datetime.now(timezone.utc).isoformat(),
+                "core_pid": child.pid,
+            }
+        )
+        try:
+            atomic_write(
+                receipt_path, json.dumps(receipt, indent=2, sort_keys=True) + "\n"
+            )
+        except BaseException:
+            child.terminate()
+            child.wait()
+            raise
+        try:
+            exit_code = child.wait()
+        except BaseException:
+            child.terminate()
+            child.wait()
+            raise
+    receipt.update(
+        {
+            "state": "exited",
+            "exited_at": datetime.now(timezone.utc).isoformat(),
+            "core_exit_code": exit_code,
+            "stdout_sha256": digest(Path(receipt["stdout_path"])),
+            "stderr_sha256": digest(Path(receipt["stderr_path"])),
+        }
+    )
+    from trial_runtime import _git
+
+    receipt["resulting_revision"] = _git(checkout, "rev-parse", "HEAD")
+    receipt["checkout_dirty"] = bool(
+        _git(checkout, "status", "--porcelain", "--untracked-files=all", "--ignored")
+    )
+    try:
+        event_path = Path(receipt["observation_path"])
+        event = json.loads(event_path.read_text(encoding="utf-8"))
+        expected = {
+            "schema_version": "mavis.e1-effective-config/v1",
+            "trial_id": receipt["trial_id"],
+            "model": receipt["selected_model"],
+            "model_provider": "omlx",
+            "catalog_sha256": receipt["catalog_sha256"],
+            "base_instructions_sha256": receipt["instructions_sha256"],
+        }
+        if any(
+            event.get(key) != value for key, value in expected.items()
+        ) or not event.get("session_id"):
+            raise ValueError(
+                "core effective-config observation differs from frozen E1 arm"
+            )
+        transcript = Path(event["rollout_path"])
+        if not transcript.is_file():
+            raise ValueError("core E1 transcript is missing")
+        receipt.update(
+            {
+                "observation_status": "matched",
+                "observation_sha256": digest(event_path),
+                "transcript_path": str(transcript.resolve()),
+                "transcript_sha256": digest(transcript),
+            }
+        )
+    except (OSError, ValueError, KeyError, TypeError) as error:
+        receipt.update(
+            {"observation_status": "inconclusive", "observation_error": str(error)}
+        )
+    atomic_write(receipt_path, json.dumps(receipt, indent=2, sort_keys=True) + "\n")
+    return (
+        exit_code
+        if exit_code == 0 and receipt["observation_status"] == "matched"
+        else 2
+    )
 
 
 def main() -> int:
