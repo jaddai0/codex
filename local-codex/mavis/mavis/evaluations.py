@@ -17,6 +17,7 @@ import re
 import shlex
 import subprocess
 from typing import Any, Callable
+from urllib.parse import urlparse
 from urllib.request import Request, urlopen
 
 from .evidence import run_command
@@ -169,10 +170,19 @@ def native_review_completed(log: str, verdict: str) -> bool:
     )
 
 
+def _local_response_url(url: str) -> str:
+    parsed = urlparse(url)
+    if (parsed.scheme != "http" or parsed.hostname not in {"127.0.0.1", "localhost", "::1"}
+            or parsed.username is not None or parsed.password is not None
+            or parsed.query or parsed.fragment or parsed.path != "/v1/responses"):
+        raise ValueError("E0 Responses API must use the local oMLX endpoint")
+    return url
+
+
 def _post_json(url: str, payload: dict[str, Any], timeout: float = 180.0) -> dict[str, Any]:
     body = json.dumps(payload).encode("utf-8")
     request = Request(
-        url,
+        _local_response_url(url),
         data=body,
         method="POST",
         headers={"Content-Type": "application/json", "Accept": "application/json"},

@@ -639,8 +639,12 @@ class E1Runner:
                 or _git(checkout, "rev-parse", "HEAD") != case["revision"]
                 or _git(checkout, "status", "--porcelain")):
             raise ValueError("candidate checkout is not clean at its frozen revision")
-        provider, harness = {"minimax": ("minimax", "opencode"),
-                             "zcode": ("zai", "zcode")}[lane]
+        # This translates the two E1 lane names for a single assignment. The
+        # gateway remains the owner of provider discovery and availability.
+        if lane == "minimax":
+            provider, harness = "minimax", "opencode"
+        else:
+            provider, harness = "zai", "zcode"
         requirements = candidate_assignment_requirements(record)
         arguments = {
             "job_id": job_id, "task": task, "lane": lane, "model": model,
