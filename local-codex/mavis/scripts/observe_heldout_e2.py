@@ -102,6 +102,8 @@ def _run_tui(command: list[str], *, repo: Path, env: dict[str, str],
                         terminal_tail = (terminal_tail + chunk)[-16384:]
                         if (not trust_sent and b"folder?" in terminal_tail
                                 and b"Trust and continue" in terminal_tail):
+                            # Codex discards input queued during the trust-screen transition.
+                            time.sleep(1)
                             os.write(master, b"\r")
                             trust_sent = True
                     except OSError:

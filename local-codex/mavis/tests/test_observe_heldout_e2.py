@@ -17,12 +17,14 @@ observer = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(observer)
 
 FAKE_TUI = r"""
-import json,sys
+import json,sys,termios,time
 from pathlib import Path
 rollout=Path(sys.argv[1]);repo=sys.argv[2];prompt=sys.argv[3]
 rollout.parent.mkdir(parents=True,exist_ok=True)
 sys.stdout.write('Trust\x1b[5;9Hthis\x1b[5;14Hfolder?\n1. Trust and continue\n')
 sys.stdout.flush()
+time.sleep(0.4)
+termios.tcflush(sys.stdin.fileno(),termios.TCIFLUSH)
 if sys.stdin.readline().strip():raise SystemExit('trust was not confirmed')
 rows=[
  {"type":"session_meta","payload":{"id":"session-test","cwd":repo}},
