@@ -10,6 +10,7 @@ import subprocess
 import uuid
 from typing import Iterable
 
+from .archive_hygiene import prepare_evidence_write
 from .storage import require_safe_id, sha256_file, write_json
 
 
@@ -66,6 +67,7 @@ def run_command(
     require_safe_id(objective_id, "objective id")
     if not command or not all(isinstance(item, str) and item for item in command):
         raise ValueError("command must be a non-empty argument list")
+    capacity = prepare_evidence_write(home)
     receipt_id = uuid.uuid4().hex
     evidence_dir = Path(home) / "evidence" / objective_id / receipt_id
     evidence_dir.mkdir(parents=True, exist_ok=False)
@@ -111,6 +113,7 @@ def run_command(
             {require_safe_id(item, "acceptance check id") for item in acceptance_check_ids}
         ),
         "producer": "mavis-host-command/v1",
+        "storage_pressure_before": capacity,
         "verdict": parse_test_output(combined, exit_status, timed_out),
     }
     receipt_path = evidence_dir / "receipt.json"
