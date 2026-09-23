@@ -14,14 +14,16 @@ from mavis.e0_tasks import prepare_small_repository, small_repository_review_pro
 from mavis.e2_tasks import codex_terra_review_completed, terra_review_command
 from mavis.evaluations import installed_candidate_fingerprint
 from mavis.runtime import (RuntimeConfig, acquire_iris_model_drain,
-                           ensure_runtime, inventory, iris_drain_headers,
+                           ensure_runtime, handoff_lease_fd, inventory, iris_drain_headers,
                            load_model, loaded_generation_models, port_in_use,
                            request_json, require_idle_iris_handoff,
                            require_installed_selected_model, release_iris_model_drain,
-                           stop_server, wait_iris_model_drain)
+                           stop_server, wait_iris_model_drain,
+                           with_mavis_handoff_lease)
 from mavis.storage import sha256_file, write_json
 
 
+@with_mavis_handoff_lease("observe_small_repository")
 def main() -> int:
     home = Path.home()
     service = home / ".local-codex" / "mavis-service"
@@ -60,11 +62,14 @@ def main() -> int:
         )
         command = [str(home / "Desktop" / "Mavis.command"), "exec", "--json",
                    "-C", str(repo), "-s", "workspace-write", prompt]
+        lease_fd = handoff_lease_fd()
         with (task / "installed-mavis-repair.jsonl").open("wb") as log:
             run = subprocess.run(command, cwd=repo, stdin=subprocess.DEVNULL,
                                  stdout=log, stderr=subprocess.STDOUT,
                                  env={**os.environ, "MAVIS_PROJECT_DIR": str(repo),
-                                      "PYTHONDONTWRITEBYTECODE": "1"}, timeout=900)
+                                      "PYTHONDONTWRITEBYTECODE": "1",
+                                      "MAVIS_GENERATION_LEASE_FD": str(lease_fd)},
+                                 pass_fds=(lease_fd,), timeout=900)
         result["mavis_exit"] = run.returncode
     except BaseException as exc:
         result["mavis_error"] = repr(exc)

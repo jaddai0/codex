@@ -19,11 +19,12 @@ from urllib.parse import quote
 
 from mavis.evaluations import installed_candidate_fingerprint
 from mavis.runtime import (RuntimeConfig, acquire_iris_model_drain,
-                           ensure_runtime, inventory, iris_drain_headers,
+                           ensure_runtime, handoff_lease_fd, inventory, iris_drain_headers,
                            load_model, loaded_generation_models, port_in_use,
                            request_json, require_idle_iris_handoff,
                            require_installed_selected_model, release_iris_model_drain,
-                           stop_server, wait_iris_model_drain)
+                           stop_server, wait_iris_model_drain,
+                           with_mavis_handoff_lease)
 from mavis.storage import write_json
 
 
@@ -58,6 +59,7 @@ def events(path: Path) -> list[dict]:
     return records
 
 
+@with_mavis_handoff_lease("observe_compaction_restart")
 def main() -> int:
     home = Path.home()
     service = home / ".local-codex" / "mavis-service"
@@ -99,14 +101,16 @@ def main() -> int:
         if loaded(config.iris_endpoint):
             raise RuntimeError("IRIS model did not unload")
         load_model(config)
+        lease_fd = handoff_lease_fd()
         env = {**os.environ, "MAVIS_PROJECT_DIR": str(workspace),
-               "PYTHONDONTWRITEBYTECODE": "1"}
+               "PYTHONDONTWRITEBYTECODE": "1",
+               "MAVIS_GENERATION_LEASE_FD": str(lease_fd)}
         launcher = str(home / "Desktop" / "Mavis.command")
         started = time.time()
         print(f"First Mavis TUI in {workspace}; wait for ACK, then /compact and /exit", flush=True)
         first = subprocess.run([launcher, "--no-daemon", "--no-alt-screen", "-C",
                                 str(workspace), f"Remember this exact fact: {fact}. Reply only ACK."],
-                               cwd=workspace, env=env, timeout=900)
+                               cwd=workspace, env=env, pass_fds=(lease_fd,), timeout=900)
         result["first_exit"] = first.returncode
         session_root = home / ".local-codex" / "sessions"
         transcript: list[dict] = []
@@ -139,7 +143,7 @@ def main() -> int:
         second = subprocess.run([launcher, "resume", "--no-daemon", "--no-alt-screen",
                                  "-C", str(workspace), session,
                                  "What exact fact did I give before compaction? Reply with only the fact."],
-                                cwd=workspace, env=env, timeout=900)
+                                cwd=workspace, env=env, pass_fds=(lease_fd,), timeout=900)
         result["resume_exit"] = second.returncode
         transcript = events(rollout)
         answers = [item.get("payload", {}).get("last_agent_message")

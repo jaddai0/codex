@@ -3,6 +3,10 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from contextlib import contextmanager
+from contextvars import ContextVar
+import fcntl
+from functools import wraps
 import json
 import os
 from pathlib import Path
@@ -12,7 +16,7 @@ import stat
 import subprocess
 import sys
 import time
-from typing import Any
+from typing import Any, Callable
 import uuid
 from urllib.error import URLError
 from urllib.parse import quote, urlparse
@@ -22,6 +26,7 @@ from .storage import read_json, write_json
 
 
 DEFAULT_MODEL = "Qwen3.8-Flash-Next-Abliterated-MLX-4bit"
+_HANDOFF_LEASE_FD: ContextVar[int | None] = ContextVar("mavis_handoff_lease_fd", default=None)
 
 
 @dataclass(frozen=True)
@@ -205,6 +210,51 @@ def release_iris_model_drain(config: RuntimeConfig, lease_id: str) -> None:
             or result.get("lease_id") != lease_id
             or result.get("state") != "released"):
         raise RuntimeError("IRIS model drain release was not confirmed")
+
+
+@contextmanager
+def mavis_generation_lease(config: RuntimeConfig, *, purpose: str):
+    """Hold the same host lock as the installed launcher for a full handoff."""
+    config.home.mkdir(parents=True, exist_ok=True, mode=0o700)
+    descriptor = os.open(config.home / "generation.lock",
+                         os.O_CREAT | os.O_RDWR | os.O_NOFOLLOW, 0o600)
+    try:
+        try:
+            fcntl.flock(descriptor, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError as error:
+            raise RuntimeError("another Mavis local generation owns the host lease") from error
+        os.ftruncate(descriptor, 0)
+        os.write(descriptor, (json.dumps({"pid": os.getpid(), "purpose": purpose,
+                                          "acquired_at_epoch": time.time()}) + "\n").encode())
+        os.fsync(descriptor)
+        context_token = _HANDOFF_LEASE_FD.set(descriptor)
+        try:
+            yield
+        finally:
+            _HANDOFF_LEASE_FD.reset(context_token)
+            os.ftruncate(descriptor, 0)
+            fcntl.flock(descriptor, fcntl.LOCK_UN)
+    finally:
+        os.close(descriptor)
+
+
+def handoff_lease_fd() -> int:
+    descriptor = _HANDOFF_LEASE_FD.get()
+    if descriptor is None:
+        raise RuntimeError("Mavis handoff lease is not held")
+    return descriptor
+
+
+def with_mavis_handoff_lease(purpose: str) -> Callable:
+    """Protect an installed observer from concurrent Mavis launcher startup."""
+    def decorate(function: Callable) -> Callable:
+        @wraps(function)
+        def guarded(*args: Any, **kwargs: Any) -> Any:
+            config = RuntimeConfig(home=Path.home() / ".local-codex" / "mavis-service")
+            with mavis_generation_lease(config, purpose=purpose):
+                return function(*args, **kwargs)
+        return guarded
+    return decorate
 
 
 def _port(endpoint: str) -> int:

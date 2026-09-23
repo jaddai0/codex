@@ -9,7 +9,9 @@ from mavis.runtime import (
     admission,
     acquire_iris_model_drain,
     ensure_isolated_settings,
+    handoff_lease_fd,
     loaded_generation_models,
+    mavis_generation_lease,
     owns_running_server,
     require_idle_iris_handoff,
     require_installed_selected_model,
@@ -93,6 +95,20 @@ class RuntimeTests(unittest.TestCase):
                 patch("mavis.runtime.request_json", return_value={"state": "drained"}), \
                 self.assertRaisesRegex(RuntimeError, "invalid lease"):
             acquire_iris_model_drain(config, owner="mavis-e0")
+
+    def test_handoff_lock_exposes_only_held_descriptor(self):
+        with tempfile.TemporaryDirectory() as directory:
+            config = RuntimeConfig(home=Path(directory))
+            with self.assertRaisesRegex(RuntimeError, "not held"):
+                handoff_lease_fd()
+            with mavis_generation_lease(config, purpose="test"):
+                descriptor = handoff_lease_fd()
+                self.assertGreaterEqual(descriptor, 0)
+                with self.assertRaisesRegex(RuntimeError, "host lease"):
+                    with mavis_generation_lease(config, purpose="competing"):
+                        pass
+            with self.assertRaisesRegex(RuntimeError, "not held"):
+                handoff_lease_fd()
 
     def test_ownership_requires_exact_binary_base_path_and_port(self):
         with tempfile.TemporaryDirectory() as directory:

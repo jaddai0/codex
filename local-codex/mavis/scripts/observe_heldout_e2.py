@@ -26,11 +26,12 @@ from mavis.e2_tasks import (CATALOG_TEST, FULL_TEST, _completed_prompt_turn,
 from mavis.e1_bootstrap import _summary as current_e0_summary
 from mavis.evaluations import installed_candidate_fingerprint
 from mavis.runtime import (RuntimeConfig, acquire_iris_model_drain,
-                           ensure_runtime, inventory, iris_drain_headers,
+                           ensure_runtime, handoff_lease_fd, inventory, iris_drain_headers,
                            load_model, loaded_generation_models, port_in_use,
                            request_json, require_idle_iris_handoff,
                            require_installed_selected_model, release_iris_model_drain,
-                           stop_server, wait_iris_model_drain)
+                           stop_server, wait_iris_model_drain,
+                           with_mavis_handoff_lease)
 from mavis.storage import sha256_file, write_json
 
 
@@ -42,7 +43,12 @@ def _records(path: Path) -> list[dict]:
 
 
 def _run_tui(command: list[str], *, repo: Path, env: dict[str, str]) -> tuple[int, int]:
-    process = subprocess.Popen(command, cwd=repo, env=env)
+    lease_fd = handoff_lease_fd()
+    process = subprocess.Popen(
+        command, cwd=repo,
+        env={**env, "MAVIS_GENERATION_LEASE_FD": str(lease_fd)},
+        pass_fds=(lease_fd,),
+    )
     try:
         return process.pid, process.wait(timeout=1800)
     except BaseException:
@@ -55,6 +61,7 @@ def _run_tui(command: list[str], *, repo: Path, env: dict[str, str]) -> tuple[in
         raise
 
 
+@with_mavis_handoff_lease("observe_heldout_e2")
 def main() -> int:
     service = Path.home() / ".local-codex" / "mavis-service"
     config = RuntimeConfig(home=service)
