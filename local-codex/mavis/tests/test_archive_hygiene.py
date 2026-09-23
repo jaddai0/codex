@@ -194,7 +194,7 @@ class ArchiveRetentionTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory:
             home = Path(directory)
             archive, original, retention, closed = self._closed(home)
-            HelperSession(home, "librarian").store_query_context(
+            HelperSession(home, "librarian", context_id="conversation-1").store_query_context(
                 "where was the decision", [{"path": str(original), "line": 1}], now=time.time())
             result = retention.compact("project-1", now=closed + timedelta(days=31))
             self.assertEqual(result["segments"][0]["status"], "referenced")

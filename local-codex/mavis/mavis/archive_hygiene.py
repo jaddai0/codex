@@ -382,10 +382,17 @@ class ArchiveRetention:
             if path.is_symlink():
                 raise ValueError("handoff symlink is unsafe")
             references.update(_strings(read_json(path).get("evidence_links", [])))
-        helper_context = self.home / "helpers" / "librarian" / "query-context.json"
-        if helper_context.is_symlink():
-            raise ValueError("librarian citation cache is a symlink")
-        if helper_context.is_file():
+        helper_root = self.home / "helpers" / "librarian"
+        contexts_root = helper_root / "contexts"
+        if contexts_root.is_symlink():
+            raise ValueError("librarian context directory is a symlink")
+        helper_contexts = [helper_root / "query-context.json"]
+        helper_contexts.extend(contexts_root.glob("*/query-context.json"))
+        for helper_context in helper_contexts:
+            if helper_context.is_symlink() or helper_context.parent.is_symlink():
+                raise ValueError("librarian citation cache is a symlink")
+            if not helper_context.is_file():
+                continue
             payload = read_json(helper_context)
             if (payload.get("role") == "librarian"
                 and float(payload.get("expires_at_epoch", 0)) > time.time()):

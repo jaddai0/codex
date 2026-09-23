@@ -222,7 +222,8 @@ def _librarian_case(home: Path, case: dict[str, Any], ask: Callable[..., dict[st
     packet = _evidence_packet(librarian, terms)
     if not packet:
         raise ValueError("no verified transcript evidence matched the librarian case")
-    session = HelperSession(home, "librarian", ttl_seconds=60)
+    session = HelperSession(home, "librarian", ttl_seconds=60,
+                            context_id=conversation)
     if case.get("followup") is not True:
         session.clear()
     prior = session.followup_context() if case.get("followup") is True else None

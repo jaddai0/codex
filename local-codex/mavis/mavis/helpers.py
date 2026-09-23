@@ -13,7 +13,7 @@ import time
 from typing import Any
 import uuid
 
-from .storage import write_json
+from .storage import require_safe_id, write_json
 
 
 HELPER_ROLES = {"librarian", "output-reader"}
@@ -21,7 +21,8 @@ _EXPIRY_WORKERS: list[subprocess.Popen[bytes]] = []
 
 
 class HelperSession:
-    def __init__(self, home: Path, role: str, ttl_seconds: int = 60):
+    def __init__(self, home: Path, role: str, ttl_seconds: int = 60,
+                 *, context_id: str | None = None):
         if role not in HELPER_ROLES:
             raise ValueError(f"unknown helper role: {role}")
         if ttl_seconds <= 0:
@@ -30,7 +31,10 @@ class HelperSession:
         self.role = role
         self.root = self.home / "helpers" / role
         self.ttl_seconds = ttl_seconds
-        self.cache_path = self.root / "query-context.json"
+        self.context_id = (require_safe_id(context_id, "helper context id")
+                           if context_id is not None else None)
+        self.cache_path = (self.root / "contexts" / self.context_id / "query-context.json"
+                           if self.context_id is not None else self.root / "query-context.json")
         self.lock_path = self.root / "query-context.lock"
 
     @contextmanager
@@ -57,14 +61,21 @@ class HelperSession:
         lease_id = uuid.uuid4().hex
         expires_at = observed + self.ttl_seconds
         with self._locked():
-            write_json(self.cache_path, {
+            if ((self.root / "contexts").is_symlink()
+                    or self.cache_path.parent.is_symlink()):
+                raise ValueError("helper context directory is a symlink")
+            self.cache_path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+            payload = {
                 "schema_version": "mavis.helper-query-context/v1",
                 "role": self.role,
                 "query": query,
                 "citations": citations,
                 "expires_at_epoch": expires_at,
                 "lease_id": lease_id,
-            })
+            }
+            if self.context_id is not None:
+                payload["context_id"] = self.context_id
+            write_json(self.cache_path, payload)
         # Synthetic clocks in unit tests are checked by followup_context().
         # Real one-shot CLI runs need a separate worker that survives CLI exit.
         if now is None:
@@ -73,7 +84,8 @@ class HelperSession:
             try:
                 worker = subprocess.Popen(
                     [sys.executable, "-m", "mavis.helpers", "--expire",
-                     str(self.home.resolve()), self.role, lease_id, str(expires_at)],
+                     str(self.home.resolve()), self.role, lease_id, str(expires_at),
+                     self.context_id or "-"],
                     stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
                     stderr=subprocess.DEVNULL, start_new_session=True,
                     close_fds=True, env=environment,
@@ -96,7 +108,9 @@ class HelperSession:
             except (OSError, json.JSONDecodeError):
                 self.cache_path.unlink(missing_ok=True)
                 return None
-            if payload.get("role") != self.role or observed >= float(payload.get("expires_at_epoch", 0)):
+            if (payload.get("role") != self.role
+                    or payload.get("context_id") != self.context_id
+                    or observed >= float(payload.get("expires_at_epoch", 0))):
                 self.cache_path.unlink(missing_ok=True)
                 return None
             return payload
@@ -120,20 +134,29 @@ class HelperSession:
             self.cache_path.unlink(missing_ok=True)
 
     def clear_for_compute_pressure(self) -> None:
-        self.clear()
+        with self._locked():
+            contexts = self.root / "contexts"
+            if contexts.is_symlink():
+                raise ValueError("helper context directory is a symlink")
+            paths = [self.root / "query-context.json", *contexts.glob("*/query-context.json")]
+            for path in paths:
+                if path.is_symlink() or path.parent.is_symlink():
+                    raise ValueError("helper context file is a symlink")
+                path.unlink(missing_ok=True)
 
 
 def _expiry_worker(argv: list[str]) -> int:
-    if len(argv) != 5 or argv[0] != "--expire":
+    if len(argv) not in (5, 6) or argv[0] != "--expire":
         raise ValueError("invalid helper expiry worker invocation")
-    _, home, role, lease_id, deadline = argv
+    _, home, role, lease_id, deadline = argv[:5]
+    context_id = argv[5] if len(argv) == 6 and argv[5] != "-" else None
     if len(lease_id) != 32 or any(character not in "0123456789abcdef" for character in lease_id):
         raise ValueError("invalid helper context lease")
     expires_at = float(deadline)
     if not -120 <= expires_at - time.time() <= 120:
         raise ValueError("helper expiry deadline is outside the bounded window")
     time.sleep(max(0, expires_at - time.time()))
-    HelperSession(Path(home), role)._expire_lease(lease_id)
+    HelperSession(Path(home), role, context_id=context_id)._expire_lease(lease_id)
     return 0
 
 

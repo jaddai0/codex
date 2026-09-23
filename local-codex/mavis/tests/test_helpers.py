@@ -27,6 +27,19 @@ class HelperSessionTests(unittest.TestCase):
             librarian.clear_for_compute_pressure()
             self.assertIsNone(librarian.followup_context(now=11))
 
+    def test_conversations_keep_independent_followups_until_pressure_clear(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            first = HelperSession(root, "librarian", context_id="first")
+            second = HelperSession(root, "librarian", context_id="second")
+            first.store_query_context("first question", [], now=10)
+            second.store_query_context("second question", [], now=11)
+            self.assertEqual(first.followup_context(now=12)["query"], "first question")
+            self.assertEqual(second.followup_context(now=12)["query"], "second question")
+            first.clear_for_compute_pressure()
+            self.assertIsNone(first.followup_context(now=12))
+            self.assertIsNone(second.followup_context(now=12))
+
     def test_context_file_disappears_after_deadline_without_followup_read(self):
         with tempfile.TemporaryDirectory() as directory:
             session = HelperSession(Path(directory), "librarian", ttl_seconds=0.25)

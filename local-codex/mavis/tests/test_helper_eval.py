@@ -46,7 +46,7 @@ class HelperEvaluationTests(unittest.TestCase):
             self.assertEqual(result["status"], "test-only")
             self.assertEqual(len(calls), 1)
             self.assertNotIn("expected_answer_terms", calls[0][1]["content"])
-            session = HelperSession(home, "librarian")
+            session = HelperSession(home, "librarian", context_id="history-one")
             expiry = result["cases"][0]["result"]["context_expires_at_epoch"]
             self.assertIsNotNone(session.followup_context(now=expiry - 0.01))
             self.assertIsNone(session.followup_context(now=expiry))
@@ -76,7 +76,8 @@ class HelperEvaluationTests(unittest.TestCase):
             first = TranscriptArchive(home, "first")
             first.append_segment([{"content": "old decision"}])
             old = first.search("old decision")[0]
-            HelperSession(home, "librarian").store_query_context("old question", [
+            first_session = HelperSession(home, "librarian", context_id="first")
+            first_session.store_query_context("old question", [
                 {key: old[key] for key in ("path", "line", "sha256")}
             ])
             second = TranscriptArchive(home, "second")
@@ -97,6 +98,7 @@ class HelperEvaluationTests(unittest.TestCase):
                         "citations": [citation]}
 
             self.assertEqual(evaluate(home, suite, MODEL, BASE_URL, ask=ask)["status"], "test-only")
+            self.assertEqual(first_session.followup_context()["query"], "old question")
 
     def test_output_known_format_uses_host_parser_before_model(self):
         with tempfile.TemporaryDirectory() as directory:
