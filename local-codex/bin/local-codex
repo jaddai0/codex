@@ -9,7 +9,8 @@ core_binary=${LOCAL_CODEX_BIN:-${share_dir}/local-codex-core}
 model_args=()
 gateway_env_args=()
 
-if [[ ${1:-} == e1 && ${2:-} == trial ]]; then
+if [[ ${1:-} == e1 ]]; then
+  export CODEX_HOME=${CODEX_HOME:-$runtime_home}
   export LOCAL_CODEX_SHARE_DIR="$share_dir"
   export PYTHONPATH="${share_dir}${PYTHONPATH:+:${PYTHONPATH}}"
   exec python3 -m mavis "$@"

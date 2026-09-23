@@ -5,6 +5,29 @@ repo_root=${0:A:h:h}
 install_bin=${LOCAL_CODEX_INSTALL_BIN:-${HOME}/.local/bin}
 install_share=${LOCAL_CODEX_INSTALL_SHARE:-${HOME}/.local/share/local-codex}
 
+python3 - "$repo_root" <<'PY'
+from pathlib import Path
+import subprocess
+import sys
+
+source = Path(sys.argv[1]).resolve(strict=True)
+revision = subprocess.check_output(["git", "-C", str(source), "rev-parse", "HEAD"], text=True).strip()
+base = "local-codex/mavis/mavis"
+committed = set(subprocess.check_output(
+    ["git", "-C", str(source), "ls-tree", "-r", "--name-only", revision, base],
+    text=True,
+).splitlines())
+actual = {path.relative_to(source).as_posix() for path in (source / base).rglob("*")
+          if path.is_file() and "__pycache__" not in path.parts and path.suffix != ".pyc"}
+if not committed or actual != committed:
+    raise SystemExit("Mavis install requires an exact committed source package")
+for relative in sorted(committed):
+    source_bytes = (source / relative).read_bytes()
+    committed_bytes = subprocess.check_output(["git", "-C", str(source), "show", f"{revision}:{relative}"])
+    if source_bytes != committed_bytes:
+        raise SystemExit(f"Mavis install source differs from Git revision: {relative}")
+PY
+
 cd "$repo_root/codex-rs"
 cargo build --release --bin codex
 
@@ -20,18 +43,34 @@ install -m 0644 "$repo_root/local-codex/persona.toml" "$install_share/persona.to
 install -m 0644 "$repo_root/codex-rs/models-manager/prompt.md" "$install_share/base-instructions.md"
 rm -rf "$install_share/mavis"
 cp -R "$repo_root/local-codex/mavis/mavis" "$install_share/mavis"
+find "$install_share/mavis" -type d -name __pycache__ -prune -exec rm -rf {} +
+find "$install_share/mavis" -type f -name '*.pyc' -delete
 find "$install_share/mavis" -type d -exec chmod 0755 {} +
 find "$install_share/mavis" -type f -exec chmod 0644 {} +
 
-PYTHONPATH="$install_share${PYTHONPATH:+:$PYTHONPATH}" python3 - "$install_share" "$install_bin/mavis" <<'PY'
+PYTHONPATH="$install_share${PYTHONPATH:+:$PYTHONPATH}" python3 - "$install_share" "$install_bin/mavis" "$repo_root" <<'PY'
 import hashlib
 import json
 from pathlib import Path
+import subprocess
 import sys
 from mavis.package_provenance import package_tree_sha256
 
 share = Path(sys.argv[1]).resolve()
 launcher = Path(sys.argv[2]).resolve()
+source = Path(sys.argv[3]).resolve(strict=True)
+revision = subprocess.check_output(["git", "-C", str(source), "rev-parse", "HEAD"], text=True).strip()
+committed_package = subprocess.check_output(
+    ["git", "-C", str(source), "ls-tree", "-r", "--name-only", revision,
+     "local-codex/mavis/mavis"], text=True,
+).splitlines()
+if not committed_package:
+    raise SystemExit("install source revision has no committed Mavis package")
+for relative in committed_package:
+    installed = share / relative.removeprefix("local-codex/mavis/")
+    committed = subprocess.check_output(["git", "-C", str(source), "show", f"{revision}:{relative}"])
+    if not installed.is_file() or installed.read_bytes() != committed:
+        raise SystemExit(f"installed Mavis source differs from Git revision: {relative}")
 core = share / "local-codex-core"
 manifest = {
     "schema_version": "mavis.installed-core/v1",
@@ -46,6 +85,8 @@ manifest = {
     "base_instructions_sha256": hashlib.sha256((share / "base-instructions.md").read_bytes()).hexdigest(),
     "persona_sha256": hashlib.sha256((share / "persona.toml").read_bytes()).hexdigest(),
     "mavis_package_sha256": package_tree_sha256(share / "mavis"),
+    "source_repository": str(source),
+    "source_revision": revision,
 }
 path = share / "install-manifest.json"
 temporary = share / ".install-manifest.json.tmp"

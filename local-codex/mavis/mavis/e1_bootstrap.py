@@ -6,13 +6,16 @@ from datetime import datetime, timezone
 import hashlib
 import json
 from pathlib import Path
+import re
+import subprocess
 from typing import Any, Callable
 
 from .evaluations import E0_CASES, installed_candidate_fingerprint
-from .gateway import harness_job_status
+from .gateway import harness_assignment_start, harness_job_status
 from .objectives import _validate_gateway_status
+from .package_provenance import package_tree_sha256
 from .runtime import inventory
-from .storage import read_json, sha256_file, write_json
+from .storage import read_json, require_safe_id, sha256_file, write_json
 
 
 def _digest(value: Any) -> str:
@@ -158,6 +161,74 @@ def _requirements(assignment: dict[str, Any]) -> list[str]:
     ]
 
 
+def _git_revision(checkout: Path) -> str:
+    result = subprocess.run(
+        ["git", "-C", str(checkout), "rev-parse", "HEAD"],
+        capture_output=True,
+        text=True,
+        check=True,
+    )
+    return result.stdout.strip()
+
+
+
+def _review_checkout(
+    home: Path, package: dict[str, Any], *, create: bool
+) -> tuple[Path, str]:
+    repository = package.get("source_repository")
+    revision = package.get("source_revision")
+    if (
+        not isinstance(repository, str)
+        or not Path(repository).is_absolute()
+        or not isinstance(revision, str)
+        or not re.fullmatch(r"[0-9a-f]{40,64}", revision)
+    ):
+        raise ValueError("E1 bootstrap package lacks pinned Git source provenance")
+    checkout = home / "e1/bootstrap/review-checkout"
+    if checkout.is_symlink():
+        raise ValueError("E1 bootstrap review checkout cannot be a symlink")
+    if create:
+        if not checkout.exists():
+            source = Path(repository).resolve(strict=True)
+            checkout.parent.mkdir(parents=True, exist_ok=True)
+            subprocess.run(
+                [
+                    "git",
+                    "-C",
+                    str(source),
+                    "worktree",
+                    "add",
+                    "--detach",
+                    str(checkout),
+                    revision,
+                ],
+                capture_output=True,
+                text=True,
+                check=True,
+            )
+    if not checkout.is_dir() or _git_revision(checkout) != revision:
+        raise ValueError(
+            "E1 bootstrap review checkout differs from installed source revision"
+        )
+    changed = subprocess.run(
+        ["git", "-C", str(checkout), "status", "--porcelain", "--untracked-files=all"],
+        capture_output=True,
+        text=True,
+        check=True,
+    )
+    if changed.stdout.strip():
+        raise ValueError("E1 bootstrap review checkout has changed files")
+    if (
+        package_tree_sha256(checkout / "local-codex/mavis/mavis")
+        != package["mavis_package_sha256"]
+    ):
+        raise ValueError(
+            "E1 bootstrap review checkout differs from installed Mavis package"
+        )
+    return checkout.resolve(strict=True), revision
+
+
+
 def _assignment(home: Path) -> tuple[Path, dict[str, Any], dict[str, Any]]:
     path = home / "e1/bootstrap/review-assignment.json"
     assignment = read_json(path)
@@ -167,7 +238,7 @@ def _assignment(home: Path) -> tuple[Path, dict[str, Any], dict[str, Any]]:
     if (assignment.get("schema_version") != "mavis.e1-bootstrap-assignment/v1"
             or assignment.get("objective_id") != "e1-bootstrap-main"
             or assignment.get("scope") != "main"
-            or assignment.get("cwd") != str(path.parent.resolve())
+            or assignment.get("cwd") != str((path.parent / "review-checkout").resolve())
             or assignment.get("owned_paths") != [str((home / "verifications/e1-bootstrap/main.json").resolve())]
             or assignment.get("required_checks") != ["independent-bootstrap-review"]
             or assignment.get("installed_candidate") != summary["installed_candidate"]):
@@ -176,6 +247,8 @@ def _assignment(home: Path) -> tuple[Path, dict[str, Any], dict[str, Any]]:
     if (not isinstance(owner, dict) or set(owner) != {"provider", "model", "harness"}
             or any(not isinstance(value, str) or not value for value in owner.values())):
         raise ValueError("E1 bootstrap review assignment has no exact owner")
+    if (owner["provider"], owner["harness"]) not in {("zai", "zcode"), ("minimax", "opencode")}:
+        raise ValueError("E1 bootstrap review owner has no native gateway lane")
     _checked_ref(assignment.get("e0_summary"), summary_path, "E0 summary")
     _checked_ref(assignment.get("baseline"), baseline_path, "baseline")
     _checked_ref(assignment.get("package_manifest"), package_path, "package manifest")
@@ -191,8 +264,10 @@ def _assignment(home: Path) -> tuple[Path, dict[str, Any], dict[str, Any]]:
     if (package.get("schema_version") != "mavis.installed-core/v1"
             or package.get("core_sha256") != summary["installed_candidate"]["core_sha256"]):
         raise ValueError("E1 bootstrap installed package differs from E0")
+    checkout, revision = _review_checkout(home, package, create=False)
     if (assignment.get("requirements") != _requirements(assignment)
-            or assignment.get("starting_revision") != _digest(assignment["installed_candidate"])):
+            or assignment.get("cwd") != str(checkout)
+            or assignment.get("starting_revision") != revision):
         raise ValueError("E1 bootstrap review assignment requirements changed")
     return path, assignment, baseline
 
@@ -203,33 +278,263 @@ def prepare_bootstrap_review(
     """Freeze exact E0, installed model bytes, and owner before dispatching review."""
     home = Path(home).resolve()
     path = home / "e1/bootstrap/review-assignment.json"
-    if path.exists() or (home / "profiles/main/active.json").exists():
+    if (path.exists() or (home / "profiles/main/active.json").exists()
+            or (home / "e1/bootstrap/main.json").exists()
+            or (home / "e1/bootstrap/review-dispatch.json").exists()
+            or (home / "verifications/e1-bootstrap/main.json").exists()):
         raise FileExistsError("E1 bootstrap review assignment exists or main profile is active")
     if (not isinstance(owner, dict) or set(owner) != {"provider", "model", "harness"}
             or any(not isinstance(value, str) or not value for value in owner.values())):
         raise ValueError("E1 bootstrap review assignment has no exact owner")
+    if (owner["provider"], owner["harness"]) not in {("zai", "zcode"), ("minimax", "opencode")}:
+        raise ValueError("E1 bootstrap review owner has no native gateway lane")
     summary_path, summary = _summary(home)
     baseline_path, _ = _baseline(home)
     package_path = _package_manifest_path()
     records = (inventory_reader or inventory)("http://127.0.0.1:8001/v1")
     model_path = _inventory_model(records, summary["model_id"])
     identity, artifacts = _model_artifacts(summary["model_id"], model_path)
+    package = read_json(package_path)
+    checkout, revision = _review_checkout(home, package, create=True)
     assignment = {
         "schema_version": "mavis.e1-bootstrap-assignment/v1",
         "objective_id": "e1-bootstrap-main", "scope": "main",
-        "cwd": str(path.parent.resolve()), "owner": owner,
+        "cwd": str(checkout), "owner": owner,
         "owned_paths": [str((home / "verifications/e1-bootstrap/main.json").resolve())],
         "required_checks": ["independent-bootstrap-review"],
         "e0_summary": _ref(summary_path), "installed_candidate": summary["installed_candidate"],
         "baseline": _ref(baseline_path), "package_manifest": _ref(package_path),
         "model_inventory": {"model_id": summary["model_id"], "model_path": artifacts["model_path"]},
         "model_identity": identity, "model_artifacts": artifacts,
-        "starting_revision": _digest(summary["installed_candidate"]),
+        "starting_revision": revision,
         "created_at": datetime.now(timezone.utc).isoformat(),
     }
     assignment["requirements"] = _requirements(assignment)
     write_json(path, assignment)
     return assignment
+
+
+def _gateway_arguments(
+    packet: dict[str, Any], assignment_path: Path, job_id: str
+) -> dict[str, Any]:
+    require_safe_id(job_id, "bootstrap review job id")
+    require_safe_id(f"{job_id}-terra", "bootstrap verifier job id")
+    owner = packet["owner"]
+    lane = {("zai", "zcode"): "zcode", ("minimax", "opencode"): "minimax"}.get(
+        (owner["provider"], owner["harness"])
+    )
+    if lane is None:
+        raise ValueError("E1 bootstrap reviewer needs an independent native harness")
+    return {
+        "job_id": job_id,
+        "task": (
+            "Independently inspect the installed E0 case receipts, baseline, installed "
+            "package, and exact model artifact hashes in the context packet. Return a raw JSON "
+            "object with schema_version mavis.e1-bootstrap-review/v1, verdict, "
+            "e0_summary_sha256, baseline_sha256, package_manifest_sha256, "
+            "installed_candidate_digest, model_identity_digest, assignment_sha256, "
+            f"gateway_worker_job_id ({job_id}), and verifier_job_id ({job_id}-terra). "
+            "This names the planned separate verifier; it does not claim that verifier ran. "
+            "Use the frozen packet's exact hashes. Return raw JSON without code fences."
+        ),
+        "lane": lane,
+        "model": owner["model"],
+        "cwd": packet["cwd"],
+        "starting_revision": packet["starting_revision"],
+        "owned_paths": packet["owned_paths"],
+        "allowed_effects": ["review evidence and report verdict"],
+        "required_checks": packet["required_checks"],
+        "context_packet": f"Bootstrap review packet: {assignment_path} (sha256 {sha256_file(assignment_path)}).",
+        "mavis_objective_id": packet["objective_id"],
+        "mavis_requirements": packet["requirements"],
+        "mavis_owner": owner,
+    }
+
+
+
+def dispatch_bootstrap_review(
+    home: Path,
+    job_id: str,
+    *,
+    starter: Callable[[dict[str, Any]], dict[str, Any]] | None = None,
+) -> dict[str, Any]:
+    home = Path(home).resolve()
+    assignment_path, assignment, _ = _assignment(home)
+    dispatch_path = home / "e1/bootstrap/review-dispatch.json"
+    review_path = home / "verifications/e1-bootstrap/main.json"
+    if dispatch_path.exists() or review_path.exists():
+        raise FileExistsError("E1 bootstrap review was already dispatched or recorded")
+    arguments = _gateway_arguments(assignment, assignment_path, job_id)
+    started = (starter or harness_assignment_start)(arguments)
+    job_dir = (
+        Path(started.get("job_dir", "")) if isinstance(started, dict) else Path("")
+    )
+    report = (
+        Path(started.get("report_path", "")) if isinstance(started, dict) else Path("")
+    )
+    gateway_assignment = (
+        Path(started.get("assignment_path", ""))
+        if isinstance(started, dict)
+        else Path("")
+    )
+    if (
+        not isinstance(started, dict)
+        or started.get("success") is not True
+        or started.get("started") is not True
+        or started.get("accepted") is not False
+        or started.get("job_id") != job_id
+        or not job_dir.is_absolute()
+        or not report.is_absolute()
+        or report.parent.resolve() != job_dir.resolve()
+        or not gateway_assignment.is_absolute()
+        or gateway_assignment.parent.resolve() != job_dir.resolve()
+        or not gateway_assignment.is_file()
+    ):
+        raise ValueError(
+            "native gateway did not start the exact E1 bootstrap review job"
+        )
+    saved = read_json(gateway_assignment)
+    if any(
+        saved.get(key) != value for key, value in arguments.items() if key != "job_id"
+    ):
+        raise ValueError(
+            "native gateway bootstrap assignment differs from frozen packet"
+        )
+    dispatch = {
+        "schema_version": "mavis.e1-bootstrap-dispatch/v1",
+        "job_id": job_id,
+        "verifier_job_id": f"{job_id}-terra",
+        "packet_path": str(assignment_path),
+        "packet_sha256": sha256_file(assignment_path),
+        "arguments_digest": _digest(arguments),
+        "gateway_assignment_path": str(gateway_assignment),
+        "gateway_assignment_sha256": sha256_file(gateway_assignment),
+        "report_path": str(report),
+        "job_dir": str(job_dir),
+    }
+    write_json(dispatch_path, dispatch)
+    return dispatch
+
+
+
+def _dispatch(
+    home: Path, assignment_path: Path, assignment: dict[str, Any]
+) -> dict[str, Any]:
+    dispatch = read_json(home / "e1/bootstrap/review-dispatch.json")
+    job_id = require_safe_id(dispatch.get("job_id"), "bootstrap review job id")
+    gateway_assignment_path = Path(dispatch.get("gateway_assignment_path") or "")
+    gateway_assignment = read_json(gateway_assignment_path)
+    expected = _gateway_arguments(assignment, assignment_path, job_id)
+    job_dir = Path(dispatch.get("job_dir") or "")
+    report = Path(dispatch.get("report_path") or "")
+    if (
+        dispatch.get("schema_version") != "mavis.e1-bootstrap-dispatch/v1"
+        or dispatch.get("verifier_job_id") != f"{job_id}-terra"
+        or dispatch.get("packet_path") != str(assignment_path)
+        or dispatch.get("packet_sha256") != sha256_file(assignment_path)
+        or dispatch.get("arguments_digest") != _digest(expected)
+        or dispatch.get("gateway_assignment_sha256")
+        != sha256_file(gateway_assignment_path)
+        or any(
+            gateway_assignment.get(key) != value
+            for key, value in expected.items()
+            if key != "job_id"
+        )
+        or not job_dir.is_absolute()
+        or not report.is_absolute()
+        or report.parent.resolve() != job_dir.resolve()
+        or gateway_assignment_path.parent.resolve() != job_dir.resolve()
+    ):
+        raise ValueError("E1 bootstrap gateway dispatch differs from frozen assignment")
+    return dispatch
+
+
+
+def check_bootstrap_review(home: Path, report_path: Path) -> dict[str, str]:
+    """Deterministic pre-completion check; does not depend on gateway acceptance."""
+    home = Path(home).resolve()
+    assignment_path, assignment, _ = _assignment(home)
+    dispatch = _dispatch(home, assignment_path, assignment)
+    if Path(report_path).resolve() != Path(dispatch["report_path"]).resolve():
+        raise ValueError("E1 bootstrap check must read the dispatched gateway report")
+    review = read_json(report_path)
+    if (
+        review.get("schema_version") != "mavis.e1-bootstrap-review/v1"
+        or review.get("verdict") != "accepted"
+        or review.get("e0_summary_sha256") != assignment["e0_summary"]["sha256"]
+        or review.get("baseline_sha256") != assignment["baseline"]["sha256"]
+        or review.get("package_manifest_sha256")
+        != assignment["package_manifest"]["sha256"]
+        or review.get("installed_candidate_digest")
+        != _digest(assignment["installed_candidate"])
+        or review.get("model_identity_digest") != _digest(assignment["model_identity"])
+        or review.get("assignment_sha256") != sha256_file(assignment_path)
+        or review.get("gateway_worker_job_id") != dispatch["job_id"]
+        or review.get("verifier_job_id") != dispatch["verifier_job_id"]
+    ):
+        raise ValueError("E1 bootstrap review differs from frozen evidence")
+    return {
+        "schema_version": "mavis.e1-bootstrap-review-check/v1",
+        "status": "pass",
+        "assignment_sha256": sha256_file(assignment_path),
+        "report_sha256": sha256_file(report_path),
+    }
+
+
+
+def import_bootstrap_review_report(
+    home: Path, *, status_reader: Callable[[str], dict[str, Any]] | None = None
+) -> Path:
+    home = Path(home).resolve()
+    assignment_path, assignment, _ = _assignment(home)
+    dispatch = _dispatch(home, assignment_path, assignment)
+    report = Path(dispatch["report_path"])
+    check_bootstrap_review(home, report)
+    canonical = home / "verifications/e1-bootstrap/main.json"
+    if canonical.exists():
+        if sha256_file(canonical) != sha256_file(report):
+            raise FileExistsError(
+                "E1 bootstrap review differs from accepted gateway report"
+            )
+        _review(
+            home,
+            {
+                "independent_review": _ref(canonical),
+                "review_assignment": _ref(assignment_path),
+                "e0_summary": assignment["e0_summary"],
+                "baseline": assignment["baseline"],
+                "package_manifest": assignment["package_manifest"],
+                "installed_candidate": assignment["installed_candidate"],
+                "model_identity": assignment["model_identity"],
+            },
+            status_reader or harness_job_status,
+            assignment_path,
+            assignment,
+        )
+        return canonical
+    canonical.parent.mkdir(parents=True, exist_ok=True)
+    canonical.write_bytes(report.read_bytes())
+    try:
+        _review(
+            home,
+            {
+                "independent_review": _ref(canonical),
+                "review_assignment": _ref(assignment_path),
+                "e0_summary": assignment["e0_summary"],
+                "baseline": assignment["baseline"],
+                "package_manifest": assignment["package_manifest"],
+                "installed_candidate": assignment["installed_candidate"],
+                "model_identity": assignment["model_identity"],
+            },
+            status_reader or harness_job_status,
+            assignment_path,
+            assignment,
+        )
+    except BaseException:
+        canonical.unlink(missing_ok=True)
+        raise
+    return canonical
+
 
 
 def _review(home: Path, receipt: dict[str, Any], status_reader: Callable[[str], dict[str, Any]],
@@ -251,27 +556,33 @@ def _review(home: Path, receipt: dict[str, Any], status_reader: Callable[[str], 
     job_id = review.get("gateway_worker_job_id")
     if not isinstance(job_id, str) or not job_id:
         raise ValueError("E1 bootstrap independent review has no gateway job")
+    dispatch = _dispatch(home, assignment_path, assignment)
+    if job_id != dispatch["job_id"]:
+        raise ValueError("E1 bootstrap review names a different gateway worker")
+    if sha256_file(Path(dispatch["report_path"])) != sha256_file(path):
+        raise ValueError("E1 bootstrap review differs from gateway report bytes")
     status = status_reader(job_id)
     _validate_gateway_status(status, job_id)
     acceptance = status["acceptance"]
     binding = status.get("mavis_binding")
     expected_binding = {
-        "schema_version": "mavis.e1-bootstrap-gateway-binding/v1",
-        "objective_id": assignment["objective_id"], "scope": assignment["scope"],
+        "schema_version": "model-gateway-mavis-objective-binding/v1",
+        "objective_id": assignment["objective_id"],
         "cwd": assignment["cwd"], "owner": assignment["owner"],
         "starting_revision": assignment["starting_revision"],
         "changed_revision": assignment["starting_revision"],
         "owned_paths": assignment["owned_paths"],
         "requirements": assignment["requirements"],
         "required_checks": assignment["required_checks"],
-        "assignment_sha256": sha256_file(assignment_path),
+        "assignment_sha256": dispatch["gateway_assignment_sha256"],
         "report_sha256": sha256_file(path),
-        "target_sha256": sha256_file(assignment_path),
     }
     if (acceptance.get("verifier_job_id") != review.get("verifier_job_id")
             or acceptance.get("report_sha256_on_disk") != sha256_file(path)
-            or acceptance.get("target_sha256") != sha256_file(assignment_path)
-            or binding != expected_binding
+            or not isinstance(binding, dict)
+            or set(binding) != set(expected_binding) | {"target_sha256"}
+            or any(binding.get(key) != value for key, value in expected_binding.items())
+            or acceptance.get("target_sha256") != binding.get("target_sha256")
             or status.get("accepted") is not True):
         raise ValueError("E1 bootstrap review lacks exact independent gateway acceptance")
 
