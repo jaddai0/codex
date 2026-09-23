@@ -382,31 +382,33 @@ def main() -> int:
     except BaseException as exc:
         result["error"] = repr(exc)
     finally:
-        try:
-            if reservation is None:
-                if endpoint_alive(config.endpoint) and loaded_generation_models(config.endpoint):
-                    request_json(config.endpoint, model_path + "/unload", method="POST", timeout=180)
-                if endpoint_alive(config.endpoint) and loaded_generation_models(config.endpoint):
-                    raise RuntimeError("Mavis generation model remained loaded")
-                reservation = park_mavis_server(config)
-        except BaseException as exc:
-            result["mavis_unload_error"] = repr(exc)
-        try:
-            if reservation is None or endpoint_alive(config.endpoint):
-                raise RuntimeError("cannot restore IRIS without an exclusive Mavis port reservation")
-            if lease_id is None and not loaded(config.iris_endpoint):
-                raise RuntimeError("IRIS cannot be restored without a drain lease")
-            if not loaded(config.iris_endpoint):
-                request_json(config.iris_endpoint, model_path + "/load", method="POST",
-                             timeout=900, headers=iris_drain_headers(lease_id))
-            result["iris_loaded"] = loaded(config.iris_endpoint)
-            result["mavis_loaded"] = False
-            if lease_id is not None and result["iris_loaded"] and not result["mavis_loaded"]:
-                release_iris_model_drain(config, lease_id)
-                result["drain_released"] = True
-            result["candidate_after"] = installed_candidate_fingerprint()
-        except BaseException as exc:
-            result["iris_restore_error"] = repr(exc)
+        # A failed preflight never authorizes unloading a model that another
+        # process may have loaded on Mavis. Cleanup begins only after our
+        # authenticated IRIS drain lease exists.
+        if lease_id is not None:
+            try:
+                if reservation is None:
+                    if endpoint_alive(config.endpoint) and loaded_generation_models(config.endpoint):
+                        request_json(config.endpoint, model_path + "/unload", method="POST", timeout=180)
+                    if endpoint_alive(config.endpoint) and loaded_generation_models(config.endpoint):
+                        raise RuntimeError("Mavis generation model remained loaded")
+                    reservation = park_mavis_server(config)
+            except BaseException as exc:
+                result["mavis_unload_error"] = repr(exc)
+            try:
+                if reservation is None or endpoint_alive(config.endpoint):
+                    raise RuntimeError("cannot restore IRIS without an exclusive Mavis port reservation")
+                if not loaded(config.iris_endpoint):
+                    request_json(config.iris_endpoint, model_path + "/load", method="POST",
+                                 timeout=900, headers=iris_drain_headers(lease_id))
+                result["iris_loaded"] = loaded(config.iris_endpoint)
+                result["mavis_loaded"] = False
+                if result["iris_loaded"] and not result["mavis_loaded"]:
+                    release_iris_model_drain(config, lease_id)
+                    result["drain_released"] = True
+                result["candidate_after"] = installed_candidate_fingerprint()
+            except BaseException as exc:
+                result["iris_restore_error"] = repr(exc)
         if reservation is not None:
             reservation.close()
         write_json(task / "result.json", result)
