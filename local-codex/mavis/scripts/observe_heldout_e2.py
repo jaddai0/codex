@@ -16,7 +16,6 @@ import subprocess
 import sys
 import time
 import uuid
-from urllib.parse import quote
 
 from mavis.e2_tasks import (CATALOG_TEST, FULL_TEST, _completed_prompt_turn,
                             _user_turn, codex_terra_review_completed, first_task_prompt,
@@ -25,15 +24,12 @@ from mavis.e2_tasks import (CATALOG_TEST, FULL_TEST, _completed_prompt_turn,
                             terra_review_command, terra_review_prompt, verify_heldout)
 from mavis.e1_bootstrap import _summary as current_e0_summary
 from mavis.evaluations import installed_candidate_fingerprint
-from mavis.runtime import (RuntimeConfig, acquire_iris_model_drain,
-                           endpoint_alive, ensure_runtime, handoff_lease_fd, inventory,
-                           iris_drain_headers, load_model, loaded_generation_models,
-                           park_mavis_server,
-                           request_json, require_idle_iris_handoff,
-                           require_installed_selected_model, release_iris_model_drain,
-                           wait_iris_model_drain,
+from mavis.runtime import (RuntimeConfig, endpoint_alive, handoff_lease_fd,
+                           inventory, loaded_generation_models,
+                           require_installed_selected_model,
                            with_mavis_handoff_lease)
 from mavis.storage import sha256_file, write_json
+from shared_gpu_observation import renew_gpu_lease, shared_mavis_model
 
 
 def _records(path: Path) -> list[dict]:
@@ -65,8 +61,7 @@ def _run_tui(command: list[str], *, repo: Path, env: dict[str, str]) -> tuple[in
 @with_mavis_handoff_lease("observe_heldout_e2")
 def main() -> int:
     service = Path.home() / ".local-codex" / "mavis-service"
-    config = RuntimeConfig(home=service)
-    model_path = f"/v1/models/{quote(config.model, safe='')}"
+    config = RuntimeConfig(home=service, allow_concurrent_local=True)
     manifest_path = prepare_heldout(service)
     task = manifest_path.parent
     repo = task / "repo"
@@ -98,102 +93,68 @@ def main() -> int:
 
     signal.signal(signal.SIGTERM, interrupt)
     signal.signal(signal.SIGINT, interrupt)
-    lease_id: str | None = None
-    reservation = None
+    shared: dict[str, object] | None = None
     try:
-        reservation = park_mavis_server(config)
-        lease_id = acquire_iris_model_drain(config, owner="mavis-observe_heldout_e2")
-        result["drain_lease_id"] = lease_id
-        wait_iris_model_drain(config, lease_id)
-        require_idle_iris_handoff(config)
-        request_json(config.iris_endpoint, model_path + "/unload", method="POST",
-                     timeout=180, headers=iris_drain_headers(lease_id))
-        if loaded(config.iris_endpoint):
-            raise RuntimeError("IRIS main model did not unload")
-        reservation.close()
-        reservation = None
-        ensure_runtime(config, load=False)
-        load_model(config)
-        env = {**os.environ, "MAVIS_PROJECT_DIR": str(repo), "PYTHONDONTWRITEBYTECODE": "1"}
-        nonce = uuid.uuid4().hex
-        result["prompt_nonce"] = nonce
-        first_argv, _unused_resume = task_launch_commands(repo, "pending", nonce)
-        result["first_argv"] = first_argv
-        print(f"Mavis catalog slice in {repo}: after its answer, enter /compact, then /exit", flush=True)
-        started = time.time()
-        result["first_pid"], result["first_exit"] = _run_tui(first_argv, repo=repo, env=env)
-        if result["first_exit"] != 0:
-            raise RuntimeError("first installed Mavis process failed")
-        result["stage1_state"] = fixture_state(manifest_path, stage="catalog")
-        result["catalog_check"] = str(run_host_check(task, "catalog", CATALOG_TEST))
-        if json.loads(Path(result["catalog_check"]).read_text())["exit_status"] != 0:
-            raise RuntimeError("catalog host check failed")
-        session_root = Path.home() / ".local-codex" / "sessions"
-        rollout, session_id, first_turn = matching_first_rollout(
-            session_root, repo, first_task_prompt(nonce), started)
-        first_data = rollout.read_bytes()
-        first_rows = _records(rollout)
-        _first_user, first_complete = _completed_prompt_turn(
-            first_rows, first_task_prompt(nonce), session_id, first_turn)
-        result.update({
-            "rollout": str(rollout),
-            "session_id": session_id,
-            "first_turn_id": first_turn,
-            "first_rollout_bytes": len(first_data),
-            "first_rollout_events": len(first_rows),
-            "first_rollout_sha256": hashlib.sha256(first_data).hexdigest(),
-        })
-        if not any(index > first_complete and row.get("type") == "compacted"
-                   for index, row in enumerate(first_rows)):
-            raise RuntimeError("first process did not complete work and compact")
-        _first_command, resume_argv = task_launch_commands(repo, session_id, nonce)
-        result["resume_argv"] = resume_argv
-        print("Mavis resumed checkout slice: after its answer, enter /exit", flush=True)
-        result["resume_pid"], result["resume_exit"] = _run_tui(resume_argv, repo=repo, env=env)
-        if result["resume_exit"] != 0:
-            raise RuntimeError("resumed installed Mavis process failed")
-        resumed_rows = _records(rollout)[len(first_rows):]
-        _resume_user, resume_turn = _user_turn(resumed_rows, resume_task_prompt(nonce), session_id)
-        _completed_prompt_turn(resumed_rows, resume_task_prompt(nonce), session_id, resume_turn)
-        result["resume_turn_id"] = resume_turn
-        result["final_state"] = fixture_state(manifest_path, stage="complete")
-        result["complete_check"] = str(run_host_check(task, "complete", FULL_TEST))
-        if json.loads(Path(result["complete_check"]).read_text())["exit_status"] != 0:
-            raise RuntimeError("complete host check failed")
+        with shared_mavis_model(config, "installed Mavis held-out E2") as shared:
+            env = {**os.environ, "MAVIS_PROJECT_DIR": str(repo), "PYTHONDONTWRITEBYTECODE": "1"}
+            nonce = uuid.uuid4().hex
+            result["prompt_nonce"] = nonce
+            first_argv, _unused_resume = task_launch_commands(repo, "pending", nonce)
+            result["first_argv"] = first_argv
+            print(f"Mavis catalog slice in {repo}: after its answer, enter /compact, then /exit", flush=True)
+            renew_gpu_lease()
+            started = time.time()
+            result["first_pid"], result["first_exit"] = _run_tui(first_argv, repo=repo, env=env)
+            if result["first_exit"] != 0:
+                raise RuntimeError("first installed Mavis process failed")
+            result["stage1_state"] = fixture_state(manifest_path, stage="catalog")
+            result["catalog_check"] = str(run_host_check(task, "catalog", CATALOG_TEST))
+            if json.loads(Path(result["catalog_check"]).read_text())["exit_status"] != 0:
+                raise RuntimeError("catalog host check failed")
+            session_root = Path.home() / ".local-codex" / "sessions"
+            rollout, session_id, first_turn = matching_first_rollout(
+                session_root, repo, first_task_prompt(nonce), started)
+            first_data = rollout.read_bytes()
+            first_rows = _records(rollout)
+            _first_user, first_complete = _completed_prompt_turn(
+                first_rows, first_task_prompt(nonce), session_id, first_turn)
+            result.update({
+                "rollout": str(rollout),
+                "session_id": session_id,
+                "first_turn_id": first_turn,
+                "first_rollout_bytes": len(first_data),
+                "first_rollout_events": len(first_rows),
+                "first_rollout_sha256": hashlib.sha256(first_data).hexdigest(),
+            })
+            if not any(index > first_complete and row.get("type") == "compacted"
+                       for index, row in enumerate(first_rows)):
+                raise RuntimeError("first process did not complete work and compact")
+            _first_command, resume_argv = task_launch_commands(repo, session_id, nonce)
+            result["resume_argv"] = resume_argv
+            print("Mavis resumed checkout slice: after its answer, enter /exit", flush=True)
+            renew_gpu_lease()
+            result["resume_pid"], result["resume_exit"] = _run_tui(resume_argv, repo=repo, env=env)
+            if result["resume_exit"] != 0:
+                raise RuntimeError("resumed installed Mavis process failed")
+            resumed_rows = _records(rollout)[len(first_rows):]
+            _resume_user, resume_turn = _user_turn(resumed_rows, resume_task_prompt(nonce), session_id)
+            _completed_prompt_turn(resumed_rows, resume_task_prompt(nonce), session_id, resume_turn)
+            result["resume_turn_id"] = resume_turn
+            result["final_state"] = fixture_state(manifest_path, stage="complete")
+            result["complete_check"] = str(run_host_check(task, "complete", FULL_TEST))
+            if json.loads(Path(result["complete_check"]).read_text())["exit_status"] != 0:
+                raise RuntimeError("complete host check failed")
     except BaseException as exc:
         result["error"] = repr(exc)
     finally:
-        try:
-            if reservation is None:
-                if loaded_generation_models(config.endpoint):
-                    request_json(config.endpoint, model_path + "/unload", method="POST", timeout=180)
-                if loaded_generation_models(config.endpoint):
-                    raise RuntimeError("Mavis main model remained loaded")
-                reservation = park_mavis_server(config)
-        except BaseException as exc:
-            result["mavis_unload_error"] = repr(exc)
-        try:
-            if reservation is None or endpoint_alive(config.endpoint):
-                raise RuntimeError("cannot restore IRIS without an exclusive Mavis port reservation")
-            if lease_id is None and not loaded(config.iris_endpoint):
-                raise RuntimeError("IRIS cannot be restored without a drain lease")
-            if not loaded(config.iris_endpoint):
-                request_json(config.iris_endpoint, model_path + "/load", method="POST",
-                             timeout=900, headers=iris_drain_headers(lease_id))
-            result["iris_loaded"] = loaded(config.iris_endpoint)
-            result["mavis_loaded"] = False
-            if lease_id is not None and result["iris_loaded"] and not result["mavis_loaded"]:
-                release_iris_model_drain(config, lease_id)
-                result["drain_released"] = True
-            result["candidate_after"] = installed_candidate_fingerprint()
-        except BaseException as exc:
-            result["iris_restore_error"] = repr(exc)
-        if reservation is not None:
-            reservation.close()
+        if shared is not None:
+            result.update(shared)
+            result["iris_loaded"] = shared.get("iris_stayed_loaded")
+        result["candidate_after"] = installed_candidate_fingerprint()
         write_json(task / "result.json", result)
     if (result.get("error") or result.get("iris_loaded") is not True
             or result.get("mavis_loaded") is not False
-            or result.get("drain_released") is not True):
+            or result.get("gpu_lease_released") is not True):
         print(task / "result.json", flush=True)
         return 1
     review_text = task / "terra-review.txt"

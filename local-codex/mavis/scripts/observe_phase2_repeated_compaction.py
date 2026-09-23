@@ -1,9 +1,8 @@
 """Observe installed Mavis recovering an early decision after two real compactions.
 
 This owns a private pseudo-terminal; it never takes over the user's terminal.
-The result stays local under Mavis's evaluation home. Run only while the IRIS
-generation model is idle and Mavis is unloaded. The IRIS model is restored even
-when an observation fails.
+The result stays local under Mavis's evaluation home. IRIS keeps its generation
+model loaded while Mavis observes the installed session under the GPU lease.
 """
 
 from __future__ import annotations
@@ -23,19 +22,14 @@ import tempfile
 import termios
 import time
 import uuid
-from urllib.parse import quote
 
 from mavis.evaluations import installed_candidate_fingerprint
-from mavis.runtime import (RuntimeConfig, acquire_iris_model_drain,
-                           endpoint_alive, ensure_runtime, handoff_lease_fd,
-                           inventory, iris_drain_headers, load_model,
-                           loaded_generation_models, park_mavis_server,
-                           request_json, require_idle_iris_handoff,
+from mavis.runtime import (RuntimeConfig, handoff_lease_fd,
                            require_installed_selected_model,
-                           release_iris_model_drain, wait_iris_model_drain,
                            with_mavis_handoff_lease)
 from mavis.storage import sha256_file, write_json
 from mavis.transcripts import TranscriptArchive
+from shared_gpu_observation import renew_gpu_lease, shared_mavis_model
 
 
 def events(path: Path) -> list[dict]:
@@ -272,8 +266,7 @@ def main() -> int:
 
     home = Path.home()
     service = home / ".local-codex" / "mavis-service"
-    config = RuntimeConfig(home=service)
-    model_path = f"/v1/models/{quote(config.model, safe='')}"
+    config = RuntimeConfig(home=service, allow_concurrent_local=True)
     task = service / "evaluations" / "phase2" / f"repeated-compaction-{uuid.uuid4().hex}"
     task.mkdir(parents=True)
     workspace = Path(tempfile.mkdtemp(prefix="mavis-p2-compact-", dir="/private/tmp")).resolve()
@@ -298,12 +291,7 @@ def main() -> int:
         "workspace": str(workspace), "fact": fact, "prompts": prompts,
         "task_root": str(task), "model_id": config.model,
     }
-    lease_id: str | None = None
-    reservation = None
-
-    def loaded(endpoint: str) -> bool:
-        return any(item.get("id") == config.model and item.get("loaded")
-                   for item in inventory(endpoint))
+    shared: dict[str, object] | None = None
 
     def on_signal(number: int, _frame: object) -> None:
         raise KeyboardInterrupt(f"signal {number}")
@@ -312,114 +300,73 @@ def main() -> int:
     signal.signal(signal.SIGINT, on_signal)
     try:
         require_installed_selected_model(config)
-        if (not loaded(config.iris_endpoint)
-                or (endpoint_alive(config.endpoint) and loaded_generation_models(config.endpoint))):
-            raise RuntimeError("IRIS must own the generation model and Mavis must be unloaded")
-        reservation = park_mavis_server(config)
-        lease_id = acquire_iris_model_drain(config, owner="mavis-phase2-repeated-compaction")
-        result["drain_lease_id"] = lease_id
-        wait_iris_model_drain(config, lease_id)
-        require_idle_iris_handoff(config)
-        request_json(config.iris_endpoint, model_path + "/unload", method="POST",
-                     timeout=180, headers=iris_drain_headers(lease_id))
-        if loaded(config.iris_endpoint):
-            raise RuntimeError("IRIS model did not unload")
-        reservation.close()
-        reservation = None
-        ensure_runtime(config, load=False)
-        load_model(config)
-        env = {**os.environ, "CODEX_HOME": str(home / ".local-codex"),
-               "MAVIS_PROJECT_DIR": str(workspace),
-               "MAVIS_PROJECT_ROOT": str(workspace),
-               "PYTHONDONTWRITEBYTECODE": "1"}
-        commands = [
-            [launcher, "--no-daemon", "--no-alt-screen", "-C", str(workspace), prompts[0]],
-        ]
-        checkpoints = []
-        boundaries = []
-        rollout = None
-        for index in range(3):
-            if index:
-                commands.append([launcher, "resume", "--no-daemon", "--no-alt-screen",
-                                 "-C", str(workspace), result["session_id"], prompts[index]])
-            started = time.time()
-            pid, rollout, rows, code = _run_stage(
-                commands[index], workspace=workspace, env=env,
-                log=task / f"terminal-{index + 1}.log", sessions=sessions,
-                prompt=prompts[index], expected_answer=answers[index],
-                expected_compactions=index + 1 if index < 2 else 0,
-                rollout=rollout, launch_started=started)
-            if index == 0:
-                session = rows[0].get("payload", {}).get("id")
-                if not isinstance(session, str) or not session:
-                    raise ValueError("first rollout lacks a session ID")
-                result["session_id"] = session
-                result["rollout"] = str(rollout)
-            boundaries.append(len(rows))
-            rollout_bytes = rollout.read_bytes()
-            result[f"process_{index + 1}"] = {
-                "pid": pid, "exit_status": code, "command": commands[index],
-                "rollout_events": len(rows), "rollout_bytes": len(rollout_bytes),
-                "rollout_sha256": hashlib.sha256(rollout_bytes).hexdigest(),
-                "terminal_log": str(task / f"terminal-{index + 1}.log"),
-                "terminal_log_sha256": sha256_file(task / f"terminal-{index + 1}.log"),
-            }
-            if index < 2:
-                archive_home = project_home(workspace, create=False)
-                if archive_home != workspace / ".mavis" or not archive_home.is_dir():
-                    raise ValueError("installed hook did not create project-local evidence")
-                checkpoints.append(_archive_checkpoint(
-                    TranscriptArchive(archive_home, result["session_id"]), index + 1, fact))
-        result["archive_checkpoints"] = checkpoints
-        final_bytes = rollout.read_bytes()
-        for index in range(2):
-            snapshot = result[f"process_{index + 1}"]
-            if hashlib.sha256(final_bytes[:snapshot["rollout_bytes"]]).hexdigest() != snapshot["rollout_sha256"]:
-                raise ValueError(f"rollout prefix changed after process {index + 1}")
-        result["verification"] = verify_repeated_compaction(
-            completed_events(rollout), workspace=workspace, prompts=prompts, answers=answers,
-            boundaries=tuple(boundaries), checkpoints=tuple(checkpoints))
-        result["rollout_final_sha256"] = sha256_file(rollout)
+        with shared_mavis_model(config, "installed Mavis repeated compaction") as shared:
+            env = {**os.environ, "CODEX_HOME": str(home / ".local-codex"),
+                   "MAVIS_PROJECT_DIR": str(workspace),
+                   "MAVIS_PROJECT_ROOT": str(workspace),
+                   "PYTHONDONTWRITEBYTECODE": "1"}
+            commands = [
+                [launcher, "--no-daemon", "--no-alt-screen", "-C", str(workspace), prompts[0]],
+            ]
+            checkpoints = []
+            boundaries = []
+            rollout = None
+            for index in range(3):
+                renew_gpu_lease()
+                if index:
+                    commands.append([launcher, "resume", "--no-daemon", "--no-alt-screen",
+                                     "-C", str(workspace), result["session_id"], prompts[index]])
+                started = time.time()
+                pid, rollout, rows, code = _run_stage(
+                    commands[index], workspace=workspace, env=env,
+                    log=task / f"terminal-{index + 1}.log", sessions=sessions,
+                    prompt=prompts[index], expected_answer=answers[index],
+                    expected_compactions=index + 1 if index < 2 else 0,
+                    rollout=rollout, launch_started=started)
+                if index == 0:
+                    session = rows[0].get("payload", {}).get("id")
+                    if not isinstance(session, str) or not session:
+                        raise ValueError("first rollout lacks a session ID")
+                    result["session_id"] = session
+                    result["rollout"] = str(rollout)
+                boundaries.append(len(rows))
+                rollout_bytes = rollout.read_bytes()
+                result[f"process_{index + 1}"] = {
+                    "pid": pid, "exit_status": code, "command": commands[index],
+                    "rollout_events": len(rows), "rollout_bytes": len(rollout_bytes),
+                    "rollout_sha256": hashlib.sha256(rollout_bytes).hexdigest(),
+                    "terminal_log": str(task / f"terminal-{index + 1}.log"),
+                    "terminal_log_sha256": sha256_file(task / f"terminal-{index + 1}.log"),
+                }
+                if index < 2:
+                    archive_home = project_home(workspace, create=False)
+                    if archive_home != workspace / ".mavis" or not archive_home.is_dir():
+                        raise ValueError("installed hook did not create project-local evidence")
+                    checkpoints.append(_archive_checkpoint(
+                        TranscriptArchive(archive_home, result["session_id"]), index + 1, fact))
+            result["archive_checkpoints"] = checkpoints
+            final_bytes = rollout.read_bytes()
+            for index in range(2):
+                snapshot = result[f"process_{index + 1}"]
+                if hashlib.sha256(final_bytes[:snapshot["rollout_bytes"]]).hexdigest() != snapshot["rollout_sha256"]:
+                    raise ValueError(f"rollout prefix changed after process {index + 1}")
+            result["verification"] = verify_repeated_compaction(
+                completed_events(rollout), workspace=workspace, prompts=prompts, answers=answers,
+                boundaries=tuple(boundaries), checkpoints=tuple(checkpoints))
+            result["rollout_final_sha256"] = sha256_file(rollout)
     except BaseException as exc:
         result["error"] = repr(exc)
     finally:
-        # A failed preflight never authorizes unloading a model that another
-        # process may have loaded on Mavis. Cleanup begins only after our
-        # authenticated IRIS drain lease exists.
-        if lease_id is not None:
-            try:
-                if reservation is None:
-                    if endpoint_alive(config.endpoint) and loaded_generation_models(config.endpoint):
-                        request_json(config.endpoint, model_path + "/unload", method="POST", timeout=180)
-                    if endpoint_alive(config.endpoint) and loaded_generation_models(config.endpoint):
-                        raise RuntimeError("Mavis generation model remained loaded")
-                    reservation = park_mavis_server(config)
-            except BaseException as exc:
-                result["mavis_unload_error"] = repr(exc)
-            try:
-                if reservation is None or endpoint_alive(config.endpoint):
-                    raise RuntimeError("cannot restore IRIS without an exclusive Mavis port reservation")
-                if not loaded(config.iris_endpoint):
-                    request_json(config.iris_endpoint, model_path + "/load", method="POST",
-                                 timeout=900, headers=iris_drain_headers(lease_id))
-                result["iris_loaded"] = loaded(config.iris_endpoint)
-                result["mavis_loaded"] = False
-                if result["iris_loaded"] and not result["mavis_loaded"]:
-                    release_iris_model_drain(config, lease_id)
-                    result["drain_released"] = True
-                result["candidate_after"] = installed_candidate_fingerprint()
-            except BaseException as exc:
-                result["iris_restore_error"] = repr(exc)
-        if reservation is not None:
-            reservation.close()
+        if shared is not None:
+            result.update(shared)
+            result["iris_loaded"] = shared.get("iris_stayed_loaded")
+        result["candidate_after"] = installed_candidate_fingerprint()
         write_json(task / "result.json", result)
         print(task / "result.json", flush=True)
     return 0 if ("verification" in result and not result.get("error")
-                 and not result.get("mavis_unload_error")
-                 and not result.get("iris_restore_error")
                  and result.get("iris_loaded") is True
                  and result.get("mavis_loaded") is False
-                 and result.get("drain_released") is True
+                 and result.get("gpu_lease_released") is True
                  and result.get("candidate_after") == candidate) else 1
 
 
