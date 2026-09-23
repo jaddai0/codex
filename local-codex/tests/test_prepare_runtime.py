@@ -4,6 +4,14 @@ from pathlib import Path
 import tempfile
 import tomllib
 import unittest
+from unittest.mock import patch
+import hashlib
+import sys
+import subprocess
+import os
+import shutil
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from threading import Thread
 
 
 MODULE_PATH = Path(__file__).parents[1] / "prepare_runtime.py"
@@ -14,6 +22,131 @@ SPEC.loader.exec_module(prepare_runtime)
 
 
 class PrepareRuntimeTests(unittest.TestCase):
+    def test_launcher_passes_active_model_to_runtime_and_spawns_core(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            mavis_home = root / "service"
+            self._accepted_profile(mavis_home, 1, "model-b", "Accepted prompt")
+            share = root / "share"
+            share.mkdir()
+            shutil.copy(MODULE_PATH, share / "prepare_runtime.py")
+            shutil.copy(MODULE_PATH.parent / "launch_core.py", share / "launch_core.py")
+            (share / "persona.toml").write_text('name = "Mavis"\n')
+            (share / "base-instructions.md").write_text("Base instructions\n")
+            stub = share / "mavis"
+            stub.mkdir()
+            (stub / "__main__.py").write_text(
+                "import json, os, sys\n"
+                "open(os.environ['STUB_RUNTIME_ARGS'], 'w').write(json.dumps(sys.argv[1:]))\n"
+            )
+            core = root / "core"
+            core.write_text("#!/bin/sh\nexit 0\n")
+            core.chmod(0o755)
+            gateway = root / "gateway" / "bin" / "mcp-server.sh"
+            gateway.parent.mkdir(parents=True)
+            gateway.write_text("#!/bin/sh\nexit 0\n")
+            gateway.chmod(0o755)
+
+            class Inventory(BaseHTTPRequestHandler):
+                def do_GET(self):
+                    payload = json.dumps({"models": [{"id": "model-b", "model_type": "llm", "loaded": True}]}).encode()
+                    self.send_response(200)
+                    self.send_header("Content-Type", "application/json")
+                    self.send_header("Content-Length", str(len(payload)))
+                    self.end_headers()
+                    self.wfile.write(payload)
+
+                def log_message(self, *_args):
+                    pass
+
+            server = ThreadingHTTPServer(("127.0.0.1", 0), Inventory)
+            thread = Thread(target=server.serve_forever, daemon=True)
+            thread.start()
+            try:
+                env = os.environ.copy()
+                env.update({"HOME": str(root), "LOCAL_CODEX_SHARE_DIR": str(share),
+                            "LOCAL_CODEX_HOME": str(root / "codex-home"), "MAVIS_HOME": str(mavis_home),
+                            "LOCAL_CODEX_BIN": str(core), "MAVIS_GATEWAY_ROOT": str(gateway.parent.parent),
+                            "OMLX_BASE_URL": f"http://127.0.0.1:{server.server_port}/v1",
+                            "STUB_RUNTIME_ARGS": str(root / "runtime-args.json")})
+                result = subprocess.run(["zsh", str(MODULE_PATH.parent / "bin/local-codex")],
+                                        env=env, capture_output=True, text=True, timeout=15)
+                self.assertEqual(result.returncode, 0, result.stderr)
+                args = json.loads((root / "runtime-args.json").read_text())
+                self.assertEqual(args[args.index("--model") + 1], "model-b")
+                receipt = json.loads(next((mavis_home / "launches").glob("*.json")).read_text())
+                self.assertEqual(receipt["state"], "exited")
+                self.assertEqual(receipt["selected_model"], "model-b")
+                self.assertEqual(receipt["core_exit_code"], 0)
+            finally:
+                server.shutdown()
+                server.server_close()
+                thread.join()
+
+    def _accepted_profile(self, mavis_home, version, model_id, prompt, previous_version=None):
+        role = mavis_home / "profiles" / "main"
+        role.mkdir(parents=True, exist_ok=True)
+        retained = {}
+        for name in ("accepted_experiment", "verifier_receipt"):
+            path = mavis_home / name / f"v{version}.json"
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_text('{"accepted":true}\n')
+            retained[name] = {"path": str(path), "sha256": hashlib.sha256(path.read_bytes()).hexdigest()}
+        profile_path = role / f"v{version}.json"
+        profile_path.write_text(json.dumps({
+            "schema_version": "mavis.model-profile/v1", "profile_id": f"profile-{version}",
+            "role": "main", "version": version, "previous_version": previous_version,
+            "status": "active", "model_identity": {
+                "model_id": model_id, "architecture": "qwen", "weights_fingerprint": "weights",
+                "tokenizer_fingerprint": "tokenizer", "chat_template_fingerprint": "template",
+                "quantization": "4bit"},
+            "runtime": {"name": "omlx", "version": "1"}, "prompts": {"system": prompt},
+            "tool_settings": {}, "context_policy": {"retrieval": {}}, **retained,
+        }))
+        (role / "active.json").write_text(json.dumps({"version": version, "path": str(profile_path.resolve())}))
+        return profile_path
+
+    def test_accepted_profile_config_receipt_and_rollback_selection(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            mavis_home, home = root / "service", root / "codex"
+            persona = root / "persona.toml"
+            persona.write_text('name = "Mavis"\n')
+            instructions = root / "base.md"
+            instructions.write_text("Base instructions\n")
+            records = [{"id": model, "model_type": "llm", "loaded": True}
+                       for model in ("model-a", "model-b")]
+            for version, model, prompt, previous in ((1, "model-a", "First", None),
+                                                    (2, "model-b", "Second", 1),
+                                                    (1, "model-a", "First", None)):
+                self._accepted_profile(mavis_home, version, model, prompt, previous)
+                argv = ["prepare_runtime.py", "--home", str(home), "--mavis-home", str(mavis_home),
+                        "--base-url", "http://127.0.0.1:8001/v1", "--persona-template", str(persona),
+                        "--instructions-template", str(instructions)]
+                with patch.object(sys, "argv", argv), patch.object(prepare_runtime, "read_json", return_value=records):
+                    self.assertEqual(prepare_runtime.main(), 0)
+                parsed = tomllib.loads((home / "config.toml").read_text())
+                catalog = json.loads((home / "omlx-models.json").read_text())
+                receipt = json.loads(sorted((mavis_home / "launches").glob("*.json"),
+                                            key=lambda path: path.stat().st_mtime_ns)[-1].read_text())
+                self.assertEqual(parsed["model"], model)
+                self.assertEqual(catalog["models"][0]["base_instructions"], f"Base instructions\n\n{prompt}\n")
+                self.assertEqual(receipt["selected_model"], model)
+                self.assertEqual(receipt["profile_version"], version)
+                self.assertEqual(receipt["config_sha256"], hashlib.sha256((home / "config.toml").read_bytes()).hexdigest())
+                receipt_path = next(path for path in (mavis_home / "launches").glob("*.json")
+                                    if json.loads(path.read_text())["profile_sha256"] ==
+                                    hashlib.sha256((mavis_home / "profiles/main" / f"v{version}.json").read_bytes()).hexdigest()
+                                    and json.loads(path.read_text())["state"] == "prepared")
+                run = subprocess.run([sys.executable, str(MODULE_PATH.parent / "launch_core.py"),
+                                      "--receipt", str(receipt_path), "--", "/bin/sh", "-c", "exit 0"],
+                                     capture_output=True, text=True)
+                self.assertEqual(run.returncode, 0, run.stderr)
+                launched = json.loads(receipt_path.read_text())
+                self.assertEqual(launched["state"], "exited")
+                self.assertEqual(launched["core_exit_code"], 0)
+                self.assertGreater(launched["core_pid"], 0)
+
     def test_shipped_persona_is_mavis(self):
         persona = (MODULE_PATH.parent / "persona.toml").read_text(encoding="utf-8")
         self.assertIn('name = "Mavis"', persona)

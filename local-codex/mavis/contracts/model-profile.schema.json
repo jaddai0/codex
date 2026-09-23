@@ -9,7 +9,7 @@
     "schema_version": {"const": "mavis.model-profile/v1"},
     "profile_id": {"type": "string", "minLength": 1},
     "role": {"enum": ["main", "decision", "librarian", "output-reader", "embedding", "ranking"]},
-    "model_identity": {"type": "object", "required": ["architecture", "weights_fingerprint", "tokenizer_fingerprint", "chat_template_fingerprint", "quantization"]},
+    "model_identity": {"type": "object", "required": ["model_id", "architecture", "weights_fingerprint", "tokenizer_fingerprint", "chat_template_fingerprint", "quantization"], "properties": {"model_id": {"type": "string", "minLength": 1}}},
     "runtime": {"type": "object", "required": ["name", "version"]},
     "prompts": {"type": "object"},
     "tool_settings": {"type": "object"},
