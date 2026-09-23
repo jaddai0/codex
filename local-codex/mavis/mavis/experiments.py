@@ -240,9 +240,27 @@ class ExperimentStore:
             record = self._load(experiment_id)
             if record["state"] != "compared":
                 raise ValueError("only a compared candidate can be reviewed")
-            if record["comparison"]["candidate"].get("e1_native_trial"):
-                raise ValueError("native E1 trial needs a separate installed-trial review adapter before staging")
             self._check_comparison(record)
+            if record["comparison"]["candidate"].get("e1_native_trial"):
+                from .e1_review import validate_review
+
+                checked = validate_review(self.home, record, receipt_path, self.gateway_status_reader)
+                path = Path(receipt_path).resolve()
+                receipt = checked["receipt"]
+                status = checked["status"]
+                record["review"] = {
+                    "path": str(path), "sha256": sha256_file(path),
+                    "verdict": receipt["verdict"],
+                    "verifier_job_id": status["acceptance"]["verifier_job_id"],
+                    "gateway_worker_job_id": receipt["gateway_worker_job_id"],
+                    "gateway_status_digest": _digest(status),
+                    "assignment_sha256": checked["assignment_sha256"],
+                    "e1_native_trial": True,
+                }
+                record["state"] = "reviewed" if receipt["verdict"] == "accepted" else "rejected"
+                record["updated_at"] = _now()
+                write_json(self._record_path(experiment_id), record)
+                return record
             path = Path(receipt_path).resolve()
             if (self.home / "verifications" / "experiments").resolve() != path.parent:
                 raise ValueError("review receipt must be in the separate verification store")
@@ -314,6 +332,17 @@ class ExperimentStore:
         review = record.get("review") or {}
         if sha256_file(Path(review["path"])) != review["sha256"]:
             raise ValueError("review receipt changed")
+        if review.get("e1_native_trial"):
+            from .e1_review import validate_review
+
+            checked = validate_review(self.home, record, Path(review["path"]), self.gateway_status_reader)
+            if (checked["receipt"].get("verdict") != "accepted"
+                    or checked["assignment_sha256"] != review["assignment_sha256"]
+                    or _digest(checked["status"]) != review["gateway_status_digest"]
+                    or checked["receipt"].get("gateway_worker_job_id") != review["gateway_worker_job_id"]
+                    or checked["status"]["acceptance"].get("verifier_job_id") != review["verifier_job_id"]):
+                raise ValueError("independent E1 review status changed")
+            return
         receipt = read_json(Path(review["path"]))
         candidate_status = self._candidate_status(review["candidate_job_id"], record)
         status = self._review_status(review["gateway_worker_job_id"], record)

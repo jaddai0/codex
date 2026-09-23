@@ -529,7 +529,7 @@ class E1RunnerTests(unittest.TestCase):
         self.assertEqual(self.runner.store.active("main")["configuration"], record["baseline"])
         review = self.home / "verifications" / "experiments" / "repair.json"
         write_json(review, {"schema_version": "mavis.experiment-review/v1"})
-        with self.assertRaisesRegex(ValueError, "separate installed-trial review adapter"):
+        with self.assertRaises(FileNotFoundError):
             self.runner.store.review("repair", review)
         self.assertEqual(self.runner.store.load("repair")["state"], "compared")
 
@@ -618,8 +618,138 @@ class E1RunnerTests(unittest.TestCase):
         finally:
             signal.setitimer(signal.ITIMER_REAL, 0)
             signal.signal(signal.SIGALRM, previous)
-        with self.assertRaisesRegex(ValueError, "separate installed-trial review adapter"):
+        with self.assertRaises(FileNotFoundError):
             self.runner.store.review("repair", review)
+
+    def _native_review(self, *, bootstrap=False):
+        if bootstrap:
+            self._paired_bootstrap_trials()
+        else:
+            self._paired_trials()
+        record = self.runner.compare_native("repair", "regression")
+        owner = {"provider": "zai", "model": "review-model", "harness": "zcode"}
+        prepared = self.runner.prepare_review("repair", owner)
+        assignment_path = Path(prepared["assignment_path"])
+        assignment = read_json(assignment_path)
+        job_dir = self.root / "review-gateway-job"
+        job_dir.mkdir()
+        gateway_assignment = job_dir / "assignment.json"
+        report = job_dir / "report.md"
+        def start(arguments):
+            write_json(gateway_assignment, {key: value for key, value in arguments.items() if key != "job_id"})
+            return {"success": True, "started": True, "accepted": False,
+                    "job_id": arguments["job_id"], "job_dir": str(job_dir),
+                    "report_path": str(report), "assignment_path": str(gateway_assignment)}
+        self.runner.gateway_assignment_starter = start
+        dispatch = self.runner.dispatch_review("repair", "independent-review-worker")
+        self.assertEqual(dispatch["gateway_assignment_sha256"], sha256_file(gateway_assignment))
+        review = Path(prepared["review_receipt_path"])
+        write_json(review, {
+            "schema_version": "mavis.e1-review/v1", "experiment_id": "repair",
+            "verdict": "accepted", "assignment_sha256": sha256_file(assignment_path),
+            "facts_digest": e1_bootstrap._digest(assignment["facts"]),
+            "gateway_worker_job_id": "independent-review-worker",
+        })
+        report.write_bytes(review.read_bytes())
+        def status(job_id):
+            binding = {
+                "schema_version": "model-gateway-mavis-objective-binding/v1",
+                "objective_id": "repair", "cwd": assignment["cwd"],
+                "owner": owner, "starting_revision": assignment["starting_revision"],
+                "changed_revision": assignment["starting_revision"],
+                "owned_paths": assignment["owned_paths"],
+                "requirements": assignment["requirements"],
+                "required_checks": assignment["required_checks"],
+                "assignment_sha256": sha256_file(gateway_assignment),
+                "report_sha256": sha256_file(report),
+                "target_sha256": "a" * 64,
+            }
+            return {
+                "job_id": job_id, "state": "completed", "exit_code": 0, "accepted": True,
+                "receipt": {"job_id": job_id, "exit_code": 0},
+                "acceptance": {"accepted": True, "job_id": job_id, "verifier": "terra",
+                               "verifier_job_id": "independent-terra-verifier",
+                               "target_sha256": "a" * 64,
+                               "evidence_sha256": "b" * 64,
+                               "report_sha256_on_disk": sha256_file(report),
+                               "verifier_verdict_sha256": "d" * 64},
+                "mavis_binding": binding,
+            }
+        self.runner.store.gateway_status_reader = status
+        return record, assignment_path, review, status
+
+    def test_native_review_stage_promote_and_rollback(self):
+        record, assignment_path, review, _ = self._native_review()
+        original = self.runner.store.active("main")
+        self.assertEqual(self.runner.store.review("repair", review)["state"], "reviewed")
+        self.assertEqual(self.runner.store.stage("repair")["state"], "staged")
+        self.assertEqual(self.runner.store.active("main"), original)
+        with self.assertRaisesRegex(ValueError, "between objectives"):
+            self.runner.store.promote("repair", between_objectives=False)
+        self.assertEqual(self.runner.store.promote("repair", between_objectives=True)["state"], "promoted")
+        self.assertEqual(self.runner.store.active("main")["configuration"], record["candidate"])
+        self.assertEqual(self.runner.store.rollback("repair", reason="observed regression")["state"], "rolled-back")
+        self.assertEqual(self.runner.store.active("main"), original)
+
+    def test_native_review_imports_exact_gateway_report(self):
+        _, _, review, _ = self._native_review()
+        review.unlink()
+        self.assertEqual(self.runner.import_review("repair")["state"], "reviewed")
+        self.assertTrue(review.is_file())
+        self.assertEqual(self.runner.store.stage("repair")["state"], "staged")
+
+    def test_native_bootstrap_review_revalidates_model_artifacts(self):
+        _, _, review, _ = self._native_review(bootstrap=True)
+        self.runner.store.review("repair", review)
+        self.assertEqual(self.runner.store.stage("repair")["state"], "staged")
+        model = self.root / "models/exact-model/model-00001.safetensors"
+        model.write_bytes(b"different-weight-bytes")
+        with self.assertRaisesRegex(ValueError, "model artifact bytes changed"):
+            self.runner.store.promote("repair", between_objectives=True)
+
+    def test_native_review_rejects_wrong_facts_and_gateway_assignment(self):
+        _, assignment_path, review, status = self._native_review()
+        original = read_json(review)
+        for field, value in (("facts_digest", "0" * 64),
+                             ("assignment_sha256", "1" * 64),
+                             ("gateway_worker_job_id", "e1trial-repair")):
+            with self.subTest(field=field):
+                modified = dict(original)
+                modified[field] = value
+                write_json(review, modified)
+                with self.assertRaises(ValueError):
+                    self.runner.store.review("repair", review)
+        write_json(review, original)
+        def wrong_status(job_id):
+            result = status(job_id)
+            result["mavis_binding"]["owner"] = {"provider": "forged"}
+            return result
+        self.runner.store.gateway_status_reader = wrong_status
+        with self.assertRaisesRegex(ValueError, "exact independent gateway acceptance"):
+            self.runner.store.review("repair", review)
+        self.runner.store.gateway_status_reader = status
+        self.runner.store.review("repair", review)
+        assignment = read_json(assignment_path)
+        assignment["facts"]["held_out"] = ["regression"]
+        write_json(assignment_path, assignment)
+        with self.assertRaisesRegex(ValueError, "assignment differs"):
+            self.runner.store.stage("repair")
+
+    def test_native_review_rechecks_raw_trial_and_status_revocation(self):
+        _, _, review, status = self._native_review()
+        self.runner.store.review("repair", review)
+        runtime = self.home / "e1/repair/runtime/candidate/held-a"
+        (runtime / "stdout.log").write_text("changed")
+        with self.assertRaisesRegex(ValueError, "stdout hash changed"):
+            self.runner.store.stage("repair")
+        (runtime / "stdout.log").write_text("ran\n")
+        def revoked(job_id):
+            result = status(job_id)
+            result["accepted"] = False
+            return result
+        self.runner.store.gateway_status_reader = revoked
+        with self.assertRaisesRegex(ValueError, "not accepted"):
+            self.runner.store.stage("repair")
 
     def test_native_bootstrap_missing_changed_or_wrong_model_fails_closed(self):
         bootstrap, summary, _, _ = self._paired_bootstrap_trials()
