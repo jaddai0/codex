@@ -17,8 +17,9 @@ import sys
 import time
 from urllib.parse import quote
 
-from mavis.e2_tasks import (CATALOG_TEST, FULL_TEST, fixture_state,
-                            prepare_heldout, run_host_check, verify_heldout)
+from mavis.e2_tasks import (CATALOG_TEST, FULL_TEST, codex_terra_review_completed,
+                            fixture_state, prepare_heldout, run_host_check,
+                            terra_review_command, terra_review_prompt, verify_heldout)
 from mavis.e1_bootstrap import _summary as current_e0_summary
 from mavis.evaluations import installed_candidate_fingerprint
 from mavis.runtime import (RuntimeConfig, endpoint_alive, ensure_runtime, inventory,
@@ -31,15 +32,6 @@ def _records(path: Path) -> list[dict]:
     if not data.endswith(b"\n"):
         raise ValueError("installed rollout ended with an incomplete event")
     return [json.loads(line) for line in data.splitlines() if line.strip()]
-
-
-def _native_response(log: str) -> str:
-    start = log.find("{")
-    try:
-        response = json.loads(log[start:])["response"] if start >= 0 else ""
-    except (json.JSONDecodeError, KeyError):
-        return ""
-    return response if isinstance(response, str) else ""
 
 
 def _run_tui(command: list[str], *, repo: Path, env: dict[str, str]) -> tuple[int, int]:
@@ -190,26 +182,27 @@ def main() -> int:
     if result.get("error") or result.get("iris_loaded") is not True or result.get("mavis_loaded") is not False:
         print(task / "result.json", flush=True)
         return 1
-    review_prompt = (
-        "Read-only independent review of the held-out installed Mavis work. "
-        f"Read {manifest_path}, BLUEPRINT.md, the baseline log, and git diff. "
-        "Run the catalog and full test commands in the manifest. Verify both "
-        "packages' behavior and that the blueprint, dirty note, untracked draft, "
-        "and tests were preserved. Inspect the compacted and resumed rollout "
-        f"at {result['rollout']} and the host receipts. Do not edit any file. "
-        "Begin your final response with ACCEPT or REJECT and give concrete evidence."
-    )
-    with (task / "terra-review.jsonl").open("wb") as log:
-        review = subprocess.run(["zcode", "--json", "--mode", "yolo",
-                                 "--disallowed-tools", "Edit,Write", "--cwd", str(repo),
-                                 "--prompt", review_prompt], cwd=repo,
-                                stdout=log, stderr=subprocess.STDOUT,
+    review_text = task / "terra-review.txt"
+    review_argv = terra_review_command(
+        repo, review_text, terra_review_prompt(manifest_path, Path(result["rollout"])))
+    before_review = fixture_state(manifest_path, stage="complete")
+    with (task / "terra-review.jsonl").open("wb") as log, (task / "terra-review.stderr.log").open("wb") as err:
+        review = subprocess.run(review_argv, cwd=repo, stdin=subprocess.DEVNULL,
+                                stdout=log, stderr=err,
                                 env={**os.environ, "PYTHONDONTWRITEBYTECODE": "1"}, timeout=900)
-    text = _native_response((task / "terra-review.jsonl").read_text())
-    (task / "terra-review.txt").write_text(text, encoding="utf-8")
+    if fixture_state(manifest_path, stage="complete") != before_review:
+        raise RuntimeError("Terra review changed the fixture")
+    thread_id = None
+    try:
+        thread_id = codex_terra_review_completed(
+            (task / "terra-review.jsonl").read_text(), review_text.read_text())
+    except (ValueError, FileNotFoundError) as exc:
+        result["review_parse_error"] = repr(exc)
     result.update({"review_exit": review.returncode,
+                   "review_argv": review_argv, "review_thread_id": thread_id,
                    "review_log_sha256": sha256_file(task / "terra-review.jsonl"),
-                   "review_text_sha256": sha256_file(task / "terra-review.txt")})
+                   "review_stderr_sha256": sha256_file(task / "terra-review.stderr.log"),
+                   "review_text_sha256": sha256_file(review_text) if review_text.is_file() else None})
     write_json(task / "result.json", result)
     try:
         verified = verify_heldout(manifest_path)

@@ -6,10 +6,11 @@ import hashlib
 import json
 import os
 from pathlib import Path
+import re
 import subprocess
 import uuid
 
-from .evaluations import installed_candidate_fingerprint, native_review_completed
+from .evaluations import installed_candidate_fingerprint
 from .e1_bootstrap import _summary as current_e0_summary
 from .runtime import RuntimeConfig
 from .storage import sha256_file, write_json
@@ -141,7 +142,7 @@ def fixture_state(manifest_path: Path, *, stage: str) -> dict[str, str]:
         raise ValueError("E2 failing baseline changed")
     if manifest["catalog_test"] != CATALOG_TEST or manifest["full_test"] != FULL_TEST or manifest["owned_paths"] != [CATALOG, CHECKOUT]:
         raise ValueError("E2 acceptance commands or ownership changed")
-    changed = set(_git(repo, "diff", "--name-only").splitlines())
+    changed = set(_git(repo, "diff", "HEAD", "--name-only").splitlines())
     untracked = set(_git(repo, "ls-files", "--others", "--exclude-standard").splitlines())
     if untracked != {PRIVATE}:
         raise ValueError("E2 untracked files changed")
@@ -226,6 +227,51 @@ def _rollout_records(path: Path) -> tuple[bytes, list[dict]]:
     return data, records
 
 
+def terra_review_prompt(manifest_path: Path, rollout: Path) -> str:
+    return (
+        "Read-only independent review of the held-out installed Mavis work. "
+        f"Read {manifest_path}, BLUEPRINT.md, the baseline log, and git diff. "
+        "Run the catalog and full test commands in the manifest. Verify both "
+        "packages' behavior and that the blueprint, dirty note, untracked draft, "
+        "and tests were preserved. Inspect the compacted and resumed rollout "
+        f"at {rollout} and the host receipts. Do not edit any file. "
+        "Begin your final response with ACCEPT or REJECT and give concrete evidence."
+    )
+
+
+def terra_review_command(repo: Path, message_path: Path, prompt: str) -> list[str]:
+    return ["codex", "exec", "--model", "gpt-5.6-terra", "--sandbox", "read-only",
+            "-C", str(repo), "--json", "--output-last-message", str(message_path), prompt]
+
+
+def codex_terra_review_completed(log: str, verdict: str) -> str:
+    """Require one completed native Codex turn and its exact saved final text."""
+    if not log.endswith("\n"):
+        raise ValueError("Terra JSONL ended with an incomplete event")
+    try:
+        events = [json.loads(line) for line in log.splitlines() if line.strip()]
+    except json.JSONDecodeError as exc:
+        raise ValueError("Terra JSONL has a malformed event") from exc
+    if not events or any(not isinstance(event, dict) for event in events):
+        raise ValueError("Terra JSONL has no valid events")
+    threads = [event.get("thread_id") for event in events if event.get("type") == "thread.started"]
+    starts = [index for index, event in enumerate(events) if event.get("type") == "turn.started"]
+    completes = [index for index, event in enumerate(events) if event.get("type") == "turn.completed"]
+    messages = [(index, event.get("item", {}).get("text")) for index, event in enumerate(events)
+                if event.get("type") == "item.completed"
+                and isinstance(event.get("item"), dict)
+                and event["item"].get("type") == "agent_message"]
+    if (len(threads) != 1 or not isinstance(threads[0], str) or not threads[0]
+            or len(starts) != 1 or len(completes) != 1 or not messages
+            or not (starts[0] < messages[-1][0] < completes[0] == len(events) - 1)
+            or any(event.get("type") == "turn.failed" for event in events)
+            or messages[-1][1] != verdict
+            or not isinstance(verdict, str)
+            or not re.match(r"^ACCEPT(?:$|[\s:.-])", verdict.lstrip())):
+        raise ValueError("Terra review did not finish with an accepting native Codex message")
+    return threads[0]
+
+
 def verify_heldout(manifest_path: Path) -> dict[str, object]:
     """Recheck an installed, restarted, independently reviewed task."""
     manifest_path = Path(manifest_path).resolve(strict=True)
@@ -237,7 +283,8 @@ def verify_heldout(manifest_path: Path) -> dict[str, object]:
     observer = Path(result.get("observer_path", "")).resolve(strict=True)
     if observer.name != "observe_heldout_e2.py" or result.get("observer_sha256") != sha256_file(observer):
         raise ValueError("E2 observer source changed")
-    if result.get("error") or result.get("verification_error") or result.get("iris_restore_error") or result.get("mavis_unload_error"):
+    if (result.get("error") or result.get("verification_error") or result.get("review_parse_error")
+            or result.get("iris_restore_error") or result.get("mavis_unload_error")):
         raise ValueError("E2 observer recorded a runtime or restoration failure")
     candidate = installed_candidate_fingerprint()
     if result.get("candidate") != candidate or result.get("candidate_after") != candidate:
@@ -281,11 +328,17 @@ def verify_heldout(manifest_path: Path) -> dict[str, object]:
             or not any(row.get("type") == "event_msg" and row.get("payload", {}).get("type") == "task_complete" for row in later)):
         raise ValueError("E2 compaction or resumed task completion is unproved")
     review_log = task / "terra-review.jsonl"
+    review_stderr = task / "terra-review.stderr.log"
     review_text = task / "terra-review.txt"
+    review_command = terra_review_command(Path(final_state["repo"]), review_text,
+                                           terra_review_prompt(manifest_path, rollout))
     if (result.get("review_exit") != 0
+            or result.get("review_argv") != review_command
             or result.get("review_log_sha256") != sha256_file(review_log)
+            or result.get("review_stderr_sha256") != sha256_file(review_stderr)
             or result.get("review_text_sha256") != sha256_file(review_text)
-            or not native_review_completed(review_log.read_text(), review_text.read_text())):
+            or result.get("review_thread_id") != codex_terra_review_completed(
+                review_log.read_text(), review_text.read_text())):
         raise ValueError("E2 independent native review did not accept")
     return {"schema_version": "mavis.e2-verification/v1", "status": "pass",
             "manifest": str(manifest_path), "session_id": result["session_id"],
