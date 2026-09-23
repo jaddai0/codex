@@ -24,6 +24,10 @@ class LibrarianEvidenceTests(unittest.TestCase):
                 "citations": [citation],
             }
             self.assertEqual(librarian.validate_answer(answer, evidence), answer)
+            with self.assertRaisesRegex(ValueError, "integer"):
+                librarian.validate_answer(
+                    {**answer, "citations": [{**citation, "line": True}]}, evidence
+                )
             with self.assertRaisesRegex(ValueError, "uncertainty"):
                 librarian.validate_answer({**answer, "uncertainty": ""}, evidence)
             with self.assertRaisesRegex(ValueError, "outside"):

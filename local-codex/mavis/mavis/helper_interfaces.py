@@ -71,7 +71,10 @@ class LibrarianEvidence:
         for item in citations:
             if not isinstance(item, dict) or set(item) != {"path", "line", "sha256"}:
                 raise ValueError("citation shape is invalid")
-            key = (item["path"], item["line"], item["sha256"])
+            line = item["line"]
+            if isinstance(line, bool):
+                raise ValueError("citation line must be an integer")
+            key = (item["path"], line, item["sha256"])
             if key not in allowed:
                 raise ValueError("citation is outside the verified evidence packet")
             path = Path(item["path"])
