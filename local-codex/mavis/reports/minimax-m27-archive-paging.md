@@ -85,13 +85,6 @@ OK
 
 ## Files Edited
 
-| File | Lines changed |
-|------|---------------|
-| `local-codex/mavis/mavis/transcripts.py` | ~144–169 (search method) |
-| `local-codex/mavis/mavis/helper_interfaces.py` | ~24–28 (search method) |
-| `local-codex/mavis/mavis/cli.py` | ~105–109 (arg), ~403–404 (handler) |
-| `local-codex/mavis/tests/test_transcripts.py` | +~50 lines (4 new tests) |
-| `local-codex/mavis/tests/test_helper_interfaces.py` | +~18 lines (1 new test) |
-| `local-codex/mavis/tests/test_cli.py` | +~24 lines (3 new tests, 1 import) |
+The change is confined to `mavis/transcripts.py`, `mavis/helper_interfaces.py`, `mavis/cli.py`, and their three matching test modules. The later coordinator repair added the bounded scan and complete CLI test in those same files.
 
 MiniMax's first tmux job encountered a provider authentication response, while a fresh isolated tmux read canary succeeded. Its next job wrote the code and passed tests; writing the report outside the owned checkout was denied. The same OpenCode session was resumed to write this report inside the checkout and return a final answer. Independent review then found the collect-all paging defect; the coordinator repaired it and repeated the tests. No model services, connected search tools, unrelated files, or protected evaluation tests were changed.
