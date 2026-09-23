@@ -46,6 +46,8 @@ class TrialRuntimeTests(unittest.TestCase):
         (self.share / "base-instructions.md").write_text("Base instructions\n")
         (self.share / "persona.toml").write_text('name = "Mavis"\n')
         (self.share / "launch_core.py").write_bytes((ROOT / "launch_core.py").read_bytes())
+        (self.share / "prepare_runtime.py").write_bytes((ROOT / "prepare_runtime.py").read_bytes())
+        (self.share / "generation_lease.py").write_bytes((ROOT / "generation_lease.py").read_bytes())
         (self.share / "mavis").mkdir()
         (self.share / "mavis" / "__init__.py").write_text("# installed fixture\n")
         self.core = self.share / "local-codex-core"
@@ -307,6 +309,10 @@ class TrialRuntimeTests(unittest.TestCase):
                 "core_sha256": sha256_file(self.core),
                 "trial_runtime_sha256": sha256_file(Path(trial_runtime.__file__)),
                 "launch_core_sha256": sha256_file(self.share / "launch_core.py"),
+                "prepare_runtime_sha256": sha256_file(self.share / "prepare_runtime.py"),
+                "generation_lease_sha256": sha256_file(self.share / "generation_lease.py"),
+                "base_instructions_sha256": sha256_file(self.share / "base-instructions.md"),
+                "persona_sha256": sha256_file(self.share / "persona.toml"),
                 "mavis_package_sha256": package_tree_sha256(self.share / "mavis"),
                 "launcher": str((ROOT / "bin/local-codex").resolve()),
                 "launcher_sha256": sha256_file(ROOT / "bin/local-codex"),
@@ -372,6 +378,10 @@ class TrialRuntimeTests(unittest.TestCase):
                 "core_sha256": sha256_file(self.core),
                 "trial_runtime_sha256": sha256_file(Path(trial_runtime.__file__)),
                 "launch_core_sha256": sha256_file(self.share / "launch_core.py"),
+                "prepare_runtime_sha256": sha256_file(self.share / "prepare_runtime.py"),
+                "generation_lease_sha256": sha256_file(self.share / "generation_lease.py"),
+                "base_instructions_sha256": sha256_file(self.share / "base-instructions.md"),
+                "persona_sha256": sha256_file(self.share / "persona.toml"),
                 "mavis_package_sha256": package_tree_sha256(self.share / "mavis"),
                 "launcher": str((ROOT / "bin/local-codex").resolve()),
                 "launcher_sha256": sha256_file(ROOT / "bin/local-codex"),

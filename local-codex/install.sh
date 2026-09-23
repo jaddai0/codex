@@ -41,6 +41,10 @@ manifest = {
     "launcher_sha256": hashlib.sha256(launcher.read_bytes()).hexdigest(),
     "trial_runtime_sha256": hashlib.sha256((share / "trial_runtime.py").read_bytes()).hexdigest(),
     "launch_core_sha256": hashlib.sha256((share / "launch_core.py").read_bytes()).hexdigest(),
+    "prepare_runtime_sha256": hashlib.sha256((share / "prepare_runtime.py").read_bytes()).hexdigest(),
+    "generation_lease_sha256": hashlib.sha256((share / "generation_lease.py").read_bytes()).hexdigest(),
+    "base_instructions_sha256": hashlib.sha256((share / "base-instructions.md").read_bytes()).hexdigest(),
+    "persona_sha256": hashlib.sha256((share / "persona.toml").read_bytes()).hexdigest(),
     "mavis_package_sha256": package_tree_sha256(share / "mavis"),
 }
 path = share / "install-manifest.json"
