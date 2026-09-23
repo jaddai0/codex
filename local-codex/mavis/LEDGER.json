@@ -10,9 +10,9 @@
   },
   "status": "partial",
   "uncertainty": [
-    "The Phase 1 installed E0 milestone and two independent task reviews passed. Subsequent source changes for maintenance cancellation and E1 profile trials require a new installed build and E0 run before the newer candidate can replace that milestone.",
-    "Phase 2 memory and helper interfaces pass source tests; live embedding and helper comparisons, repeated-compaction quality, helper isolation, and net-benefit acceptance remain open.",
-    "Phase 3 E1 has native assignment plumbing and strict source gates, but candidate activation, a real paired comparison, independent promotion, and rollback remain open.",
+    "A previous Phase 1 installed candidate passed E0 and two independent task reviews. The current source candidate has not been built, installed, or rerun through E0 after later core and E1 changes.",
+    "Phase 2 memory and helper interfaces pass source tests. A fixed-corpus direct-MLX comparison and freshness run completed, but installed embedding use, helper roles, repeated-compaction quality, helper isolation, and completed-task benefit remain open.",
+    "Phase 3 E1 has native assignment plumbing and strict source gates, but current installed candidate activation, a real paired comparison, independent promotion, and rollback remain open.",
     "Hosted Jev returned one typed answer under the local capped ledger; external invoice reconciliation and a local Jev candidate remain open."
   ],
   "rejected_alternatives": [
@@ -34,14 +34,15 @@
     {
       "id": "phase-1",
       "requirement": "Deliver a useful isolated Mavis with objectives, evidence, compaction, delegation, Jev, parsing, search, and interruption recovery; pass E0 plus two independently verified real tasks.",
-      "status": "pass",
+      "status": "reject",
       "command": "Installed Desktop Mavis E0 observers and python3 -m mavis eval e0 under sequential IRIS/Mavis handoff; installed Mavis maintenance task in isolated checkout; PYTHONDONTWRITEBYTECODE=1 python3 -m unittest discover -s tests -q; independent read-only review and two-thread SQLite race canary",
       "artifact": "/Users/dustinpainter/.local-codex/mavis-service/evaluations/e0/summary.json",
       "evidence": [
         "Installed E0 summary at /Users/dustinpainter/.local-codex/mavis-service/evaluations/e0/summary.json passed all ten mandatory cases on service SHA-256 15710e90443d08fb0aa03196d7197dc428ec97094d831f61274a450225bbf957 and core SHA-256 969723b0eb97773fca6814d21ef89091cfcad32eaa9a845b0dc079a1bf92f618. The handoff receipt at segment-boundary-installed/result.json records e0_exit=0, matching before/after candidate fingerprints, IRIS restored, and Mavis unloaded.",
         "The installed Mavis small-repository maintenance repair passed exact tests, preserved the unrelated dirty note, and independent native ZCode review accepted in /Users/dustinpainter/.local-codex/mavis-service/evaluations/e0/tasks/3db16fdd5d6e4c7da62c3c35216b349e.",
         "A distinct bounded real maintenance task completed: installed Mavis fixed Boolean citation validation in an isolated checkout, exited 0 after seven focused tests, and independent review accepted the two-file patch; /Users/dustinpainter/.Codex/reports/mavis-librarian-fix-independent-review-2026-09-22.md.",
-        "The installed Mavis multi-file maintenance cancellation run at /Users/dustinpainter/.local-codex/mavis-service/evaluations/phase1/maintenance-control-live/result.json exited 0 with IRIS restored, Mavis unloaded, and matching candidate fingerprints. Mavis authored the queue, CLI, and matching tests in four files. Independent review ACCEPT at /Users/dustinpainter/.Codex/reports/mavis-maintenance-control-independent-review-2026-09-22.md; unpiped full suite 131 tests passed, a real CLI subprocess passed, and a two-thread serialized race canary plus regression passed. The only coordinator addition was the two-thread regression test closing review P2."
+        "The installed Mavis multi-file maintenance cancellation run at /Users/dustinpainter/.local-codex/mavis-service/evaluations/phase1/maintenance-control-live/result.json exited 0 with IRIS restored, Mavis unloaded, and matching candidate fingerprints. Mavis authored the queue, CLI, and matching tests in four files. Independent review ACCEPT at /Users/dustinpainter/.Codex/reports/mavis-maintenance-control-independent-review-2026-09-22.md; unpiped full suite 131 tests passed, a real CLI subprocess passed, and a two-thread serialized race canary plus regression passed. The only coordinator addition was the two-thread regression test closing review P2.",
+        "The current unified source candidate at 3da10bb15 passed 289 Mavis package tests and 125 host tests, plus syntax and architecture checks. This does not transfer the older installed E0 pass to the current candidate; its installed E0 rerun is pending."
       ]
     },
     {
@@ -51,8 +52,8 @@
       "command": "PYTHONDONTWRITEBYTECODE=1 PYTHONPATH=local-codex/mavis python3 -m unittest discover -s local-codex/mavis/tests -q",
       "artifact": "local-codex/mavis/reports/phase2-helper-interfaces.md",
       "evidence": [
-        "Project retrieval handles stale/deleted/renamed paths and hash-verified global records. Librarian/output-reader evidence boundaries, zero-failure parsing, and bounded archive paging are implemented; combined Mavis source suite passed 106 tests.",
-        "Embedding comparison, live isolated helper models, repeated compactions, large-log helper trial, and net-benefit acceptance remain open."
+        "Project retrieval handles stale/deleted/renamed paths and hash-verified global records. Librarian/output-reader evidence boundaries, zero-failure parsing, and bounded archive paging are implemented; the current Mavis source suite passed 289 tests.",
+        "A fixed 16-question direct-MLX comparison measured Qwen3 Embedding 0.6B at 12/16 expected files in the top five and the installed 8B model at 13/16. Real-model branch, changed-file, rename, and deletion freshness checks passed; see phase2-embedding-comparison.md. Installed embedding integration, live isolated helper models, repeated compactions, large-log helper trial, and completed-task benefit remain open."
       ]
     },
     {
@@ -62,7 +63,7 @@
       "command": "PYTHONDONTWRITEBYTECODE=1 PYTHONPATH=local-codex/mavis python3 -m unittest discover -s local-codex/mavis/tests -q",
       "artifact": "local-codex/mavis/reports/phase3-e1-runner.md",
       "evidence": [
-        "E1 source runner freezes revisions and checks, retains host receipts, dispatches native gateway assignments, and rejects dirty candidate checkouts. Main source suite passed 106 tests; gateway Mavis assignment fields passed 81 source tests.",
+        "E1 source runner freezes revisions and checks, retains host receipts, dispatches native gateway assignments, and rejects dirty candidate checkouts. Current package suite passed 289 tests and host suite passed 125. Gateway Terra verification now requires evidence-specific findings and exposes the accepted verifier report path and hash; source contract tests passed, but no current installed E1 trial has run.",
         "Installed accepted main-profile selection has source tests and independent review, but no real accepted profile is active. Native candidate activation receipt, paired failure comparison, independent promotion review, and rollback remain open; compare-native intentionally fails closed until activation is proven."
       ]
     },
