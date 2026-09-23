@@ -1,3 +1,4 @@
+import hashlib
 from pathlib import Path
 import json
 import subprocess
@@ -10,6 +11,77 @@ from mavis.transcripts import TranscriptArchive
 
 
 class TranscriptArchiveTests(unittest.TestCase):
+    def test_search_rejects_symlinked_transcripts_parent(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            archive = TranscriptArchive(root, "conversation-1")
+            archive.append_segment([{"role": "user", "content": "private decision"}])
+            outside = root / "outside-transcripts"
+            archive.root.parent.rename(outside)
+            archive.root.parent.symlink_to(outside, target_is_directory=True)
+            with self.assertRaisesRegex(ValueError, "archive directory escapes"):
+                archive.search("private decision")
+
+    def test_search_rejects_symlinked_archive_root(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            archive = TranscriptArchive(root, "conversation-1")
+            archive.append_segment([{"role": "user", "content": "private decision"}])
+            outside = root / "outside-archive"
+            archive.root.rename(outside)
+            archive.root.symlink_to(outside, target_is_directory=True)
+            with self.assertRaisesRegex(ValueError, "archive directory escapes"):
+                archive.search("private decision")
+
+    def test_search_rejects_symlinked_segments_directory(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            archive = TranscriptArchive(root, "conversation-1")
+            archive.append_segment([{"role": "user", "content": "safe decision"}])
+            external_dir = root / "outside"
+            external_dir.mkdir()
+            external = external_dir / "leak.jsonl"
+            external.write_text("private decision\n", encoding="utf-8")
+            for segment in (archive.root / "segments").iterdir():
+                segment.unlink()
+            (archive.root / "segments").rmdir()
+            (archive.root / "segments").symlink_to(external_dir, target_is_directory=True)
+            manifest = json.loads(archive.manifest_path.read_text())
+            manifest["segments"][0]["path"] = str(archive.root / "segments" / "leak.jsonl")
+            manifest["segments"][0]["sha256"] = hashlib.sha256(external.read_bytes()).hexdigest()
+            archive.manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
+            with self.assertRaisesRegex(ValueError, "directory escapes the archive"):
+                archive.search("private decision")
+
+    def test_search_rejects_forged_external_segment_even_when_hash_matches(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            archive = TranscriptArchive(root, "conversation-1")
+            archive.append_segment([{"role": "user", "content": "visible decision"}])
+            external = root / "leaked.jsonl"
+            external.write_text("a decision outside\n", encoding="utf-8")
+            digest = hashlib.sha256(external.read_bytes()).hexdigest()
+            manifest = json.loads(archive.manifest_path.read_text())
+            manifest["segments"][0]["path"] = str(external)
+            manifest["segments"][0]["sha256"] = digest
+            archive.manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
+            with self.assertRaisesRegex(ValueError, "escapes the archive"):
+                archive.search("decision")
+
+    def test_search_rejects_symlinked_segment(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            archive = TranscriptArchive(root, "conversation-1")
+            segment = archive.append_segment(
+                [{"role": "user", "content": "decision visible"}]
+            )
+            target = root / "real.jsonl"
+            target.write_text("hidden decision\n", encoding="utf-8")
+            segment.unlink()
+            segment.symlink_to(target)
+            with self.assertRaisesRegex(ValueError, "escapes the archive"):
+                archive.search("decision")
+
     def test_search_stops_scanning_after_page_but_verifies_later_segments(self):
         with tempfile.TemporaryDirectory() as directory:
             archive = TranscriptArchive(Path(directory), "conversation-1")

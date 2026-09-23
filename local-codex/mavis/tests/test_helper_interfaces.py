@@ -1,3 +1,5 @@
+import hashlib
+import json
 from pathlib import Path
 import tempfile
 import unittest
@@ -9,6 +11,76 @@ from mavis.transcripts import TranscriptArchive
 
 
 class LibrarianEvidenceTests(unittest.TestCase):
+    def test_validate_answer_rejects_symlinked_transcripts_parent(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            archive = TranscriptArchive(root, "conversation-1")
+            archive.append_segment([{"role": "user", "content": "private decision"}])
+            librarian = LibrarianEvidence(archive)
+            evidence = librarian.search("private decision")
+            citation = {key: evidence[0][key] for key in ("path", "line", "sha256")}
+            outside = root / "outside-transcripts"
+            archive.root.parent.rename(outside)
+            archive.root.parent.symlink_to(outside, target_is_directory=True)
+            with self.assertRaisesRegex(ValueError, "outside"):
+                librarian.validate_answer(
+                    {
+                        "answer": "private decision",
+                        "uncertainty": "single line only",
+                        "citations": [citation],
+                    },
+                    evidence,
+                )
+
+    def test_validate_answer_rejects_symlinked_archive_root(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            archive = TranscriptArchive(root, "conversation-1")
+            archive.append_segment([{"role": "user", "content": "private decision"}])
+            librarian = LibrarianEvidence(archive)
+            evidence = librarian.search("private decision")
+            citation = {key: evidence[0][key] for key in ("path", "line", "sha256")}
+            outside = root / "outside-archive"
+            archive.root.rename(outside)
+            archive.root.symlink_to(outside, target_is_directory=True)
+            with self.assertRaisesRegex(ValueError, "outside"):
+                librarian.validate_answer(
+                    {
+                        "answer": "private decision",
+                        "uncertainty": "single line only",
+                        "citations": [citation],
+                    },
+                    evidence,
+                )
+
+    def test_validate_answer_rejects_symlinked_segments_directory(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            archive = TranscriptArchive(root, "conversation-1")
+            archive.append_segment([{"role": "user", "content": "safe decision"}])
+            external_dir = root / "outside"
+            external_dir.mkdir()
+            external = external_dir / "leak.jsonl"
+            external.write_text("private decision\n", encoding="utf-8")
+            for segment in (archive.root / "segments").iterdir():
+                segment.unlink()
+            (archive.root / "segments").rmdir()
+            (archive.root / "segments").symlink_to(external_dir, target_is_directory=True)
+            path = archive.root / "segments" / "leak.jsonl"
+            digest = sha256_file(external)
+            manifest = json.loads(archive.manifest_path.read_text())
+            manifest["segments"][0]["path"] = str(path)
+            manifest["segments"][0]["sha256"] = digest
+            archive.manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
+            evidence = [{"path": str(path), "line": 1, "sha256": digest, "text": "private decision"}]
+            answer = {
+                "answer": "private decision",
+                "uncertainty": "single line only",
+                "citations": [{"path": str(path), "line": 1, "sha256": digest}],
+            }
+            with self.assertRaisesRegex(ValueError, "outside"):
+                LibrarianEvidence(archive).validate_answer(answer, evidence)
+
     def test_cited_answer_requires_archive_source_and_uncertainty(self):
         with tempfile.TemporaryDirectory() as directory:
             archive = TranscriptArchive(Path(directory), "conversation-1")
@@ -46,6 +118,67 @@ class LibrarianEvidenceTests(unittest.TestCase):
                     {**answer, "citations": [forged]}, evidence + [forged]
                 )
             segment.write_text("changed\n", encoding="utf-8")
+            with self.assertRaisesRegex(ValueError, "outside"):
+                librarian.validate_answer(answer, evidence)
+
+    def test_validate_answer_rejects_forged_external_segment(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            archive = TranscriptArchive(root, "conversation-1")
+            archive.append_segment([{"role": "user", "content": "keep the old release"}])
+            # The crafted manifest names an external file that was never part of
+            # the archive, while carrying that file's own correct hash. The path
+            # guard rejects it before any hash comparison happens.
+            external = root / "leaked.jsonl"
+            external.write_text("keep the old release\n", encoding="utf-8")
+            digest = hashlib.sha256(external.read_bytes()).hexdigest()
+            manifest = json.loads(archive.manifest_path.read_text())
+            manifest["segments"][0]["path"] = str(external)
+            manifest["segments"][0]["sha256"] = digest
+            archive.manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
+            evidence = [
+                {
+                    "path": str(external),
+                    "line": 1,
+                    "sha256": digest,
+                    "text": "keep the old release",
+                }
+            ]
+            citation = {"path": str(external), "line": 1, "sha256": digest}
+            librarian = LibrarianEvidence(archive)
+            with self.assertRaisesRegex(ValueError, "outside"):
+                librarian.validate_answer(
+                    {
+                        "answer": "The old release was kept.",
+                        "uncertainty": "This line does not explain why.",
+                        "citations": [citation],
+                    },
+                    evidence,
+                )
+
+    def test_validate_answer_rejects_symlinked_segment(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            archive = TranscriptArchive(root, "conversation-1")
+            segment = archive.append_segment(
+                [{"role": "user", "content": "Decision: keep the old release."}]
+            )
+            line_text = segment.read_text(encoding="utf-8")
+            # Search first to capture a genuine, in-segments evidence entry.
+            librarian = LibrarianEvidence(archive)
+            evidence = librarian.search("old release")
+            citation = {key: evidence[0][key] for key in ("path", "line", "sha256")}
+            # Swap the real file for a symlink to an identical-content sibling
+            # outside the segments directory; the hash stays correct.
+            external = root / "mirror.jsonl"
+            external.write_text(line_text, encoding="utf-8")
+            segment.unlink()
+            segment.symlink_to(external)
+            answer = {
+                "answer": "The old release was kept.",
+                "uncertainty": "This line does not explain why.",
+                "citations": [citation],
+            }
             with self.assertRaisesRegex(ValueError, "outside"):
                 librarian.validate_answer(answer, evidence)
 

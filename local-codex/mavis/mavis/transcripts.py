@@ -141,6 +141,31 @@ class TranscriptArchive:
         write_json(path, handoff)
         return path
 
+    def resolve_segment_file(self, declared_path: str | Path) -> Path:
+        """Resolve and validate a manifest segment path.
+
+        A segment must be a regular ``.jsonl`` file located directly inside
+        this archive's ``segments`` directory. Symlinks in the archive-owned
+        transcript, conversation, or segments directories or the file, and any
+        path that resolves outside the segments directory are rejected, so a
+        forged manifest cannot expose an external file even when its hash
+        matches.
+        """
+        path = Path(declared_path)
+        if path.suffix != ".jsonl":
+            raise ValueError(f"segment must be a .jsonl file: {path}")
+        for directory in (self.root.parent, self.root, self.root / "segments"):
+            if directory.is_symlink():
+                raise ValueError(f"archive directory escapes the archive: {directory}")
+        if path.is_symlink():
+            raise ValueError(f"segment symlink escapes the archive: {path}")
+        resolved = path.resolve()
+        if resolved.parent != (self.root / "segments").resolve():
+            raise ValueError(f"segment escapes the archive: {resolved}")
+        if not resolved.is_file():
+            raise ValueError(f"segment is missing: {resolved}")
+        return resolved
+
     def search(
         self, query: str, limit: int = 20, offset: int = 0
     ) -> list[dict[str, Any]]:
@@ -156,8 +181,8 @@ class TranscriptArchive:
         matched = 0
         manifest = read_json(self.manifest_path)
         for segment in manifest["segments"]:
-            path = Path(segment["path"])
-            if not path.is_file() or sha256_file(path) != segment["sha256"]:
+            path = self.resolve_segment_file(segment["path"])
+            if sha256_file(path) != segment["sha256"]:
                 raise ValueError(f"transcript segment is missing or changed: {path}")
             if len(results) >= limit:
                 continue
