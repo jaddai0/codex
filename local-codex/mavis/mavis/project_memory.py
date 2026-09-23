@@ -21,6 +21,11 @@ MAX_SOURCES = 16
 MAX_RECORD_BYTES = 64 * 1024
 
 
+def claim_key(claim: str) -> str:
+    """Group equivalent claim text without changing the stored wording."""
+    return " ".join(claim.casefold().split())
+
+
 class ProjectMemory:
     """Append project records and return only records backed by current files."""
 
@@ -184,13 +189,14 @@ class ProjectMemory:
 
     def _valid_record(
         self, path: Path, branch: str, version: int
-    ) -> dict[str, Any] | None:
+    ) -> tuple[dict[str, Any], int, str] | None:
         if path.is_symlink():
             return None
         try:
             if path.stat().st_size > MAX_RECORD_BYTES:
                 return None
-            record = json.loads(path.read_text(encoding="utf-8"))
+            raw = path.read_text(encoding="utf-8")
+            record = json.loads(raw)
             if (
                 not isinstance(record, dict)
                 or set(record)
@@ -259,7 +265,11 @@ class ProjectMemory:
                 source = self._source(reference["path"])
                 if source is None or source[1] != reference["sha256"]:
                     return None
-            return record
+            claim_line = f'  "claim": {json.dumps(record["claim"])},'
+            lines = raw.splitlines()
+            if claim_line not in lines:
+                return None
+            return record, lines.index(claim_line) + 1, claim_line
         except (OSError, ValueError, TypeError, KeyError):
             return None
 
@@ -288,16 +298,20 @@ class ProjectMemory:
             if not versions:
                 continue
             version, path = versions[-1]
-            record = self._valid_record(path, branch, version)
-            if record is None or needle not in record["claim"].casefold():
+            validated = self._valid_record(path, branch, version)
+            if validated is None:
+                continue
+            record, line_number, source_line = validated
+            if needle not in record["claim"].casefold():
                 continue
             score = 100 if record["claim"].casefold() == needle else 50
             hits.append(
                 {
                     "scope": "project",
                     "path": str(path),
-                    "line": 1,
-                    "text": record["claim"],
+                    "line": line_number,
+                    "text": source_line,
+                    "claim": record["claim"],
                     "score": score,
                     "source": "project-memory",
                     "record_id": record["record_id"],
@@ -310,4 +324,12 @@ class ProjectMemory:
                     "source_references": record["source_references"],
                 }
             )
-        return sorted(hits, key=lambda item: (-item["score"], item["record_id"]))
+        ranked = sorted(hits, key=lambda item: (-item["score"], item["record_id"]))
+        distinct = []
+        seen = set()
+        for hit in ranked:
+            key = claim_key(hit["claim"])
+            if key not in seen:
+                distinct.append(hit)
+                seen.add(key)
+        return distinct

@@ -397,13 +397,19 @@ class ProjectIndex:
             if key not in dedup or hit.score > dedup[key].score:
                 dedup[key] = hit
         project_ranked = sorted(dedup.values(), key=lambda item: (-item.score, item.path, item.line))
-        from .project_memory import ProjectMemory
+        from .project_memory import ProjectMemory, claim_key
 
         memories = ProjectMemory(self.project_root).search(query)
         global_ranked = sorted(self._verified_global_hits(query),
                                key=lambda item: (-item.score, item.path, item.line))
-        combined = ([item.as_dict() for item in project_ranked] + memories
-                    + [item.as_dict() for item in global_ranked])
+        seen_claims = {claim_key(item["claim"]) for item in memories}
+        distinct_global = []
+        for hit in global_ranked:
+            key = claim_key(hit.text)
+            if key not in seen_claims:
+                distinct_global.append(hit.as_dict())
+                seen_claims.add(key)
+        combined = [item.as_dict() for item in project_ranked] + memories + distinct_global
         return combined[offset:offset + limit]
 
     def symbol(self, name: str, limit: int = 20, offset: int = 0) -> list[dict[str, Any]]:

@@ -99,6 +99,70 @@ class ProjectMemoryTests(unittest.TestCase):
             self.assertEqual(hits[0]["branch"], memory.branch())
             self.assertIn("observed_at", hits[0]["freshness"])
 
+    def test_search_citation_is_the_exact_claim_line_in_saved_record(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            self.make_repo(root)
+            claim = 'Decision: use "stable" café and retry.'
+            ProjectMemory(root).add("quoted", "decision", claim, ["decision.md"])
+            hit = ProjectIndex(root, root / "shared").search("café")[0]
+            self.assertEqual(hit["claim"], claim)
+            saved_lines = Path(hit["path"]).read_text(encoding="utf-8").splitlines()
+            self.assertEqual(saved_lines[hit["line"] - 1], hit["text"])
+            self.assertIn('"claim":', hit["text"])
+            self.assertEqual(json.loads(Path(hit["path"]).read_text())["claim"], claim)
+
+    def test_equal_claims_collapse_before_paging_with_project_precedence(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory) / "project"
+            root.mkdir()
+            self.make_repo(root)
+            shared = Path(directory) / "shared"
+            memory = ProjectMemory(root)
+            memory.add("z-record", "decision", "Needle stable choice", ["decision.md"])
+            memory.add(
+                "a-record", "history", " needle  STABLE choice ", ["decision.md"]
+            )
+            memory.add("other", "failure", "Needle separate failure", ["decision.md"])
+            source = Path(directory) / "global-source.txt"
+            source.write_text("source")
+            knowledge = shared / "knowledge"
+            knowledge.mkdir(parents=True)
+            for name, claim in (
+                ("duplicate", "Needle stable choice"),
+                ("unique", "Needle global fact"),
+            ):
+                (knowledge / f"{name}.json").write_text(
+                    json.dumps(
+                        {
+                            "schema_version": "mavis.memory-record/v1",
+                            "scope": "global-coding",
+                            "verification_state": "verified",
+                            "claim": claim,
+                            "source_references": [
+                                {
+                                    "path": str(source),
+                                    "sha256": hashlib.sha256(
+                                        source.read_bytes()
+                                    ).hexdigest(),
+                                }
+                            ],
+                        }
+                    )
+                )
+            index = ProjectIndex(root, shared)
+            hits = index.search("needle", limit=2) + index.search(
+                "needle", limit=2, offset=2
+            )
+            self.assertEqual(
+                [hit["source"] for hit in hits],
+                ["project-memory", "project-memory", "verified-global"],
+            )
+            self.assertEqual(
+                [hit.get("record_id") for hit in hits[:2]], ["a-record", "other"]
+            )
+            self.assertEqual(hits[-1]["text"], "Needle global fact")
+
     def test_changed_deleted_source_and_branch_switch_invalidate_without_resurrection(
         self,
     ):
