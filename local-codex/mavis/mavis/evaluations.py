@@ -25,7 +25,7 @@ from urllib.request import Request, urlopen
 
 from .evidence import run_command
 from .objectives import ObjectiveStore
-from .runtime import RuntimeConfig, _listener_pids, admission, endpoint_alive, inventory, owns_running_server
+from .runtime import RuntimeConfig, _listener_pids, admission, endpoint_alive, inventory, loaded_generation_models
 from .storage import sha256_file, write_json
 
 
@@ -751,25 +751,27 @@ class E0Evaluator:
         mavis_alive = endpoint_alive(self.config.endpoint)
         iris_pids = _listener_pids(8000)
         mavis_pids = _listener_pids(8001)
-        distinct = not (iris_pids & mavis_pids)
-        mavis_owned = owns_running_server(self.config) if mavis_alive else False
+        park_pid = os.environ.get("MAVIS_E0_PARK_OWNER_PID")
+        parked = (park_pid is not None and park_pid.isdecimal()
+                  and mavis_pids == {int(park_pid)} and not mavis_alive)
         observed = (
             before.get("iris_pids") == after.get("iris_pids") == sorted(iris_pids)
             and before.get("iris_model_loaded") is True
             and after.get("iris_model_loaded") is True
             and before.get("mavis_pids") != after.get("mavis_pids")
-            and after.get("mavis_pids") == sorted(mavis_pids)
+            and after.get("mavis_pids")
             and proof.get("outage_observed") is True
         )
-        status = "pass" if iris_alive and mavis_alive and distinct and mavis_owned and observed else "reject"
+        iris_loaded = (loaded_generation_models(self.config.iris_endpoint) ==
+                       [self.config.model]) if iris_alive else False
+        status = "pass" if iris_alive and iris_loaded and parked and observed else "reject"
         return self._receipt(
             "isolation-recovery",
             status,
             [
                 f"iris_alive={iris_alive}",
-                f"mavis_alive={mavis_alive}",
-                f"distinct_listener_pids={distinct}",
-                f"mavis_owned={mavis_owned}",
+                f"iris_model_loaded={iris_loaded}",
+                f"mavis_port_reserved={parked}",
                 f"outage_and_new_service_observed={observed}",
             ],
             recovery_receipt=str(proof_path),

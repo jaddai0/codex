@@ -1,4 +1,10 @@
 from pathlib import Path
+import os
+import signal
+import socket
+import subprocess
+import sys
+import threading
 import tempfile
 import time
 import unittest
@@ -16,6 +22,7 @@ from mavis.runtime import (
     require_idle_iris_handoff,
     require_installed_selected_model,
     release_iris_model_drain,
+    park_mavis_server,
     start_server,
     wait_iris_model_drain,
 )
@@ -36,6 +43,51 @@ class FakeProcess:
 
 
 class RuntimeTests(unittest.TestCase):
+    def test_park_waits_for_process_group_and_exclusively_reserves_port(self):
+        with tempfile.TemporaryDirectory() as directory:
+            with socket.socket() as probe:
+                probe.bind(("127.0.0.1", 0))
+                port = probe.getsockname()[1]
+            config = RuntimeConfig(home=Path(directory),
+                                   endpoint=f"http://127.0.0.1:{port}/v1")
+            child = subprocess.Popen(
+                [sys.executable, "-c", "import socket,time; s=socket.socket(); "
+                 "s.bind(('127.0.0.1', int(__import__('sys').argv[1]))); "
+                 "s.listen(); time.sleep(60)", str(port)],
+                start_new_session=True,
+            )
+            try:
+                write_json(config.state_path, {"pid": child.pid})
+                deadline = time.monotonic() + 5
+                while time.monotonic() < deadline:
+                    with socket.socket() as probe:
+                        if probe.connect_ex(("127.0.0.1", port)) == 0:
+                            break
+                    time.sleep(0.02)
+                else:
+                    self.fail("test listener did not start")
+                idle = {"status": "ok", "active_requests": 0,
+                        "waiting_requests": 0, "models_loading": 0}
+                reaper = threading.Thread(target=child.wait, daemon=True)
+                reaper.start()
+                with patch("mavis.runtime.request_json", return_value=idle), \
+                        patch("mavis.runtime.owns_running_server", return_value=True):
+                    reservation = park_mavis_server(config)
+                try:
+                    reaper.join(timeout=1)
+                    self.assertIsNotNone(child.poll())
+                    with socket.socket() as probe:
+                        self.assertEqual(probe.connect_ex(("127.0.0.1", port)), 0)
+                    with self.assertRaises(OSError):
+                        with socket.socket() as competing:
+                            competing.bind(("127.0.0.1", port))
+                finally:
+                    reservation.close()
+            finally:
+                if child.poll() is None:
+                    os.killpg(child.pid, signal.SIGKILL)
+                child.wait()
+
     def test_loaded_generation_inventory_keeps_unknown_models_visible(self):
         rows = [{"id": "embed", "loaded": True, "engine_type": "embedding"},
                 {"id": "main", "loaded": True, "engine_type": "vlm"},

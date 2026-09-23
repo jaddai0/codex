@@ -15,6 +15,31 @@ from mavis.storage import sha256_file, write_json
 
 
 class E0EvaluationTests(unittest.TestCase):
+    def test_isolation_recovery_requires_parked_mavis_and_live_iris(self):
+        with tempfile.TemporaryDirectory() as directory:
+            evaluator = E0Evaluator(Path(directory), RuntimeConfig(home=Path(directory)))
+            evaluator.root.mkdir(parents=True)
+            candidate = {"core_sha256": "a" * 64}
+            write_json(evaluator.root / "isolation-recovery-live.json", {
+                "schema_version": "mavis.e0-isolation-recovery/v1",
+                "candidate": candidate,
+                "before": {"iris_pids": [10], "iris_model_loaded": True,
+                           "mavis_pids": [20]},
+                "after": {"iris_pids": [10], "iris_model_loaded": True,
+                          "mavis_pids": [21]},
+                "outage_observed": True,
+            })
+            with patch.dict(os.environ, {"MAVIS_E0_PARK_OWNER_PID": "30"}), \
+                    patch("mavis.evaluations.installed_candidate_fingerprint",
+                          return_value=candidate), \
+                    patch("mavis.evaluations.endpoint_alive",
+                          side_effect=[True, False]), \
+                    patch("mavis.evaluations._listener_pids",
+                          side_effect=[{10}, {30}]), \
+                    patch("mavis.evaluations.loaded_generation_models",
+                          return_value=[evaluator.config.model]):
+                self.assertEqual(evaluator.run_case("isolation-recovery")["status"], "pass")
+
     def test_buried_inspection_allows_stdin_sort_unique_without_file_output(self):
         self.assertTrue(_safe_buried_inspection("grep -o MAVIS_E0_FAILURE_ output.raw | sort -u | head"))
         self.assertFalse(_safe_buried_inspection("grep -o MAVIS_E0_FAILURE_ output.raw | sort -o stolen.log"))

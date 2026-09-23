@@ -504,3 +504,47 @@ def stop_server(config: RuntimeConfig) -> None:
         raise RuntimeError("refusing to stop a process Mavis does not own")
     pid = int(read_json(config.state_path)["pid"])
     os.kill(pid, signal.SIGTERM)
+
+
+def park_mavis_server(config: RuntimeConfig, *, timeout: float = 30) -> socket.socket:
+    """Stop the owned server and reserve its port through IRIS restoration.
+
+    The caller must keep the returned listening socket open until IRIS is
+    restored and its drain released. A failed stop never proves safe handoff.
+    """
+    status = request_json(config.endpoint, "/api/status")
+    if (not isinstance(status, dict) or status.get("status") != "ok"
+            or type(status.get("active_requests")) is not int
+            or type(status.get("waiting_requests")) is not int
+            or type(status.get("models_loading")) is not int
+            or any(status[key] != 0 for key in
+                   ("active_requests", "waiting_requests", "models_loading"))):
+        raise RuntimeError("Mavis server has active, queued, or loading work")
+    if not owns_running_server(config):
+        raise RuntimeError("refusing to park a server Mavis does not own")
+    pid = int(read_json(config.state_path)["pid"])
+    if os.getpgid(pid) != pid:
+        raise RuntimeError("Mavis server is not in its dedicated process group")
+    os.killpg(pid, signal.SIGTERM)
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        try:
+            os.killpg(pid, 0)
+        except ProcessLookupError:
+            if not _listener_pids(_port(config.endpoint)):
+                break
+        time.sleep(0.2)
+    else:
+        raise TimeoutError("Mavis server or a model worker remained after stop")
+    parsed = urlparse(config.endpoint)
+    reservation = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    try:
+        reservation.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        reservation.bind((parsed.hostname or "127.0.0.1", _port(config.endpoint)))
+        reservation.listen(1)
+        if _listener_pids(_port(config.endpoint)) != {os.getpid()}:
+            raise RuntimeError("Mavis port reservation did not exclusively own the listener")
+        return reservation
+    except BaseException:
+        reservation.close()
+        raise
