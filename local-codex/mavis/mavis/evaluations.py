@@ -9,6 +9,8 @@ environment.
 from __future__ import annotations
 
 from datetime import datetime, timezone
+from contextlib import contextmanager
+import fcntl
 import hashlib
 import json
 import os
@@ -17,6 +19,7 @@ import re
 import shlex
 import subprocess
 from typing import Any, Callable
+import uuid
 from urllib.parse import urlparse
 from urllib.request import Request, urlopen
 
@@ -215,7 +218,21 @@ class E0Evaluator:
         write_json(self.root / f"{case}.json", payload)
         return payload
 
+    @contextmanager
+    def _suite_lock(self):
+        self.root.mkdir(parents=True, exist_ok=True)
+        with (self.root / ".suite.lock").open("a+") as handle:
+            fcntl.flock(handle.fileno(), fcntl.LOCK_EX)
+            try:
+                yield
+            finally:
+                fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
+
     def run_case(self, case: str) -> dict[str, Any]:
+        with self._suite_lock():
+            return self._run_case_unlocked(case)
+
+    def _run_case_unlocked(self, case: str) -> dict[str, Any]:
         methods: dict[str, Callable[[], dict[str, Any]]] = {
             "tool-roundtrip": self._tool_roundtrip,
             "small-repository": lambda: self._small_repository("small-repository"),
@@ -344,24 +361,29 @@ class E0Evaluator:
     def run(self, case: str | None = None) -> dict[str, Any]:
         if case is not None:
             return self.run_case(case)
-        results = [self.run_case(item) for item in E0_CASES]
-        passed = len(results) == len(E0_CASES) and all(item["status"] == "pass" for item in results)
-        summary = {
-            "schema_version": "mavis.evaluation-suite/v1",
-            "suite": "e0",
-            "status": "pass" if passed else "reject",
-            "mandatory_cases": list(E0_CASES),
-            "results": [{"case": item["case"], "status": item["status"]} for item in results],
-            "observed_at": _now(),
-        }
-        if passed:
-            summary["installed_candidate"] = installed_candidate_fingerprint()
-            summary["model_id"] = self.config.model
-            summary["case_receipts"] = {
-                item: sha256_file(self.root / f"{item}.json") for item in E0_CASES
+        run_id = os.environ.get("MAVIS_E0_RUN_ID") or uuid.uuid4().hex
+        if not re.fullmatch(r"[0-9a-f]{32}", run_id):
+            raise ValueError("E0 run ID must be 32 lowercase hexadecimal characters")
+        with self._suite_lock():
+            results = [self._run_case_unlocked(item) for item in E0_CASES]
+            passed = len(results) == len(E0_CASES) and all(item["status"] == "pass" for item in results)
+            summary = {
+                "schema_version": "mavis.evaluation-suite/v1",
+                "suite": "e0",
+                "run_id": run_id,
+                "status": "pass" if passed else "reject",
+                "mandatory_cases": list(E0_CASES),
+                "results": [{"case": item["case"], "status": item["status"]} for item in results],
+                "observed_at": _now(),
             }
-        write_json(self.root / "summary.json", summary)
-        return summary
+            if passed:
+                summary["installed_candidate"] = installed_candidate_fingerprint()
+                summary["model_id"] = self.config.model
+                summary["case_receipts"] = {
+                    item: sha256_file(self.root / f"{item}.json") for item in E0_CASES
+                }
+            write_json(self.root / "summary.json", summary)
+            return summary
 
     def _tool_roundtrip(self) -> dict[str, Any]:
         if not endpoint_alive(self.config.endpoint):

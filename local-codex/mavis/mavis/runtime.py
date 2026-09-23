@@ -9,6 +9,7 @@ from pathlib import Path
 import signal
 import socket
 import subprocess
+import sys
 import time
 from typing import Any
 from urllib.error import URLError
@@ -67,12 +68,56 @@ def inventory(endpoint: str) -> list[dict[str, Any]]:
     return records
 
 
+def loaded_generation_models(endpoint: str) -> list[str]:
+    """Require a readable inventory and name every loaded non-embedding model."""
+    models = []
+    for row in inventory(endpoint):
+        if row.get("loaded") is not True:
+            continue
+        if row.get("engine_type") == "embedding" or row.get("model_type") == "embedding":
+            continue
+        model_id = row.get("id")
+        if not isinstance(model_id, str) or not model_id:
+            raise RuntimeError("loaded generation model lacks an ID")
+        models.append(model_id)
+    return models
+
+
 def endpoint_alive(endpoint: str) -> bool:
     try:
         inventory(endpoint)
         return True
     except (OSError, URLError, RuntimeError, ValueError, json.JSONDecodeError):
         return False
+
+
+def require_idle_iris_handoff(config: RuntimeConfig, *, interval_seconds: float = 1.0) -> None:
+    """Refuse a model handoff while IRIS has active or queued generation."""
+    for sample in range(2):
+        status = request_json(config.iris_endpoint, "/api/status")
+        if (not isinstance(status, dict) or status.get("status") != "ok"
+            or not isinstance(status.get("loaded_models"), list)
+            or config.model not in status["loaded_models"]
+            or type(status.get("active_requests")) is not int
+            or type(status.get("waiting_requests")) is not int
+            or status["active_requests"] != 0
+            or status["waiting_requests"] != 0):
+            raise RuntimeError("IRIS has active or waiting work; model handoff refused")
+        if sample == 0:
+            time.sleep(interval_seconds)
+    if loaded_generation_models(config.iris_endpoint) != [config.model]:
+        raise RuntimeError("IRIS generation model inventory changed before handoff")
+
+
+def require_installed_selected_model(config: RuntimeConfig) -> None:
+    """Prove the installed launcher will select the model being handed off."""
+    prepare = Path.home() / ".local" / "share" / "local-codex" / "prepare_runtime.py"
+    result = subprocess.run(
+        [sys.executable, str(prepare), "--mavis-home", str(config.home), "--resolve-model"],
+        text=True, capture_output=True, timeout=15, check=True,
+    )
+    if result.stdout.strip() != config.model:
+        raise RuntimeError("installed launcher selects a different Mavis model")
 
 
 def _port(endpoint: str) -> int:

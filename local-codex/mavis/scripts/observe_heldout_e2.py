@@ -25,8 +25,10 @@ from mavis.e2_tasks import (CATALOG_TEST, FULL_TEST, _completed_prompt_turn,
                             terra_review_command, terra_review_prompt, verify_heldout)
 from mavis.e1_bootstrap import _summary as current_e0_summary
 from mavis.evaluations import installed_candidate_fingerprint
-from mavis.runtime import (RuntimeConfig, endpoint_alive, ensure_runtime, inventory,
-                           load_model, request_json, stop_server)
+from mavis.runtime import (RuntimeConfig, ensure_runtime, inventory,
+                           load_model, loaded_generation_models, port_in_use,
+                           request_json, require_idle_iris_handoff,
+                           require_installed_selected_model, stop_server)
 from mavis.storage import sha256_file, write_json
 
 
@@ -64,7 +66,8 @@ def main() -> int:
         return any(row.get("id") == config.model and row.get("loaded")
                    for row in inventory(endpoint))
 
-    if not loaded(config.iris_endpoint) or loaded(config.endpoint):
+    require_installed_selected_model(config)
+    if not loaded(config.iris_endpoint) or loaded_generation_models(config.endpoint):
         raise RuntimeError("IRIS must own the main model and Mavis must be unloaded")
     candidate = installed_candidate_fingerprint()
     e0_path, e0 = current_e0_summary(service)
@@ -85,6 +88,7 @@ def main() -> int:
     signal.signal(signal.SIGTERM, interrupt)
     signal.signal(signal.SIGINT, interrupt)
     try:
+        require_idle_iris_handoff(config)
         request_json(config.iris_endpoint, model_path + "/unload", method="POST", timeout=180)
         if loaded(config.iris_endpoint):
             raise RuntimeError("IRIS main model did not unload")
@@ -139,29 +143,30 @@ def main() -> int:
         result["error"] = repr(exc)
     finally:
         try:
-            if loaded(config.endpoint):
+            if loaded_generation_models(config.endpoint):
                 request_json(config.endpoint, model_path + "/unload", method="POST", timeout=180)
-            if loaded(config.endpoint):
+            if loaded_generation_models(config.endpoint):
                 raise RuntimeError("Mavis main model remained loaded")
         except BaseException as exc:
             result["mavis_unload_error"] = repr(exc)
             try:
-                if endpoint_alive(config.endpoint):
-                    stop_server(config)
-                    for _ in range(100):
-                        if not endpoint_alive(config.endpoint):
-                            break
-                        time.sleep(0.2)
-                    ensure_runtime(config, load=False)
+                stop_server(config)
+                for _ in range(100):
+                    if not port_in_use(config.endpoint):
+                        break
+                    time.sleep(0.2)
+                if port_in_use(config.endpoint):
+                    raise RuntimeError("Mavis listener remained after stop")
+                ensure_runtime(config, load=False)
             except BaseException as recovery_exc:
                 result["mavis_stop_error"] = repr(recovery_exc)
         try:
-            if endpoint_alive(config.endpoint) and loaded(config.endpoint):
+            if loaded_generation_models(config.endpoint):
                 raise RuntimeError("Mavis still holds the model")
             if not loaded(config.iris_endpoint):
                 request_json(config.iris_endpoint, model_path + "/load", method="POST", timeout=900)
             result["iris_loaded"] = loaded(config.iris_endpoint)
-            result["mavis_loaded"] = loaded(config.endpoint)
+            result["mavis_loaded"] = bool(loaded_generation_models(config.endpoint))
             result["candidate_after"] = installed_candidate_fingerprint()
         except BaseException as exc:
             result["iris_restore_error"] = repr(exc)

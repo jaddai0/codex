@@ -8,7 +8,10 @@ from mavis.runtime import (
     RuntimeConfig,
     admission,
     ensure_isolated_settings,
+    loaded_generation_models,
     owns_running_server,
+    require_idle_iris_handoff,
+    require_installed_selected_model,
     start_server,
 )
 from mavis.storage import write_json
@@ -28,6 +31,39 @@ class FakeProcess:
 
 
 class RuntimeTests(unittest.TestCase):
+    def test_loaded_generation_inventory_keeps_unknown_models_visible(self):
+        rows = [{"id": "embed", "loaded": True, "engine_type": "embedding"},
+                {"id": "main", "loaded": True, "engine_type": "vlm"},
+                {"id": "unexpected", "loaded": True}]
+        with patch("mavis.runtime.inventory", return_value=rows):
+            self.assertEqual(loaded_generation_models("http://127.0.0.1:8001/v1"),
+                             ["main", "unexpected"])
+
+    def test_handoff_refuses_active_or_uncertain_iris_work(self):
+        config = RuntimeConfig(home=Path("/tmp/mavis-handoff-test"))
+        idle = {"status": "ok", "loaded_models": [config.model],
+                "active_requests": 0, "waiting_requests": 0}
+        with patch("mavis.runtime.request_json", side_effect=[idle, idle]) as reader, \
+                patch("mavis.runtime.loaded_generation_models", return_value=[config.model]), \
+                patch("mavis.runtime.time.sleep"):
+            require_idle_iris_handoff(config)
+            self.assertEqual(reader.call_count, 2)
+        for changed in ({"active_requests": 1}, {"waiting_requests": 1},
+                        {"loaded_models": []}, {"active_requests": None}):
+            with self.subTest(changed=changed), patch(
+                "mavis.runtime.request_json", return_value={**idle, **changed}
+            ), self.assertRaisesRegex(RuntimeError, "handoff refused"):
+                require_idle_iris_handoff(config, interval_seconds=0)
+
+    def test_handoff_requires_installed_launcher_model_match(self):
+        config = RuntimeConfig(home=Path("/tmp/mavis-handoff-test"))
+        with patch("mavis.runtime.subprocess.run") as run:
+            run.return_value.stdout = "another-model\n"
+            with self.assertRaisesRegex(RuntimeError, "different Mavis model"):
+                require_installed_selected_model(config)
+            run.return_value.stdout = config.model + "\n"
+            require_installed_selected_model(config)
+
     def test_ownership_requires_exact_binary_base_path_and_port(self):
         with tempfile.TemporaryDirectory() as directory:
             config = RuntimeConfig(home=Path(directory), omlx_binary=Path("/opt/omlx"))
