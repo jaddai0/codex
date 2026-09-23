@@ -141,7 +141,7 @@ class E0EvaluationTests(unittest.TestCase):
                 {"type": "session_meta", "payload": {"cwd": str(repo)}},
                 {"type": "response_item", "payload": {"type": "function_call", "name": "exec_command", "call_id": "run", "arguments": '{"cmd":"python3 produce_log.py"}'}},
                 {"type": "response_item", "payload": {"type": "function_call_output", "call_id": "run", "output": output}},
-                {"type": "event_msg", "payload": {"type": "task_complete", "last_agent_message": f"exited with code 1: {marker}"}},
+                {"type": "event_msg", "payload": {"type": "task_complete", "last_agent_message": f"The command exited with code 1: {marker}"}},
             ]
             rollout.write_text("".join(json.dumps(event) + "\n" for event in events))
             (task / "result.json").write_text(json.dumps({
@@ -165,13 +165,28 @@ class E0EvaluationTests(unittest.TestCase):
                 events[-1]["payload"]["last_agent_message"] = f"The command failed with exit code 1: {marker}"
                 rollout.write_text("".join(json.dumps(event) + "\n" for event in events))
                 self.assertEqual(evaluator.run_case("buried-failure")["status"], "pass")
+                events[-1]["payload"]["last_agent_message"] = f"The command **failed** (non-zero exit code **1**): {marker}"
+                rollout.write_text("".join(json.dumps(event) + "\n" for event in events))
+                self.assertEqual(evaluator.run_case("buried-failure")["status"], "pass")
                 events[-1]["payload"]["last_agent_message"] = f"The command succeeded: {marker}"
+                rollout.write_text("".join(json.dumps(event) + "\n" for event in events))
+                self.assertEqual(evaluator.run_case("buried-failure")["status"], "blocked")
+                events[-1]["payload"]["last_agent_message"] = f"The command succeeded. An earlier unrelated test failed; exit code 1 is in the transcript. {marker}"
+                rollout.write_text("".join(json.dumps(event) + "\n" for event in events))
+                self.assertEqual(evaluator.run_case("buried-failure")["status"], "blocked")
+                events[-1]["payload"]["last_agent_message"] = f"The command failed with exit code 0. An earlier process had exit code 1. {marker}"
+                rollout.write_text("".join(json.dumps(event) + "\n" for event in events))
+                self.assertEqual(evaluator.run_case("buried-failure")["status"], "blocked")
+                events[-1]["payload"]["last_agent_message"] = f"The command failed with exit code 11, though code 1 was also mentioned. {marker}"
+                rollout.write_text("".join(json.dumps(event) + "\n" for event in events))
+                self.assertEqual(evaluator.run_case("buried-failure")["status"], "blocked")
+                events[-1]["payload"]["last_agent_message"] = f"The command failed with exit code 1. The command also exited with code 11. {marker}"
                 rollout.write_text("".join(json.dumps(event) + "\n" for event in events))
                 self.assertEqual(evaluator.run_case("buried-failure")["status"], "blocked")
                 events[-1]["payload"]["last_agent_message"] = f"The command failed with exit code 1: {marker}"
                 events.insert(1, {"type": "response_item", "payload": {
                     "type": "function_call", "name": "exec_command", "call_id": "preflight",
-                    "arguments": json.dumps({"cmd": "ls produce_log.py"}),
+                    "arguments": json.dumps({"cmd": "ls produce_log.py; rg marker output.raw | cut -c1-120"}),
                 }})
                 rollout.write_text("".join(json.dumps(event) + "\n" for event in events))
                 self.assertEqual(evaluator.run_case("buried-failure")["status"], "pass")
