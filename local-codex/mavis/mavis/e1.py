@@ -666,6 +666,30 @@ class E1Runner:
             finally:
                 fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
 
+    def prepare_review(self, experiment_id: str, owner: dict[str, str]) -> dict[str, Any]:
+        """Freeze a separate reviewer's exact installed-trial assignment."""
+        from .e1_review import prepare_review
+
+        record = self.store.load(experiment_id)
+        self.store._check_comparison(record)
+        return prepare_review(self.home, record, owner)
+
+    def dispatch_review(self, experiment_id: str, job_id: str) -> dict[str, Any]:
+        from .e1_review import dispatch_review
+
+        record = self.store.load(experiment_id)
+        self.store._check_comparison(record)
+        return dispatch_review(self.home, record, job_id=job_id,
+                               starter=self.gateway_assignment_starter)
+
+    def import_review(self, experiment_id: str) -> dict[str, Any]:
+        from .e1_review import import_review_report
+
+        record = self.store.load(experiment_id)
+        self.store._check_comparison(record)
+        receipt = import_review_report(self.home, record, self.store.gateway_status_reader)
+        return self.store.review(experiment_id, receipt)
+
     def _compare_native_locked(self, experiment_id: str, case_id: str) -> dict[str, Any]:
         record, manifest = self._frozen(experiment_id)
         if record["state"] != "candidate":

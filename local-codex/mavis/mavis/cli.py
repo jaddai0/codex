@@ -189,12 +189,28 @@ def build_parser() -> argparse.ArgumentParser:
     native_compare = e1_sub.add_parser("compare-native")
     native_compare.add_argument("experiment_id")
     native_compare.add_argument("case_id")
+    review_prepare = e1_sub.add_parser("review-prepare")
+    review_prepare.add_argument("experiment_id")
+    review_prepare.add_argument("--owner-provider", required=True)
+    review_prepare.add_argument("--owner-model", required=True)
+    review_prepare.add_argument("--owner-harness", required=True)
+    review_dispatch = e1_sub.add_parser("review-dispatch")
+    review_dispatch.add_argument("experiment_id")
+    review_dispatch.add_argument("--job-id", required=True)
+    review_import = e1_sub.add_parser("review-import")
+    review_import.add_argument("experiment_id")
     for name in ("status", "review-requirements", "stage"):
         entry = e1_sub.add_parser(name)
         entry.add_argument("experiment_id")
     review = e1_sub.add_parser("review")
     review.add_argument("experiment_id")
     review.add_argument("receipt", type=Path)
+    promote = e1_sub.add_parser("promote")
+    promote.add_argument("experiment_id")
+    promote.add_argument("--between-objectives", action="store_true")
+    rollback = e1_sub.add_parser("rollback")
+    rollback.add_argument("experiment_id")
+    rollback.add_argument("--reason", required=True)
 
     maintenance = subcommands.add_parser("maintenance")
     maintenance_sub = maintenance.add_subparsers(
@@ -404,15 +420,33 @@ def main(argv: list[str] | None = None) -> int:
             )
         elif args.e1_command == "compare-native":
             result = runner.compare_native(args.experiment_id, args.case_id)
+        elif args.e1_command == "review-prepare":
+            result = runner.prepare_review(args.experiment_id, {
+                "provider": args.owner_provider, "model": args.owner_model,
+                "harness": args.owner_harness,
+            })
+        elif args.e1_command == "review-dispatch":
+            result = runner.dispatch_review(args.experiment_id, args.job_id)
+        elif args.e1_command == "review-import":
+            result = runner.import_review(args.experiment_id)
         elif args.e1_command == "status":
             result = store.load(args.experiment_id)
         elif args.e1_command == "review-requirements":
             record = store.load(args.experiment_id)
             if record["state"] != "compared":
                 raise ValueError("review requirements need a completed comparison")
-            result = review_assignment_requirements(record)
+            if record["comparison"]["candidate"].get("e1_native_trial"):
+                from .e1_review import _paths
+
+                result = read_json(_paths(home, args.experiment_id)[0])["requirements"]
+            else:
+                result = review_assignment_requirements(record)
         elif args.e1_command == "review":
             result = store.review(args.experiment_id, args.receipt)
+        elif args.e1_command == "promote":
+            result = store.promote(args.experiment_id, between_objectives=args.between_objectives)
+        elif args.e1_command == "rollback":
+            result = store.rollback(args.experiment_id, reason=args.reason)
         else:
             result = store.stage(args.experiment_id)
         print_json(result)
