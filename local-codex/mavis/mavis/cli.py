@@ -15,6 +15,9 @@ from .e1_bootstrap import (check_bootstrap_review, create_bootstrap,
                            prepare_bootstrap_review)
 from .e1_bootstrap_gateway import (complete_bootstrap_review, start_bootstrap_verifier,
                                    verify_and_import_bootstrap_review)
+from .e1_review import check_review_report
+from .e1_review_gateway import (complete_review, start_review_verifier,
+                                verify_and_import_review)
 from .experiments import ExperimentStore, review_assignment_requirements
 from .e0_tasks import prepare_small_repository
 from .e2_tasks import prepare_heldout, verify_heldout
@@ -225,6 +228,11 @@ def build_parser() -> argparse.ArgumentParser:
     review_dispatch = e1_sub.add_parser("review-dispatch")
     review_dispatch.add_argument("experiment_id")
     review_dispatch.add_argument("--job-id", required=True)
+    review_check = e1_sub.add_parser("review-check")
+    review_check.add_argument("experiment_id")
+    review_check.add_argument("--report", required=True, type=Path)
+    for name in ("review-complete", "review-verifier-start", "review-verify"):
+        e1_sub.add_parser(name).add_argument("experiment_id")
     review_import = e1_sub.add_parser("review-import")
     review_import.add_argument("experiment_id")
     for name in ("status", "review-requirements", "stage"):
@@ -476,6 +484,20 @@ def main(argv: list[str] | None = None) -> int:
             })
         elif args.e1_command == "review-dispatch":
             result = runner.dispatch_review(args.experiment_id, args.job_id)
+        elif args.e1_command in ("review-check", "review-complete",
+                                  "review-verifier-start", "review-verify"):
+            record = store.load(args.experiment_id)
+            store._check_comparison(record)
+            if args.e1_command == "review-check":
+                result = check_review_report(home, record, args.report)
+            elif args.e1_command == "review-complete":
+                result = complete_review(home, record)
+            elif args.e1_command == "review-verifier-start":
+                result = start_review_verifier(home, record)
+            else:
+                imported = verify_and_import_review(home, record)
+                result = {"gateway": imported,
+                          "experiment": store.review(args.experiment_id, Path(imported["review"]))}
         elif args.e1_command == "review-import":
             result = runner.import_review(args.experiment_id)
         elif args.e1_command == "status":
