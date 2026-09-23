@@ -199,6 +199,14 @@ def omlx_live_process_binding(config: RuntimeConfig, endpoint: str,
     if not any(path == base_path or base_path in path.parents
                for path in _process_open_paths(pid)):
         raise RuntimeError("oMLX process is not bound to the expected base path")
+    status = request_json(endpoint, "/api/status")
+    snapshot = status.get("runtime_source") if isinstance(status, dict) else None
+    expected_python = str((config.omlx_binary.parent / "python").resolve(strict=True))
+    if (not isinstance(snapshot, dict) or snapshot.get("process_pid") != pid
+            or snapshot.get("package_sha256") != runtime["package_sha256"]
+            or snapshot.get("package_files") != runtime["package_files"]
+            or snapshot.get("python_executable") != expected_python):
+        raise RuntimeError("live oMLX process does not report the fingerprinted package and Python")
     result = subprocess.run(["ps", "-p", str(pid), "-o", "lstart="],
                             text=True, capture_output=True, check=True, timeout=5,
                             env={**os.environ, "LC_ALL": "C"})
@@ -207,10 +215,16 @@ def omlx_live_process_binding(config: RuntimeConfig, endpoint: str,
     latest_source = max(path.stat().st_mtime for path in package.rglob("*.py")
                         if "__pycache__" not in path.parts)
     latest_source = max(latest_source, config.omlx_binary.stat().st_mtime)
-    if started + 1 < latest_source:
-        raise RuntimeError("oMLX process started before its current source was installed")
+    model = Path(runtime["model_path"])
+    latest_source = max(latest_source, *(path.stat().st_mtime for path in
+        (model / name for name in runtime["model_metadata_sha256"])) )
+    latest_source = max(latest_source, *(path.stat().st_mtime for path in
+        model.glob("*.safetensors")))
+    if started <= latest_source + 1:
+        raise RuntimeError("oMLX process may predate its current source or model files")
     return {"pid": pid, "started_at_epoch": started, "base_path": str(base_path),
-            "package_sha256": runtime["package_sha256"]}
+            "package_sha256": runtime["package_sha256"],
+            "python_executable": expected_python}
 
 
 def _iris_drain_token() -> str:
