@@ -6,13 +6,20 @@ import unittest
 from unittest.mock import patch
 
 from mavis.evidence import run_command
-from mavis.helper_eval import SUITE_VERSION, _completion, evaluate, main
+from mavis.helper_eval import (MAX_REQUEST_BYTES, SUITE_VERSION, _completion,
+                               _request_bytes, evaluate as _evaluate, main)
 from mavis.helpers import HelperSession
 from mavis.transcripts import TranscriptArchive
 
 
 BASE_URL = "http://127.0.0.1:8001/v1"
 MODEL = "Qwen3.5-0.8B"
+
+
+def evaluate(*args, **kwargs):
+    """Fixture-only route can inspect cases but can never return a pass receipt."""
+    kwargs.setdefault("test_only_unbound", True)
+    return _evaluate(*args, **kwargs)
 
 
 class HelperEvaluationTests(unittest.TestCase):
@@ -36,7 +43,7 @@ class HelperEvaluationTests(unittest.TestCase):
                  "expected_source_terms": ["Decision: retain the blue engine"]}
             ]}
             result = evaluate(home, suite, MODEL, BASE_URL, ask=ask)
-            self.assertEqual(result["status"], "pass")
+            self.assertEqual(result["status"], "test-only")
             self.assertEqual(len(calls), 1)
             self.assertNotIn("expected_answer_terms", calls[0][1]["content"])
             session = HelperSession(home, "librarian")
@@ -89,7 +96,7 @@ class HelperEvaluationTests(unittest.TestCase):
                 return {"answer": "new decision", "uncertainty": "No reason recorded",
                         "citations": [citation]}
 
-            self.assertEqual(evaluate(home, suite, MODEL, BASE_URL, ask=ask)["status"], "pass")
+            self.assertEqual(evaluate(home, suite, MODEL, BASE_URL, ask=ask)["status"], "test-only")
 
     def test_output_known_format_uses_host_parser_before_model(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -113,8 +120,12 @@ class HelperEvaluationTests(unittest.TestCase):
             ]}
             valid = {"verdict": "uncertain", "summary": "", "observations": [
                 {"line": 1, "text": "compile complete"}]}
-            accepted = evaluate(home, suite, MODEL, BASE_URL, ask=lambda *args: valid)
-            self.assertEqual(accepted["status"], "pass")
+            def ask(*args):
+                self.assertLessEqual(len(_request_bytes(MODEL, args[2])), MAX_REQUEST_BYTES)
+                return valid
+
+            accepted = evaluate(home, suite, MODEL, BASE_URL, ask=ask)
+            self.assertEqual(accepted["status"], "test-only")
             forged = {**valid, "observations": [{"line": 1, "text": "all tests passed"}]}
             rejected = evaluate(home, suite, MODEL, BASE_URL, ask=lambda *args: forged)
             self.assertEqual(rejected["status"], "fail")
@@ -135,6 +146,24 @@ class HelperEvaluationTests(unittest.TestCase):
             self.assertEqual(result["status"], "inconclusive")
             failure_lines = result["cases"][0]["result"]["host"]["failure_lines"]
             self.assertEqual([item["text"] for item in failure_lines], ["FAILED: hidden test"])
+
+    def test_many_short_lines_are_inconclusive_before_any_model_request(self):
+        with tempfile.TemporaryDirectory() as directory:
+            home = Path(directory)
+            receipt = run_command(home, "reader", ["python3", "-c", "print('x\\n' * 12000)"], home)
+            suite = {"schema_version": SUITE_VERSION, "role": "output-reader", "cases": [
+                {"id": "short-lines", "receipt_path": str(receipt),
+                 "expected_verdict": "uncertain", "expected_observation_terms": ["x"]}
+            ]}
+            result = evaluate(home, suite, MODEL, BASE_URL,
+                              ask=lambda *args: self.fail("oversized serialized request was sent"))
+            self.assertEqual(result["status"], "inconclusive")
+            case = result["cases"][0]
+            self.assertEqual(case["status"], "inconclusive")
+            self.assertIn("full-log-or-none", case["evidence"]["selection_policy"])
+            self.assertGreater(case["evidence"]["request_bytes"], MAX_REQUEST_BYTES)
+            self.assertEqual(case["evidence"]["host"]["verdict"], "uncertain")
+            self.assertTrue(Path(case["evidence"]["host"]["raw_output"]["path"]).is_dir())
 
     def test_output_failure_and_timeout_cannot_become_pass(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -157,6 +186,11 @@ class HelperEvaluationTests(unittest.TestCase):
         suite = {"schema_version": SUITE_VERSION, "role": "librarian", "cases": [{}]}
         with self.assertRaisesRegex(ValueError, "8001"):
             evaluate(Path("/tmp"), suite, MODEL, "http://127.0.0.1:8000/v1")
+
+    def test_public_evaluator_cannot_pass_without_model_binding(self):
+        suite = {"schema_version": SUITE_VERSION, "role": "librarian", "cases": [{"id": "case"}]}
+        with self.assertRaisesRegex(ValueError, "binding is required"):
+            _evaluate(Path("/tmp"), suite, MODEL, BASE_URL, ask=lambda *args: {})
 
     def test_completion_requires_exact_model_identity_and_complete_json(self):
         class Response:
@@ -201,14 +235,51 @@ class HelperEvaluationTests(unittest.TestCase):
             suite = {"schema_version": SUITE_VERSION, "role": "output-reader", "cases": [
                 {"id": "pytest", "receipt_path": str(receipt), "expected_verdict": "pass"}
             ]}
-            inventory = lambda _: [{"id": MODEL, "model_path": str(model)}]
+            row = {"id": MODEL, "model_path": str(model), "loaded": True,
+                   "settings": {"max_context_window": 4096},
+                   "model_context_length": 32768, "engine_type": "batched",
+                   "thinking_default": False}
+            inventory = lambda _: [row]
+            status = lambda _: {"status": "ok", "version": "0.7.0.dev4",
+                                "loaded_models": [MODEL]}
+            settings = lambda _: {
+                "base_path": str((home / "omlx").resolve()),
+                "server": {"host": "127.0.0.1", "port": 8001},
+                "model": {"model_dir": str(model)},
+                "memory": {"memory_guard_tier": "safe"},
+                "scheduler": {"max_concurrent_requests": 1},
+                "cache": {"enabled": True},
+                "sampling": {"max_context_window": 8192, "max_tokens": 2048,
+                             "temperature": 0.7, "top_p": 0.9, "top_k": 40,
+                             "repetition_penalty": 1.0},
+                "auth": {"api_key": "must-not-be-in-receipt"},
+            }
             result = evaluate(home, suite, MODEL, BASE_URL, model_path=model,
-                              inventory_reader=inventory)
+                              inventory_reader=inventory, status_reader=status,
+                              settings_reader=settings)
             self.assertEqual(result["status"], "inconclusive")
             self.assertIn("model.safetensors", result["model_binding"]["files"])
+            self.assertEqual(result["model_binding"]["service_version"], "0.7.0.dev4")
+            self.assertIn("global_settings_sha256", result["model_binding"])
+            self.assertNotIn("auth", result["model_binding"]["global_settings"])
+            self.assertEqual(result["model_binding"]["effective_sampling"]["max_context_window"], 4096)
             with self.assertRaisesRegex(ValueError, "differs"):
                 evaluate(home, suite, MODEL, BASE_URL, model_path=model,
-                         inventory_reader=lambda _: [{"id": MODEL, "model_path": str(home)}])
+                         inventory_reader=lambda _: [{**row, "model_path": str(home)}],
+                         status_reader=status, settings_reader=settings)
+            with self.assertRaisesRegex(ValueError, "effective settings evidence"):
+                evaluate(home, suite, MODEL, BASE_URL, model_path=model,
+                         inventory_reader=lambda _: [{key: value for key, value in row.items()
+                                                       if key != "settings"}],
+                         status_reader=status, settings_reader=settings)
+            versions = iter(["0.7.0.dev4", "0.7.0.dev5"])
+            changed = evaluate(home, suite, MODEL, BASE_URL, model_path=model,
+                               inventory_reader=inventory,
+                               status_reader=lambda _: {"status": "ok", "version": next(versions),
+                                                        "loaded_models": [MODEL]},
+                               settings_reader=settings)
+            self.assertEqual(changed["status"], "fail")
+            self.assertEqual(changed["cases"][-1]["id"], "model-binding")
 
     def test_preflight_failure_keeps_private_failure_receipt(self):
         with tempfile.TemporaryDirectory() as directory:
