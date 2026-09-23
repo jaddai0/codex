@@ -9,16 +9,73 @@ core_binary=${LOCAL_CODEX_BIN:-${share_dir}/local-codex-core}
 model_args=()
 gateway_env_args=()
 
+bind_project_root() {
+  local requested_dir="" argument anchor anchor_real root root_real home_real inherited_real
+  local awaiting_dir=0 found_override=0
+  for argument in "$@"; do
+    if (( awaiting_dir )); then
+      requested_dir="$argument"
+      awaiting_dir=0
+      found_override=1
+      continue
+    fi
+    case "$argument" in
+      --) break ;;
+      -C|--cd) awaiting_dir=1 ;;
+      --cd=*) requested_dir="${argument#--cd=}"; found_override=1 ;;
+      -C=*) requested_dir="${argument#-C=}"; found_override=1 ;;
+      -C?*) requested_dir="${argument#-C}"; found_override=1 ;;
+    esac
+  done
+  if (( awaiting_dir )) || { (( found_override )) && [[ -z "$requested_dir" || ! -d "$requested_dir" ]]; }; then
+    print -u2 "mavis: --cd/-C needs an existing directory"
+    exit 2
+  fi
+  if [[ -n "$requested_dir" ]]; then
+    anchor="$requested_dir"
+  elif [[ -n ${MAVIS_PROJECT_DIR:-} ]]; then
+    anchor="$MAVIS_PROJECT_DIR"
+  else
+    anchor="$PWD"
+  fi
+  if [[ ! -d "$anchor" ]]; then
+    print -u2 "mavis: selected project directory is unavailable"
+    exit 2
+  fi
+  anchor_real=$(cd -- "$anchor" && pwd -P)
+  home_real=$(cd -- "$HOME" && pwd -P)
+  root=$(git -C "$anchor_real" rev-parse --show-toplevel 2>/dev/null || true)
+  root_real=""
+  if [[ -n "$root" ]]; then
+    root_real=$(cd -- "$root" && pwd -P)
+    if [[ "$root_real" == "$home_real" ]]; then
+      root_real=""
+    fi
+  fi
+  if [[ -n ${MAVIS_PROJECT_ROOT:-} ]]; then
+    if [[ "$MAVIS_PROJECT_ROOT" != /* || ! -d "$MAVIS_PROJECT_ROOT" ]]; then
+      print -u2 "mavis: inherited project root is invalid"
+      exit 2
+    fi
+    inherited_real=$(cd -- "$MAVIS_PROJECT_ROOT" && pwd -P)
+    if [[ -z "$root_real" || "$inherited_real" != "$root_real" ]]; then
+      print -u2 "mavis: inherited project root differs from the selected checkout"
+      exit 2
+    fi
+  fi
+  if [[ -n "$root_real" ]]; then
+    export MAVIS_PROJECT_ROOT="$root_real"
+  else
+    unset MAVIS_PROJECT_ROOT
+  fi
+}
+
+bind_project_root "$@"
+
 case "${1:-}" in
   runtime|objective|run|output|archive-search|archive-retention|storage-pressure|pre-compact|project-evidence|project-index|project-memory|eval|e1|maintenance)
   export CODEX_HOME=${CODEX_HOME:-$runtime_home}
   export MAVIS_HOME=${MAVIS_HOME:-${HOME}/.local-codex/mavis-service}
-  if [[ -z ${MAVIS_PROJECT_ROOT:-} ]]; then
-    project_root=$(git rev-parse --show-toplevel 2>/dev/null || true)
-    if [[ -n "$project_root" && "$project_root" != "$HOME" ]]; then
-      export MAVIS_PROJECT_ROOT="$project_root"
-    fi
-  fi
   if [[ "$MAVIS_HOME" != /* ]]; then
     print -u2 "mavis: MAVIS_HOME must be an absolute path"
     exit 2
@@ -62,12 +119,6 @@ if [[ ! -x "$core_binary" ]]; then
 fi
 
 export MAVIS_HOME=${MAVIS_HOME:-${HOME}/.local-codex/mavis-service}
-if [[ -z ${MAVIS_PROJECT_ROOT:-} ]]; then
-  project_root=$(git rev-parse --show-toplevel 2>/dev/null || true)
-  if [[ -n "$project_root" && "$project_root" != "$HOME" ]]; then
-    export MAVIS_PROJECT_ROOT="$project_root"
-  fi
-fi
 if [[ "$MAVIS_HOME" != /* ]]; then
   print -u2 "mavis: MAVIS_HOME must be an absolute path"
   exit 2
