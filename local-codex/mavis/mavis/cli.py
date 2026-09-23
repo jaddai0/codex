@@ -162,10 +162,20 @@ def build_parser() -> argparse.ArgumentParser:
             entry.add_argument("case_id")
     coverage = e1_sub.add_parser("coverage")
     coverage.add_argument("experiment_id")
+    dispatch = e1_sub.add_parser("dispatch-candidate")
+    dispatch.add_argument("experiment_id")
+    dispatch.add_argument("case_id")
+    dispatch.add_argument("--job-id", required=True)
+    dispatch.add_argument("--lane", choices=("minimax", "zcode"), required=True)
+    dispatch.add_argument("--model", required=True)
+    dispatch.add_argument("--task", required=True)
     compare = e1_sub.add_parser("compare")
     compare.add_argument("experiment_id")
     compare.add_argument("--candidate-job-id", required=True)
     compare.add_argument("--candidate-report", type=Path, required=True)
+    native_compare = e1_sub.add_parser("compare-native")
+    native_compare.add_argument("experiment_id")
+    native_compare.add_argument("case_id")
     for name in ("status", "review-requirements", "stage"):
         entry = e1_sub.add_parser(name)
         entry.add_argument("experiment_id")
@@ -344,10 +354,16 @@ def main(argv: list[str] | None = None) -> int:
             result = runner.check(args.experiment_id, args.arm, args.case_id)
         elif args.e1_command == "coverage":
             result = runner.coverage(args.experiment_id)
+        elif args.e1_command == "dispatch-candidate":
+            result = runner.dispatch_candidate(args.experiment_id, args.case_id,
+                                               job_id=args.job_id, lane=args.lane,
+                                               model=args.model, task=args.task)
         elif args.e1_command == "compare":
             result = runner.compare(
                 args.experiment_id, args.candidate_job_id, args.candidate_report
             )
+        elif args.e1_command == "compare-native":
+            result = runner.compare_native(args.experiment_id, args.case_id)
         elif args.e1_command == "status":
             result = store.load(args.experiment_id)
         elif args.e1_command == "review-requirements":

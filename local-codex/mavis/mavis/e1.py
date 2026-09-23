@@ -1,4 +1,4 @@
-"""Frozen E1 cases and host-recorded paired checks; native workers remain external."""
+"""Frozen E1 cases, native candidate dispatch, and host-recorded paired checks."""
 
 from pathlib import Path
 import shutil
@@ -7,6 +7,8 @@ from typing import Any
 
 from .evidence import parse_test_output, run_command
 from .experiments import ExperimentStore, _digest, candidate_assignment_requirements
+from .gateway import harness_assignment_start
+from .objectives import _validate_gateway_status
 from .storage import read_json, require_safe_id, sha256_file, write_json
 
 
@@ -247,9 +249,10 @@ def validate_e1_bundle(home: Path, record: dict[str, Any]) -> str:
 
 
 class E1Runner:
-    def __init__(self, home: Path):
+    def __init__(self, home: Path, gateway_assignment_starter=None, gateway_status_reader=None):
         self.home = Path(home)
-        self.store = ExperimentStore(home)
+        self.store = ExperimentStore(home, gateway_status_reader=gateway_status_reader)
+        self.gateway_assignment_starter = gateway_assignment_starter or harness_assignment_start
         self.root = self.home / "e1"
 
     def _root(self, experiment_id: str) -> Path:
@@ -361,6 +364,111 @@ class E1Runner:
             }
         write_json(root / f"prepared-{arm}.json", prepared)
         return prepared
+
+    def dispatch_candidate(self, experiment_id: str, case_id: str, *, job_id: str,
+                           lane: str, model: str, task: str) -> dict[str, Any]:
+        """Dispatch one prepared candidate checkout with frozen Mavis ownership."""
+        record, manifest = self._frozen(experiment_id)
+        if record["state"] != "candidate":
+            raise ValueError("experiment is no longer a candidate")
+        case = next((item for item in manifest["cases"] if item["id"] == case_id), None)
+        if case is None:
+            raise ValueError("unknown E1 case")
+        require_safe_id(job_id, "candidate job id")
+        if lane not in {"minimax", "zcode"} or not isinstance(model, str) or not model.strip():
+            raise ValueError("candidate requires a named native coding lane and model")
+        if not isinstance(task, str) or not task.strip():
+            raise ValueError("candidate task is required")
+        root = self._root(experiment_id)
+        dispatch_path = root / "dispatch" / f"{case_id}.json"
+        if dispatch_path.exists():
+            raise FileExistsError(dispatch_path)
+        prepared = read_json(root / "prepared-candidate.json")
+        checkout = root / "checkouts" / "candidate" / case_id
+        entry = prepared.get(case_id)
+        if (not isinstance(entry, dict) or Path(entry.get("path", "")).resolve() != checkout.resolve()
+                or entry.get("starting_revision") != case["revision"]
+                or _git(checkout, "rev-parse", "HEAD") != case["revision"]
+                or _git(checkout, "status", "--porcelain")):
+            raise ValueError("candidate checkout is not clean at its frozen revision")
+        provider, harness = {"minimax": ("minimax", "opencode"),
+                             "zcode": ("zai", "zcode")}[lane]
+        requirements = candidate_assignment_requirements(record)
+        arguments = {
+            "job_id": job_id, "task": task, "lane": lane, "model": model,
+            "cwd": str(checkout), "starting_revision": case["revision"],
+            "owned_paths": [str(checkout)], "allowed_effects": ["edit owned checkout"],
+            "required_checks": [check["id"] for check in case["checks"]],
+            "context_packet": f"E1 candidate snapshot: {record['candidate']['path']} (sha256 {record['candidate']['sha256']}). Apply this frozen configuration; repair the case without changing acceptance checks.",
+            "mavis_objective_id": experiment_id,
+            "mavis_requirements": requirements,
+            "mavis_owner": {"provider": provider, "model": model, "harness": harness},
+        }
+        started = self.gateway_assignment_starter(arguments)
+        report = Path(started.get("report_path", "")) if isinstance(started, dict) else Path("")
+        job_dir = Path(started.get("job_dir", "")) if isinstance(started, dict) else Path("")
+        assignment = Path(started.get("assignment_path", "")) if isinstance(started, dict) else Path("")
+        if (not isinstance(started, dict) or started.get("success") is not True
+                or started.get("started") is not True or started.get("accepted") is not False
+                or started.get("job_id") != job_id or not job_dir.is_absolute()
+                or not report.is_absolute() or report.parent.resolve() != job_dir.resolve()
+                or not assignment.is_absolute() or assignment.parent.resolve() != job_dir.resolve()
+                or not assignment.is_file()):
+            raise ValueError("native gateway did not start the exact Mavis candidate job")
+        saved_assignment = read_json(assignment)
+        if any(saved_assignment.get(key) != value for key, value in arguments.items() if key != "job_id"):
+            raise ValueError("native gateway assignment differs from frozen candidate task")
+        receipt = {"schema_version": "mavis.e1-native-dispatch/v1", "experiment_id": experiment_id,
+                   "case_id": case_id, "job_id": job_id, "assignment_digest": _digest(arguments),
+                   "candidate_sha256": record["candidate"]["sha256"], "starting_revision": case["revision"],
+                   "checkout": str(checkout), "report_path": str(report), "job_dir": str(job_dir),
+                   "assignment_path": str(assignment), "assignment_sha256": sha256_file(assignment)}
+        write_json(dispatch_path, receipt)
+        return receipt
+
+    def compare_native(self, experiment_id: str, case_id: str) -> dict[str, Any]:
+        """Use the accepted gateway job's retained report, with no supplied file."""
+        record, manifest = self._frozen(experiment_id)
+        case = next((item for item in manifest["cases"] if item["id"] == case_id), None)
+        if case is None:
+            raise ValueError("unknown E1 case")
+        receipt = read_json(self._root(experiment_id) / "dispatch" / f"{case_id}.json")
+        checkout = self._root(experiment_id) / "checkouts" / "candidate" / case_id
+        if (receipt.get("schema_version") != "mavis.e1-native-dispatch/v1"
+                or receipt.get("experiment_id") != experiment_id or receipt.get("case_id") != case_id
+                or receipt.get("candidate_sha256") != record["candidate"]["sha256"]
+                or receipt.get("starting_revision") != case["revision"]
+                or Path(receipt.get("checkout", "")).resolve() != checkout.resolve()):
+            raise ValueError("native dispatch lost its frozen candidate binding")
+        job_id = require_safe_id(receipt.get("job_id"), "candidate job id")
+        status = self.store.gateway_status_reader(job_id)
+        _validate_gateway_status(status, job_id)
+        binding = status.get("mavis_binding") if isinstance(status, dict) else None
+        report = Path(receipt.get("report_path", ""))
+        job_dir = Path(receipt.get("job_dir", ""))
+        assignment = Path(receipt.get("assignment_path", ""))
+        saved_assignment = read_json(assignment)
+        case_result = read_json(self._root(experiment_id) / "results" / "candidate" / f"{case_id}.json")
+        if (not isinstance(status, dict) or status.get("job_id") != job_id
+                or status.get("state") != "completed" or status.get("exit_code") != 0
+                or status.get("accepted") is not True or not isinstance(binding, dict)
+                or binding.get("objective_id") != experiment_id
+                or binding.get("starting_revision") != case["revision"]
+                or binding.get("changed_revision") != case_result.get("checked_revision")
+                or Path(binding.get("cwd", "")).resolve() != checkout.resolve()
+                or binding.get("owned_paths") != [str(checkout)]
+                or binding.get("owner") != saved_assignment.get("mavis_owner")
+                or binding.get("required_checks") != [check["id"] for check in case["checks"]]
+                or not isinstance(binding.get("requirements"), list)
+                or not all(item in binding["requirements"] for item in candidate_assignment_requirements(record))
+                or not job_dir.is_absolute() or not report.is_absolute()
+                or report.parent.resolve() != job_dir.resolve() or not report.is_file()
+                or not assignment.is_absolute() or assignment.parent.resolve() != job_dir.resolve()
+                or sha256_file(assignment) != receipt.get("assignment_sha256")
+                or binding.get("assignment_sha256") != receipt.get("assignment_sha256")
+                or binding.get("report_sha256") != sha256_file(report)):
+            raise ValueError("native gateway candidate receipt or report is not accepted and bound")
+        return self.compare(experiment_id, job_id, report)
 
     def check(self, experiment_id: str, arm: str, case_id: str) -> dict[str, Any]:
         record, manifest = self._frozen(experiment_id)
