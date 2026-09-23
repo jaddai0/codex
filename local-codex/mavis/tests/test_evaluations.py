@@ -20,9 +20,12 @@ class E0EvaluationTests(unittest.TestCase):
             evaluator = E0Evaluator(Path(directory), RuntimeConfig(home=Path(directory)))
             evaluator.root.mkdir(parents=True)
             candidate = {"core_sha256": "a" * 64}
+            runtime = {"binary_sha256": "b" * 64, "model_id": evaluator.config.model}
             write_json(evaluator.root / "isolation-recovery-live.json", {
                 "schema_version": "mavis.e0-isolation-recovery/v1",
                 "candidate": candidate,
+                "omlx_runtime": runtime,
+                "recovery_under_iris_drain": True,
                 "before": {"iris_pids": [10], "iris_model_loaded": True,
                            "mavis_pids": [20]},
                 "after": {"iris_pids": [10], "iris_model_loaded": True,
@@ -32,6 +35,8 @@ class E0EvaluationTests(unittest.TestCase):
             with patch.dict(os.environ, {"MAVIS_E0_PARK_OWNER_PID": "30"}), \
                     patch("mavis.evaluations.installed_candidate_fingerprint",
                           return_value=candidate), \
+                    patch("mavis.evaluations.omlx_runtime_fingerprint",
+                          return_value=runtime), \
                     patch("mavis.evaluations.endpoint_alive",
                           side_effect=[True, False]), \
                     patch("mavis.evaluations._listener_pids",
@@ -39,6 +44,13 @@ class E0EvaluationTests(unittest.TestCase):
                     patch("mavis.evaluations.loaded_generation_models",
                           return_value=[evaluator.config.model]):
                 self.assertEqual(evaluator.run_case("isolation-recovery")["status"], "pass")
+            with patch("mavis.evaluations.installed_candidate_fingerprint",
+                       return_value=candidate), patch(
+                           "mavis.evaluations.omlx_runtime_fingerprint",
+                           return_value={"binary_sha256": "changed"}
+                       ):
+                self.assertEqual(evaluator.run_case("isolation-recovery")["status"],
+                                 "blocked")
 
     def test_buried_inspection_allows_stdin_sort_unique_without_file_output(self):
         self.assertTrue(_safe_buried_inspection("grep -o MAVIS_E0_FAILURE_ output.raw | sort -u | head"))
@@ -52,6 +64,7 @@ class E0EvaluationTests(unittest.TestCase):
                 ".local/share/local-codex/local-codex-core",
                 ".local/share/local-codex/prepare_runtime.py",
                 ".local/share/local-codex/launch_core.py",
+                ".local/share/local-codex/generation_lease.py",
                 ".local/share/local-codex/base-instructions.md",
                 ".local/share/local-codex/persona.toml",
                 ".local/share/local-codex/mavis/__init__.py",

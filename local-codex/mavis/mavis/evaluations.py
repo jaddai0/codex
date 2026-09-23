@@ -25,7 +25,7 @@ from urllib.request import Request, urlopen
 
 from .evidence import run_command
 from .objectives import ObjectiveStore
-from .runtime import RuntimeConfig, _listener_pids, admission, endpoint_alive, inventory, loaded_generation_models
+from .runtime import RuntimeConfig, _listener_pids, admission, endpoint_alive, inventory, loaded_generation_models, omlx_runtime_fingerprint
 from .storage import sha256_file, write_json
 
 
@@ -89,6 +89,7 @@ def installed_candidate_fingerprint() -> dict[str, str]:
         "command_sha256": sha256_file(command),
         "prepare_runtime_sha256": sha256_file(share / "prepare_runtime.py"),
         "launch_core_sha256": sha256_file(share / "launch_core.py"),
+        "generation_lease_sha256": sha256_file(share / "generation_lease.py"),
         "instructions_template_sha256": sha256_file(share / "base-instructions.md"),
         "persona_template_sha256": sha256_file(share / "persona.toml"),
         "service_sha256": digest.hexdigest(),
@@ -745,6 +746,10 @@ class E0Evaluator:
         proof = json.loads(proof_path.read_text())
         if proof.get("schema_version") != "mavis.e0-isolation-recovery/v1" or proof.get("candidate") != installed_candidate_fingerprint():
             return self._receipt("isolation-recovery", "blocked", ["The installed candidate changed since service recovery was observed"])
+        if proof.get("omlx_runtime") != omlx_runtime_fingerprint(self.config):
+            return self._receipt("isolation-recovery", "blocked", ["oMLX runtime or model metadata changed since service recovery was observed"])
+        if proof.get("recovery_under_iris_drain") is not True:
+            return self._receipt("isolation-recovery", "blocked", ["Mavis recovery was not observed under the IRIS drain"])
         before = proof.get("before") or {}
         after = proof.get("after") or {}
         iris_alive = endpoint_alive(self.config.iris_endpoint)

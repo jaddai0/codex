@@ -7,6 +7,7 @@ from contextlib import contextmanager
 from contextvars import ContextVar
 import fcntl
 from functools import wraps
+import hashlib
 import json
 import os
 from pathlib import Path
@@ -133,6 +134,45 @@ def require_installed_selected_model(config: RuntimeConfig) -> None:
     )
     if result.stdout.strip() != config.model:
         raise RuntimeError("installed launcher selects a different Mavis model")
+
+
+def omlx_runtime_fingerprint(config: RuntimeConfig) -> dict[str, Any]:
+    """Bind a recovery observation to the editable server and model metadata."""
+    python = config.omlx_binary.parent / "python"
+    modules = ("omlx.server", "omlx.engine_pool", "omlx.model_drain")
+    script = ("import importlib.util,json,sys; "
+              "print(json.dumps({name:importlib.util.find_spec(name).origin "
+              "for name in sys.argv[1:]}))")
+    result = subprocess.run([str(python), "-c", script, *modules],
+                            text=True, capture_output=True, check=True, timeout=15)
+    paths = json.loads(result.stdout)
+    if set(paths) != set(modules):
+        raise RuntimeError("oMLX runtime source mapping is incomplete")
+    sources = {}
+    for name in modules:
+        path = Path(paths[name]).resolve(strict=True)
+        if path.name != name.rsplit(".", 1)[1] + ".py":
+            raise RuntimeError("oMLX runtime source path changed unexpectedly")
+        sources[name] = {"path": str(path),
+                         "sha256": hashlib.sha256(path.read_bytes()).hexdigest()}
+    model_path = (config.model_dir / config.model).resolve(strict=True)
+    metadata = {}
+    for name in ("config.json", "tokenizer_config.json", "model.safetensors.index.json",
+                 "generation_config.json", "chat_template.jinja"):
+        path = model_path / name
+        if path.is_file():
+            metadata[name] = hashlib.sha256(path.read_bytes()).hexdigest()
+    if "config.json" not in metadata:
+        raise RuntimeError("selected oMLX model metadata is missing")
+    shards = sorted((path.name, path.stat().st_size, path.stat().st_mtime_ns)
+                    for path in model_path.glob("*.safetensors") if path.is_file())
+    if not shards:
+        raise RuntimeError("selected oMLX model has no weight shards")
+    shard_signature = hashlib.sha256(json.dumps(shards, separators=(",", ":")).encode()).hexdigest()
+    return {"binary_sha256": hashlib.sha256(config.omlx_binary.read_bytes()).hexdigest(),
+            "sources": sources, "model_id": config.model, "model_path": str(model_path),
+            "model_metadata_sha256": metadata,
+            "weight_file_signature_sha256": shard_signature}
 
 
 def _iris_drain_token() -> str:
