@@ -94,7 +94,8 @@ def main() -> int:
         result["drain_lease_id"] = lease_id
         wait_iris_model_drain(config, lease_id)
         require_idle_iris_handoff(config)
-        request_json(config.iris_endpoint, model_path + "/unload", method="POST", timeout=180)
+        request_json(config.iris_endpoint, model_path + "/unload", method="POST",
+                     timeout=180, headers=iris_drain_headers(lease_id))
         if loaded(config.iris_endpoint):
             raise RuntimeError("IRIS model did not unload")
         load_model(config)
