@@ -4,9 +4,13 @@ from __future__ import annotations
 
 import importlib.util
 import json
+import os
 from pathlib import Path
+import sys
 import tempfile
+import time
 import unittest
+from unittest.mock import patch
 
 from mavis.transcripts import HANDOFF_FIELDS, TranscriptArchive
 
@@ -130,6 +134,48 @@ class RepeatedCompactionEvidenceTests(unittest.TestCase):
             archive.write_handoff(handoff)
             with self.assertRaisesRegex(ValueError, "early decision is absent"):
                 observer._archive_checkpoint(archive, 1, "early fact")
+
+    def test_private_pty_drives_compact_and_exit(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            workspace = root / "project"
+            workspace.mkdir()
+            sessions = root / "sessions"
+            sessions.mkdir()
+            rollout = sessions / "rollout-fixture.jsonl"
+            script = root / "fake_tui.py"
+            script.write_text(
+                "import json, pathlib, sys\n"
+                "path = pathlib.Path(sys.argv[1])\n"
+                "workspace, prompt = sys.argv[2:]\n"
+                "rows = [\n"
+                " {'type':'session_meta','payload':{'id':'session-1','cwd':workspace}},\n"
+                " {'type':'event_msg','payload':{'type':'task_started','turn_id':'turn-1'}},\n"
+                " {'type':'event_msg','payload':{'type':'item_completed','thread_id':'session-1','turn_id':'turn-1','item':{'type':'UserMessage','content':[{'type':'text','text':prompt}]} }},\n"
+                " {'type':'event_msg','payload':{'type':'task_complete','turn_id':'turn-1','last_agent_message':'ACK1'}}]\n"
+                "with path.open('w') as output:\n"
+                " for row in rows: output.write(json.dumps(row) + '\\n')\n"
+                "if sys.stdin.readline().strip() != '/compact': sys.exit(2)\n"
+                "with path.open('a') as output: output.write(json.dumps({'type':'compacted','payload':{}}) + '\\n')\n"
+                "if sys.stdin.readline().strip() != '/exit': sys.exit(3)\n",
+                encoding="utf-8",
+            )
+            lease_fd = os.open(os.devnull, os.O_RDONLY)
+            try:
+                with patch.object(observer, "handoff_lease_fd", return_value=lease_fd):
+                    pid, observed, rows, code = observer._run_stage(
+                        [sys.executable, str(script), str(rollout), str(workspace), "remember fact"],
+                        workspace=workspace, env=os.environ.copy(),
+                        log=root / "terminal.log", sessions=sessions,
+                        prompt="remember fact", expected_answer="ACK1",
+                        expected_compactions=1, rollout=None,
+                        launch_started=time.time(), stage_timeout=8)
+            finally:
+                os.close(lease_fd)
+            self.assertGreater(pid, 0)
+            self.assertEqual(observed, rollout)
+            self.assertEqual(code, 0)
+            self.assertEqual(rows[-1]["type"], "compacted")
 
 
 if __name__ == "__main__":
