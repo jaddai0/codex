@@ -16,6 +16,49 @@ from mavis.storage import sha256_file, write_json
 
 
 class E0EvaluationTests(unittest.TestCase):
+    def test_compaction_restart_reads_ignored_project_archive(self):
+        with tempfile.TemporaryDirectory() as directory:
+            base = Path(directory)
+            service = base / "service"
+            repo = base / "repo"
+            repo.mkdir()
+            repo = repo.resolve()
+            subprocess.run(["git", "init", "-q", str(repo)], check=True)
+            session = "session-project-archive"
+            fact = "MAVIS_E0_COMPACT_0123456789abcdef=orchid-lantern-47"
+            archive = repo / ".mavis" / "transcripts" / session
+            handoff = archive / "handoffs" / "first.json"
+            segment = archive / "segments" / "first.json"
+            handoff.parent.mkdir(parents=True)
+            segment.parent.mkdir(parents=True)
+            segment.write_text(fact)
+            handoff.write_text(json.dumps({"evidence_links": [str(segment)]}))
+            task = service / "evaluations" / "e0" / "compaction-live-fixture"
+            task.mkdir(parents=True)
+            rollout = task / "rollout.jsonl"
+            rows = [
+                {"type": "session_meta", "payload": {"id": session, "cwd": str(repo)}},
+                {"type": "response_item", "payload": {"role": "user", "content": fact}},
+                {"type": "event_msg", "payload": {"type": "task_complete", "last_agent_message": "ACK"}},
+                {"type": "compacted"},
+                {"type": "response_item", "payload": {"role": "user", "content": "What exact fact did I give before compaction?"}},
+                {"type": "event_msg", "payload": {"type": "task_complete", "last_agent_message": fact}},
+            ]
+            rollout.write_text("".join(json.dumps(row) + "\n" for row in rows))
+            candidate = {"core_sha256": "a" * 64}
+            write_json(task / "result.json", {
+                "candidate": candidate, "candidate_after": candidate,
+                "workspace": str(repo), "rollout": str(rollout),
+                "session_id": session, "fact": fact,
+                "first_exit": 0, "resume_exit": 0,
+                "iris_loaded": True, "mavis_loaded": False,
+                "exact_recovery": True, "resumed_answer": fact,
+                "handoffs": [str(handoff)],
+            })
+            evaluator = E0Evaluator(service, RuntimeConfig(home=service))
+            with patch("mavis.evaluations.installed_candidate_fingerprint", return_value=candidate):
+                self.assertEqual(evaluator.run_case("compaction-restart")["status"], "pass")
+
     @unittest.skipUnless(os.name == "posix", "private raw output requires Unix")
     def test_buried_failure_accepts_private_project_spool_and_legacy_reference(self):
         with tempfile.TemporaryDirectory() as directory:

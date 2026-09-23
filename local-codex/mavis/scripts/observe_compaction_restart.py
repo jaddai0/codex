@@ -13,6 +13,7 @@ import time
 import uuid
 
 from mavis.evaluations import installed_candidate_fingerprint
+from mavis.project_evidence import project_home
 from mavis.runtime import RuntimeConfig, require_installed_selected_model, with_mavis_handoff_lease
 from mavis.storage import write_json
 sys.path.insert(0, str(Path(__file__).resolve().parent))
@@ -92,7 +93,7 @@ def main() -> int:
             result.update({"rollout": str(rollout), "session_id": session,
                            "first_exit": first_exit, "first_answer": "ACK",
                            "compacted_event": any(row.get("type") == "compacted" for row in rows)})
-            handoff_dir = service / "transcripts" / session / "handoffs"
+            handoff_dir = project_home(workspace, create=False) / "transcripts" / session / "handoffs"
             result["handoffs"] = [str(path) for path in handoff_dir.glob("*.json")]
             if not result["compacted_event"] or not result["handoffs"]:
                 raise RuntimeError("first TUI did not persist its compaction handoff")

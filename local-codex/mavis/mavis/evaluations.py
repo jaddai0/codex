@@ -25,6 +25,7 @@ from urllib.request import Request, urlopen
 
 from .evidence import run_command
 from .objectives import ObjectiveStore
+from .project_evidence import project_home
 from .runtime import RuntimeConfig, _listener_pids, admission, endpoint_alive, inventory, loaded_generation_models, omlx_live_process_binding, omlx_runtime_fingerprint
 from .storage import sha256_file, write_json
 
@@ -716,15 +717,19 @@ class E0Evaluator:
                     and has_user(after, "What exact fact did I give before compaction?")
                     and has_answer(after, fact)):
                 continue
+            try:
+                evidence_home = project_home(Path(result["workspace"]), create=False)
+            except (KeyError, OSError, RuntimeError, ValueError):
+                continue
             handoffs = [Path(path) for path in result.get("handoffs", [])]
-            handoff_root = self.home / "transcripts" / session / "handoffs"
+            handoff_root = evidence_home / "transcripts" / session / "handoffs"
             if not handoffs or not all(path.is_file() and path.parent == handoff_root for path in handoffs):
                 continue
             segments = []
             for path in handoffs:
                 handoff = json.loads(path.read_text())
                 segments.extend(Path(link) for link in handoff.get("evidence_links", []))
-            segment_root = self.home / "transcripts" / session / "segments"
+            segment_root = evidence_home / "transcripts" / session / "segments"
             if not any(path.is_file() and path.parent == segment_root
                        and fact in path.read_text() for path in segments):
                 continue
