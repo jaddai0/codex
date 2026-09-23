@@ -28,6 +28,33 @@ def _requirements(facts: dict[str, Any]) -> list[str]:
     ]
 
 
+def _candidate_workers(root: Path, record: dict[str, Any], case_ids: list[str]) -> list[dict[str, Any]]:
+    """Replay native candidate dispatch ownership when a worker authored a case repair."""
+    workers = []
+    dispatch_root = root / "dispatch"
+    for path in sorted(dispatch_root.glob("*.json")):
+        dispatch = read_json(path)
+        assignment_path = Path(dispatch.get("assignment_path") or "")
+        if (path.stem not in case_ids
+                or dispatch.get("schema_version") != "mavis.e1-native-dispatch/v1"
+                or dispatch.get("experiment_id") != record["experiment_id"]
+                or dispatch.get("case_id") != path.stem
+                or dispatch.get("candidate_sha256") != record["candidate"]["sha256"]
+                or dispatch.get("assignment_sha256") != sha256_file(assignment_path)):
+            raise ValueError("E1 candidate worker provenance changed")
+        assignment = read_json(assignment_path)
+        owner = assignment.get("mavis_owner")
+        if (not isinstance(owner, dict) or set(owner) != {"provider", "model", "harness"}
+                or assignment.get("mavis_objective_id") != record["experiment_id"]
+                or f"experiment-candidate-snapshot:{record['candidate']['sha256']}"
+                not in assignment.get("mavis_requirements", [])
+                or assignment.get("cwd") != dispatch.get("checkout")):
+            raise ValueError("E1 candidate worker assignment changed")
+        workers.append({"case_id": path.stem, "job_id": dispatch["job_id"], "owner": owner,
+                        "dispatch_sha256": sha256_file(path)})
+    return workers
+
+
 def _gateway_arguments(packet: dict[str, Any], assignment_path: Path, job_id: str) -> dict[str, Any]:
     require_safe_id(job_id, "review job id")
     owner = packet["owner"]
@@ -41,9 +68,11 @@ def _gateway_arguments(packet: dict[str, Any], assignment_path: Path, job_id: st
         "task": ("Independently inspect the paired installed E1 trial evidence in the review packet. "
                  "Reject missing, changed, or unconvincing checks. Return a JSON object with schema_version "
                  "mavis.e1-review/v1, experiment_id, verdict, assignment_sha256, facts_digest, "
-                 "and gateway_worker_job_id. Use the facts_digest in the packet and assignment hash "
-                 "in the context packet. Return raw JSON without code fences. The host will import "
-                 "the exact report bytes."),
+                 "gateway_worker_job_id, and case_findings. For every case ID, case_findings must "
+                 "contain a specific nonempty finding and the exact evidence hashes from the packet's "
+                 "case_evidence entry. Inspect the case results, trial receipts, and raw check logs. "
+                 "Use the facts_digest in the packet and assignment hash in the context packet. "
+                 "Return raw JSON without code fences. The host will import the exact report bytes."),
         "lane": lane, "model": owner["model"], "cwd": packet["cwd"],
         "starting_revision": packet["starting_revision"],
         "owned_paths": packet["owned_paths"],
@@ -95,6 +124,11 @@ def _facts(home: Path, record: dict[str, Any]) -> dict[str, Any]:
         }
     prompts = {arm: {case["id"]: trials[arm][case["id"]]["instructions_sha256"] for case in cases}
                for arm in ("baseline", "candidate")}
+    case_evidence = {case["id"]: {arm: {
+        "result_sha256": sha256_file(root / "results" / arm / f"{case['id']}.json"),
+        "trial_sha256": sha256_file(root / "trials" / arm / f"{case['id']}.json"),
+    } for arm in ("baseline", "candidate")} for case in cases}
+    candidate_workers = _candidate_workers(root, record, [case["id"] for case in cases])
     summaries = {arm: {
         "path": comparison[arm]["evidence"]["path"],
         "sha256": comparison[arm]["evidence"]["sha256"],
@@ -108,6 +142,8 @@ def _facts(home: Path, record: dict[str, Any]) -> dict[str, Any]:
         "candidate_snapshot_sha256": record["candidate"]["sha256"],
         "model_identity": identity,
         "prompts": prompts,
+        "case_evidence": case_evidence,
+        "candidate_workers": candidate_workers,
         "case_ids": [case["id"] for case in cases],
         "held_out": manifest["held_out"],
         "minimum_gain": manifest["minimum_gain"],
@@ -130,6 +166,8 @@ def prepare_review(home: Path, record: dict[str, Any], owner: dict[str, str]) ->
     if assignment_path.exists():
         raise FileExistsError("E1 review assignment already exists")
     facts = _facts(home, record)
+    if owner in [worker["owner"] for worker in facts["candidate_workers"]]:
+        raise ValueError("E1 reviewer must be independent from candidate workers")
     requirements = _requirements(facts)
     review_checkout = assignment_path.parent / "checkouts" / "baseline" / read_json(assignment_path.parent / "cases.json")["regression"]
     assignment = {
@@ -253,6 +291,8 @@ def validate_review(home: Path, record: dict[str, Any], receipt_path: Path,
         not isinstance(value, str) or not value.strip() for value in owner.values()
     ):
         raise ValueError("E1 review assignment has no exact owner")
+    if owner in [worker["owner"] for worker in facts["candidate_workers"]]:
+        raise ValueError("E1 reviewer matches a candidate worker")
     gateway_assignment_path = Path(dispatch.get("gateway_assignment_path") or "")
     gateway_assignment = read_json(gateway_assignment_path)
     expected_gateway = _gateway_arguments(assignment, assignment_path, dispatch.get("job_id"))
@@ -275,6 +315,16 @@ def validate_review(home: Path, record: dict[str, Any], receipt_path: Path,
             or receipt.get("assignment_sha256") != sha256_file(assignment_path)
             or receipt.get("facts_digest") != assignment["facts_digest"]):
         raise ValueError("E1 review receipt does not match frozen evidence")
+    findings = receipt.get("case_findings")
+    if (not isinstance(findings, dict) or set(findings) != set(facts["case_ids"])):
+        raise ValueError("E1 review lacks case-specific findings")
+    for case_id, finding in findings.items():
+        if (not isinstance(finding, dict) or set(finding) != {"finding", "evidence"}
+                or not isinstance(finding["finding"], str)
+                or not finding["finding"].strip()
+                or len(finding["finding"]) > 4000
+                or finding["evidence"] != facts["case_evidence"][case_id]):
+            raise ValueError("E1 review finding lacks exact case evidence")
     worker_job_id = require_safe_id(receipt.get("gateway_worker_job_id"), "review worker job id")
     if worker_job_id != dispatch.get("job_id"):
         raise ValueError("E1 review worker differs from dispatched gateway job")

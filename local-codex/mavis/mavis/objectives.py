@@ -12,7 +12,7 @@ from uuid import uuid4
 
 from .evidence import parse_test_output
 from .gateway import GatewayUnavailable, harness_job_status
-from .storage import read_json, require_safe_id, sha256_file, write_json
+from .storage import profile_boundary_lock, read_json, require_safe_id, sha256_file, write_json
 
 
 STATES = {
@@ -157,18 +157,19 @@ class ObjectiveStore:
     def transition(self, objective_id: str, state: str, reason: str) -> dict[str, Any]:
         if state not in STATES:
             raise ValueError(f"unknown objective state: {state}")
-        record = self.load(objective_id)
-        current = str(record["state"])
-        if state not in TRANSITIONS[current]:
-            raise ValueError(f"invalid objective transition: {current} -> {state}")
-        if state == "accepted":
-            self._assert_acceptance(record)
-        record["state"] = state
-        record.setdefault("state_history", []).append(
-            {"from": current, "to": state, "reason": reason, "at": _now()}
-        )
-        self.save(record)
-        return record
+        with profile_boundary_lock(self.home):
+            record = self.load(objective_id)
+            current = str(record["state"])
+            if state not in TRANSITIONS[current]:
+                raise ValueError(f"invalid objective transition: {current} -> {state}")
+            if state == "accepted":
+                self._assert_acceptance(record)
+            record["state"] = state
+            record.setdefault("state_history", []).append(
+                {"from": current, "to": state, "reason": reason, "at": _now()}
+            )
+            self.save(record)
+            return record
 
     def add_assignment(
         self, objective_id: str, assignment: dict[str, Any]

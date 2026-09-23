@@ -1,4 +1,5 @@
 from copy import deepcopy
+import fcntl
 import os
 from pathlib import Path
 import tempfile
@@ -91,6 +92,26 @@ class ExperimentLifecycleTests(unittest.TestCase):
         self.assertEqual(self.store.active("main"), original)
         reopened = ExperimentStore(self.home, gateway_status_reader=self._gateway_status)
         self.assertEqual(reopened.load("fix-1")["state"], "rolled-back")
+
+    def test_promotion_and_rollback_require_a_live_objective_boundary(self):
+        self._compare()
+        self.store.review("fix-1", self._review())
+        self.store.stage("fix-1")
+        objective = self.home / "objectives" / "work-1.json"
+        write_json(objective, {"objective_id": "work-1", "state": "running"})
+        with self.assertRaisesRegex(ValueError, "between objectives"):
+            self.store.promote("fix-1", between_objectives=True)
+        objective.unlink()
+        with (self.home / "generation.lock").open("a+") as lease:
+            fcntl.flock(lease.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+            with self.assertRaisesRegex(RuntimeError, "generation owns"):
+                self.store.promote("fix-1", between_objectives=True)
+        self.store.promote("fix-1", between_objectives=True)
+        write_json(objective, {"objective_id": "work-1", "state": "awaiting verification"})
+        with self.assertRaisesRegex(ValueError, "between objectives"):
+            self.store.rollback("fix-1", reason="regression")
+        objective.unlink()
+        self.assertEqual(self.store.rollback("fix-1", reason="regression")["state"], "rolled-back")
 
     def test_scope_and_baseline_are_frozen(self):
         self.assertEqual(os.stat(self.store.root).st_mode & 0o777, 0o700)

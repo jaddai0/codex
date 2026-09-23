@@ -6,8 +6,8 @@ from copy import deepcopy
 from pathlib import Path
 from typing import Any, Callable
 
-from .experiments import ExperimentStore
-from .storage import read_json, require_safe_id, sha256_file, write_json
+from .experiments import ExperimentStore, _profile_transition_lease
+from .storage import profile_boundary_lock, read_json, require_safe_id, sha256_file, write_json
 
 
 class ProfileStore:
@@ -43,6 +43,18 @@ class ProfileStore:
         return int(read_json(pointer)["version"]) if pointer.exists() else None
 
     def activate(
+        self,
+        role: str,
+        version: int,
+        accepted_experiment: Path,
+        verifier_receipt: Path,
+    ) -> None:
+        home = self.root.parent.resolve()
+        with _profile_transition_lease(home), profile_boundary_lock(home):
+            self.experiments._assert_objective_boundary()
+            self._activate_unlocked(role, version, accepted_experiment, verifier_receipt)
+
+    def _activate_unlocked(
         self,
         role: str,
         version: int,

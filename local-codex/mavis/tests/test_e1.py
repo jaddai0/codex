@@ -649,6 +649,10 @@ class E1RunnerTests(unittest.TestCase):
             "verdict": "accepted", "assignment_sha256": sha256_file(assignment_path),
             "facts_digest": e1_bootstrap._digest(assignment["facts"]),
             "gateway_worker_job_id": "independent-review-worker",
+            "case_findings": {case_id: {
+                "finding": f"Reviewed both raw trial and check receipts for {case_id}",
+                "evidence": evidence,
+            } for case_id, evidence in assignment["facts"]["case_evidence"].items()},
         })
         report.write_bytes(review.read_bytes())
         def status(job_id):
@@ -698,6 +702,28 @@ class E1RunnerTests(unittest.TestCase):
         self.assertTrue(review.is_file())
         self.assertEqual(self.runner.store.stage("repair")["state"], "staged")
 
+    def test_native_reviewer_cannot_match_recorded_candidate_worker(self):
+        self._paired_trials()
+        record = self.runner.compare_native("repair", "regression")
+        root = self.home / "e1" / "repair"
+        owner = {"provider": "zai", "model": "review-model", "harness": "zcode"}
+        checkout = root / "checkouts" / "candidate" / "regression"
+        assignment = self.root / "candidate-assignment.json"
+        write_json(assignment, {
+            "mavis_owner": owner, "mavis_objective_id": "repair",
+            "mavis_requirements": [f"experiment-candidate-snapshot:{record['candidate']['sha256']}"],
+            "cwd": str(checkout),
+        })
+        write_json(root / "dispatch" / "regression.json", {
+            "schema_version": "mavis.e1-native-dispatch/v1",
+            "experiment_id": "repair", "case_id": "regression", "job_id": "candidate-worker",
+            "candidate_sha256": record["candidate"]["sha256"],
+            "assignment_path": str(assignment), "assignment_sha256": sha256_file(assignment),
+            "checkout": str(checkout),
+        })
+        with self.assertRaisesRegex(ValueError, "independent from candidate workers"):
+            self.runner.prepare_review("repair", owner)
+
     def test_native_bootstrap_review_revalidates_model_artifacts(self):
         _, _, review, _ = self._native_review(bootstrap=True)
         self.runner.store.review("repair", review)
@@ -720,6 +746,15 @@ class E1RunnerTests(unittest.TestCase):
                 with self.assertRaises(ValueError):
                     self.runner.store.review("repair", review)
         write_json(review, original)
+        missing_findings = dict(original)
+        missing_findings.pop("case_findings")
+        write_json(review, missing_findings)
+        report = self.root / "review-gateway-job" / "report.md"
+        report.write_bytes(review.read_bytes())
+        with self.assertRaisesRegex(ValueError, "case-specific findings"):
+            self.runner.store.review("repair", review)
+        write_json(review, original)
+        report.write_bytes(review.read_bytes())
         def wrong_status(job_id):
             result = status(job_id)
             result["mavis_binding"]["owner"] = {"provider": "forged"}

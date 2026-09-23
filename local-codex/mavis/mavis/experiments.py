@@ -21,7 +21,7 @@ from typing import Any, Callable, Iterator
 from .gateway import harness_job_status
 from .maintenance import MaintenanceQueue
 from .objectives import _validate_gateway_status
-from .storage import read_json, require_safe_id, sha256_file, write_json
+from .storage import profile_boundary_lock, read_json, require_safe_id, sha256_file, write_json
 
 
 KINDS = {"prompts", "tool_settings", "retrieval"}
@@ -50,6 +50,22 @@ def _digest(value: Any) -> str:
     return hashlib.sha256(json.dumps(value, sort_keys=True, separators=(",", ":"), allow_nan=False).encode()).hexdigest()
 
 
+@contextmanager
+def _profile_transition_lease(home: Path) -> Iterator[None]:
+    """Hold the same host lock as accepted main sessions and E1 trials."""
+    home = Path(home).resolve()
+    home.mkdir(parents=True, exist_ok=True, mode=0o700)
+    with (home / "generation.lock").open("a+") as handle:
+        try:
+            fcntl.flock(handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError as error:
+            raise RuntimeError("another Mavis local generation owns the host lease") from error
+        try:
+            yield
+        finally:
+            fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
+
+
 class ExperimentStore:
     def __init__(self, home: Path, gateway_status_reader: Callable[[str], dict[str, Any]] | None = None):
         self.home = Path(home)
@@ -75,6 +91,21 @@ class ExperimentStore:
 
     def _active_path(self, scope: str) -> Path:
         return self.root / "active" / f"{require_safe_id(scope, 'experiment scope')}.json"
+
+    def _assert_objective_boundary(self) -> None:
+        """A persisted unfinished objective cannot change its active profile."""
+        root = self.home / "objectives"
+        for path in root.glob("*.json"):
+            if path.is_symlink():
+                raise ValueError("objective state has a symlink")
+            record = read_json(path)
+            if (record.get("objective_id") != path.stem
+                    or record.get("state") not in {"queued", "running", "awaiting verification",
+                                                    "accepted", "needs repair", "escalated",
+                                                    "blocked", "cancelled"}):
+                raise ValueError("objective state is invalid")
+            if record["state"] not in {"queued", "accepted", "cancelled"}:
+                raise ValueError("promotion or rollback is allowed only between objectives")
 
     def _snapshot(self, config: dict[str, Any]) -> dict[str, str]:
         if not isinstance(config, dict) or not all(key in config for key in KINDS):
@@ -380,7 +411,8 @@ class ExperimentStore:
     def promote(self, experiment_id: str, *, between_objectives: bool) -> dict[str, Any]:
         if not between_objectives:
             raise ValueError("promotion is allowed only between objectives")
-        with self._locked():
+        with _profile_transition_lease(self.home), profile_boundary_lock(self.home), self._locked():
+            self._assert_objective_boundary()
             record = self._load(experiment_id)
             if record["state"] != "staged":
                 raise ValueError("only a staged candidate can be promoted")
@@ -410,7 +442,8 @@ class ExperimentStore:
     def rollback(self, experiment_id: str, *, reason: str) -> dict[str, Any]:
         if not reason.strip():
             raise ValueError("rollback requires a reason")
-        with self._locked():
+        with _profile_transition_lease(self.home), profile_boundary_lock(self.home), self._locked():
+            self._assert_objective_boundary()
             record = self._load(experiment_id)
             active_path = self._active_path(record["scope"])
             active = read_json(active_path)

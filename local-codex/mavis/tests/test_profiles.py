@@ -1,4 +1,5 @@
 import json
+import fcntl
 from pathlib import Path
 import tempfile
 import unittest
@@ -161,6 +162,28 @@ class ProfileStoreTests(unittest.TestCase):
             with self.assertRaisesRegex(ValueError, "cannot apply"):
                 store.activate("main", 1, experiment, verifier)
             self.assertIsNone(store.active_version("main"))
+
+    def test_profile_pointer_cannot_change_during_active_work(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            self.experiments = ExperimentStore(root, gateway_status_reader=self._gateway_status)
+            self.experiments.seed_active("main", {"prompts": {"system": "initial"},
+                                                  "tool_settings": {}, "retrieval": {}})
+            experiment, verifier = self._promotion_evidence(root, "exp-a", "A")
+            store = ProfileStore(root, gateway_status_reader=self._gateway_status)
+            store.create_candidate("main", profile("a", ["exp-a"], "A"))
+            objective = root / "objectives" / "work-1.json"
+            write_json(objective, {"objective_id": "work-1", "state": "running"})
+            with self.assertRaisesRegex(ValueError, "between objectives"):
+                store.activate("main", 1, experiment, verifier)
+            objective.unlink()
+            with (root / "generation.lock").open("a+") as lease:
+                fcntl.flock(lease.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+                with self.assertRaisesRegex(RuntimeError, "generation owns"):
+                    store.activate("main", 1, experiment, verifier)
+            self.assertIsNone(store.active_version("main"))
+            store.activate("main", 1, experiment, verifier)
+            self.assertEqual(store.active_version("main"), 1)
 
 
 if __name__ == "__main__":

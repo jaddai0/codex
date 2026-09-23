@@ -5,13 +5,28 @@ from __future__ import annotations
 import hashlib
 import json
 import os
+from contextlib import contextmanager
+import fcntl
 from pathlib import Path
 import re
 import tempfile
-from typing import Any
+from typing import Any, Iterator
 
 
 SAFE_ID = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$")
+
+
+@contextmanager
+def profile_boundary_lock(home: Path) -> Iterator[None]:
+    """Serialize objective starts with changes to the active profile."""
+    root = Path(home).resolve()
+    root.mkdir(parents=True, exist_ok=True, mode=0o700)
+    with (root / "profile-boundary.lock").open("a") as handle:
+        fcntl.flock(handle.fileno(), fcntl.LOCK_EX)
+        try:
+            yield
+        finally:
+            fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
 
 
 def require_safe_id(value: str, label: str = "identifier") -> str:
