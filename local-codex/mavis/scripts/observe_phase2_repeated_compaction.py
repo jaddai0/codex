@@ -185,7 +185,7 @@ def verify_repeated_compaction(rows: list[dict], *, workspace: Path,
 def _run_stage(command: list[str], *, workspace: Path, env: dict[str, str],
                log: Path, sessions: Path, prompt: str, expected_answer: str,
                expected_compactions: int, rollout: Path | None,
-               launch_started: float) -> tuple[int, Path, list[dict], int]:
+               launch_started: float, stage_timeout: float = 900) -> tuple[int, Path, list[dict], int]:
     """Drive one installed TUI process through its own private PTY."""
     master, slave = pty.openpty()
     fcntl.ioctl(slave, termios.TIOCSWINSZ, struct.pack("HHHH", 40, 140, 0, 0))
@@ -202,7 +202,7 @@ def _run_stage(command: list[str], *, workspace: Path, env: dict[str, str],
         os.close(slave)
         slave = -1
         stage = "answer"
-        deadline = time.monotonic() + 900
+        deadline = time.monotonic() + stage_timeout
         with log.open("wb") as output:
             while True:
                 if time.monotonic() > deadline:
@@ -229,12 +229,13 @@ def _run_stage(command: list[str], *, workspace: Path, env: dict[str, str],
                         time.sleep(0.5)
                         os.write(master, b"/compact\r" if expected_compactions else b"/exit\r")
                         stage = "compact" if expected_compactions else "exit"
-                        deadline = time.monotonic() + (600 if expected_compactions else 60)
+                        deadline = time.monotonic() + min(
+                            stage_timeout, 600 if expected_compactions else 60)
                 elif stage == "compact" and sum(row.get("type") == "compacted" for row in rows) == expected_compactions:
                     time.sleep(1)
                     os.write(master, b"/exit\r")
                     stage = "exit"
-                    deadline = time.monotonic() + 60
+                    deadline = time.monotonic() + min(stage_timeout, 60)
                 code = process.poll()
                 if code is not None:
                     if stage != "exit":
