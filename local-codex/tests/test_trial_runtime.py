@@ -14,6 +14,7 @@ sys.path.insert(0, str(ROOT / "mavis"))
 sys.path.insert(0, str(ROOT / "mavis" / "tests"))
 
 from mavis.storage import read_json, sha256_file, write_json
+from mavis.package_provenance import package_tree_sha256
 from test_e1 import E1RunnerTests
 import trial_runtime
 from launch_core import launch_trial, matching_trial_transcript
@@ -44,6 +45,9 @@ class TrialRuntimeTests(unittest.TestCase):
         self.share.mkdir()
         (self.share / "base-instructions.md").write_text("Base instructions\n")
         (self.share / "persona.toml").write_text('name = "Mavis"\n')
+        (self.share / "launch_core.py").write_bytes((ROOT / "launch_core.py").read_bytes())
+        (self.share / "mavis").mkdir()
+        (self.share / "mavis" / "__init__.py").write_text("# installed fixture\n")
         self.core = self.share / "local-codex-core"
         self.core.write_text("#!/bin/sh\nexit 0\n")
         self.core.chmod(0o755)
@@ -302,6 +306,8 @@ class TrialRuntimeTests(unittest.TestCase):
                 "core_binary": str(self.core.resolve()),
                 "core_sha256": sha256_file(self.core),
                 "trial_runtime_sha256": sha256_file(Path(trial_runtime.__file__)),
+                "launch_core_sha256": sha256_file(self.share / "launch_core.py"),
+                "mavis_package_sha256": package_tree_sha256(self.share / "mavis"),
                 "launcher": str((ROOT / "bin/local-codex").resolve()),
                 "launcher_sha256": sha256_file(ROOT / "bin/local-codex"),
             },
@@ -327,6 +333,17 @@ class TrialRuntimeTests(unittest.TestCase):
             trial_runtime, "accepted_main_profile", return_value=self.profile
         ):
             trial_runtime.validate_trial_receipt(receipt)
+            installed_source = self.share / "mavis" / "__init__.py"
+            installed_source.write_text("# changed after installation\n")
+            with self.assertRaisesRegex(ValueError, "installed core provenance changed"):
+                trial_runtime.validate_trial_receipt(receipt)
+            installed_source.write_text("# installed fixture\n")
+            launch_source = self.share / "launch_core.py"
+            original_launch = launch_source.read_bytes()
+            launch_source.write_bytes(original_launch + b"\n# changed\n")
+            with self.assertRaisesRegex(ValueError, "installed core provenance changed"):
+                trial_runtime.validate_trial_receipt(receipt)
+            launch_source.write_bytes(original_launch)
             launcher.write_text("changed")
             with self.assertRaisesRegex(ValueError, "gateway source changed"):
                 trial_runtime.validate_trial_receipt(receipt)
@@ -354,6 +371,8 @@ class TrialRuntimeTests(unittest.TestCase):
                 "core_binary": str(self.core.resolve()),
                 "core_sha256": sha256_file(self.core),
                 "trial_runtime_sha256": sha256_file(Path(trial_runtime.__file__)),
+                "launch_core_sha256": sha256_file(self.share / "launch_core.py"),
+                "mavis_package_sha256": package_tree_sha256(self.share / "mavis"),
                 "launcher": str((ROOT / "bin/local-codex").resolve()),
                 "launcher_sha256": sha256_file(ROOT / "bin/local-codex"),
             },
