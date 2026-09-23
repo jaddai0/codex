@@ -295,7 +295,9 @@ class PrepareRuntimeTests(unittest.TestCase):
             encoding="utf-8"
         )
         self.assertIn("http://127.0.0.1:8001/v1", launcher)
-        self.assertIn("python3 -m mavis runtime ensure", launcher)
+        self.assertIn('"$share_dir/launch_core.py" --managed', launcher)
+        self.assertIn('"-m", "mavis", "runtime", "ensure"',
+                      (MODULE_PATH.parent / "launch_core.py").read_text(encoding="utf-8"))
         self.assertIn("http://127.0.0.1:8000/v1", launcher)
         self.assertIn(".local-codex/mavis-service", launcher)
         self.assertNotIn("${HOME}/.mavis", launcher)
