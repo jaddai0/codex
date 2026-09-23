@@ -25,10 +25,12 @@ from mavis.e2_tasks import (CATALOG_TEST, FULL_TEST, _completed_prompt_turn,
                             terra_review_command, terra_review_prompt, verify_heldout)
 from mavis.e1_bootstrap import _summary as current_e0_summary
 from mavis.evaluations import installed_candidate_fingerprint
-from mavis.runtime import (RuntimeConfig, ensure_runtime, inventory,
+from mavis.runtime import (RuntimeConfig, acquire_iris_model_drain,
+                           ensure_runtime, inventory, iris_drain_headers,
                            load_model, loaded_generation_models, port_in_use,
                            request_json, require_idle_iris_handoff,
-                           require_installed_selected_model, stop_server)
+                           require_installed_selected_model, release_iris_model_drain,
+                           stop_server, wait_iris_model_drain)
 from mavis.storage import sha256_file, write_json
 
 
@@ -87,7 +89,11 @@ def main() -> int:
 
     signal.signal(signal.SIGTERM, interrupt)
     signal.signal(signal.SIGINT, interrupt)
+    lease_id: str | None = None
     try:
+        lease_id = acquire_iris_model_drain(config, owner="mavis-observe_heldout_e2")
+        result["drain_lease_id"] = lease_id
+        wait_iris_model_drain(config, lease_id)
         require_idle_iris_handoff(config)
         request_json(config.iris_endpoint, model_path + "/unload", method="POST", timeout=180)
         if loaded(config.iris_endpoint):
@@ -163,15 +169,23 @@ def main() -> int:
         try:
             if loaded_generation_models(config.endpoint):
                 raise RuntimeError("Mavis still holds the model")
+            if lease_id is None and not loaded(config.iris_endpoint):
+                raise RuntimeError("IRIS cannot be restored without a drain lease")
             if not loaded(config.iris_endpoint):
-                request_json(config.iris_endpoint, model_path + "/load", method="POST", timeout=900)
+                request_json(config.iris_endpoint, model_path + "/load", method="POST",
+                             timeout=900, headers=iris_drain_headers(lease_id))
             result["iris_loaded"] = loaded(config.iris_endpoint)
             result["mavis_loaded"] = bool(loaded_generation_models(config.endpoint))
+            if lease_id is not None and result["iris_loaded"] and not result["mavis_loaded"]:
+                release_iris_model_drain(config, lease_id)
+                result["drain_released"] = True
             result["candidate_after"] = installed_candidate_fingerprint()
         except BaseException as exc:
             result["iris_restore_error"] = repr(exc)
         write_json(task / "result.json", result)
-    if result.get("error") or result.get("iris_loaded") is not True or result.get("mavis_loaded") is not False:
+    if (result.get("error") or result.get("iris_loaded") is not True
+            or result.get("mavis_loaded") is not False
+            or result.get("drain_released") is not True):
         print(task / "result.json", flush=True)
         return 1
     review_text = task / "terra-review.txt"

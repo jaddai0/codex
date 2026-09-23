@@ -396,6 +396,24 @@ class E0Evaluator:
                 self._run_root = None
 
     def _tool_roundtrip(self) -> dict[str, Any]:
+        run_id = os.environ.get("MAVIS_E0_RUN_ID")
+        prior_path = self.root / "tool-roundtrip.json"
+        if run_id and prior_path.is_file():
+            prior = json.loads(prior_path.read_text())
+            if (prior.get("status") == "pass" and prior.get("run_id") == run_id
+                    and prior.get("model_id") == self.config.model
+                    and prior.get("installed_candidate") == installed_candidate_fingerprint()
+                    and isinstance(prior.get("response_ids"), list)
+                    and len(prior["response_ids"]) == 2
+                    and all(isinstance(item, str) and item for item in prior["response_ids"])):
+                return self._receipt(
+                    "tool-roundtrip", "pass",
+                    ["Installed live tool call and continuation passed earlier in this E0 run"],
+                    run_id=run_id, model_id=self.config.model,
+                    installed_candidate=prior["installed_candidate"],
+                    response_ids=prior["response_ids"],
+                    live_receipt_sha256=sha256_file(prior_path),
+                )
         if not endpoint_alive(self.config.endpoint):
             return self._receipt("tool-roundtrip", "blocked", ["Mavis endpoint is unavailable"])
         selected = next(
@@ -467,6 +485,9 @@ class E0Evaluator:
             "pass",
             [f"Responses {first['id']} -> {second['id']} completed one exact function-call round trip"],
             response_ids=[first["id"], second["id"]],
+            run_id=run_id,
+            model_id=self.config.model,
+            installed_candidate=installed_candidate_fingerprint(),
         )
 
     def _fabricated_success(self) -> dict[str, Any]:

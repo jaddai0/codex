@@ -11,7 +11,7 @@ from mavis.evaluations import (E0_CASES, E0Evaluator, _safe_buried_inspection,
 from mavis.e0_tasks import prepare_small_repository, small_repository_review_prompt
 from mavis.e2_tasks import terra_review_command
 from mavis.runtime import RuntimeConfig
-from mavis.storage import sha256_file
+from mavis.storage import sha256_file, write_json
 
 
 class E0EvaluationTests(unittest.TestCase):
@@ -323,6 +323,27 @@ class E0EvaluationTests(unittest.TestCase):
                 result = evaluator.run_case("tool-roundtrip")
             self.assertEqual(result["status"], "blocked")
             request.assert_not_called()
+
+    def test_tool_roundtrip_reuses_only_same_run_installed_live_receipt(self):
+        with tempfile.TemporaryDirectory() as directory:
+            evaluator = E0Evaluator(Path(directory), RuntimeConfig(home=Path(directory)))
+            evaluator.root.mkdir(parents=True)
+            prior = {"case": "tool-roundtrip", "status": "pass",
+                     "run_id": "a" * 32, "model_id": evaluator.config.model,
+                     "installed_candidate": {"core_sha256": "b" * 64},
+                     "response_ids": ["first", "second"]}
+            write_json(evaluator.root / "tool-roundtrip.json", prior)
+            with patch.dict("os.environ", {"MAVIS_E0_RUN_ID": "a" * 32}), \
+                    patch("mavis.evaluations.installed_candidate_fingerprint",
+                          return_value=prior["installed_candidate"]), \
+                    patch("mavis.evaluations.endpoint_alive", return_value=False):
+                result = evaluator.run_case("tool-roundtrip")
+                self.assertEqual(result["status"], "pass")
+                self.assertEqual(result["response_ids"], ["first", "second"])
+            write_json(evaluator.root / "tool-roundtrip.json", prior)
+            with patch.dict("os.environ", {"MAVIS_E0_RUN_ID": "c" * 32}), \
+                    patch("mavis.evaluations.endpoint_alive", return_value=False):
+                self.assertEqual(evaluator.run_case("tool-roundtrip")["status"], "blocked")
 
     def test_one_case_does_not_replace_full_suite_summary(self):
         with tempfile.TemporaryDirectory() as directory:

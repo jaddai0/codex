@@ -8,10 +8,12 @@ import os
 from pathlib import Path
 import signal
 import socket
+import stat
 import subprocess
 import sys
 import time
 from typing import Any
+import uuid
 from urllib.error import URLError
 from urllib.parse import quote, urlparse
 from urllib.request import Request, urlopen
@@ -53,9 +55,15 @@ def _origin(endpoint: str) -> str:
 
 
 def request_json(
-    endpoint: str, path: str, method: str = "GET", timeout: float = 10
+    endpoint: str, path: str, method: str = "GET", timeout: float = 10,
+    *, headers: dict[str, str] | None = None, payload: dict[str, Any] | None = None,
 ) -> Any:
-    request = Request(_origin(endpoint) + path, method=method, headers={"Accept": "application/json"})
+    request_headers = {"Accept": "application/json", **(headers or {})}
+    body = None if payload is None else json.dumps(payload).encode("utf-8")
+    if body is not None:
+        request_headers["Content-Type"] = "application/json"
+    request = Request(_origin(endpoint) + path, data=body, method=method,
+                      headers=request_headers)
     with urlopen(request, timeout=timeout) as response:
         return json.load(response)
 
@@ -120,6 +128,83 @@ def require_installed_selected_model(config: RuntimeConfig) -> None:
     )
     if result.stdout.strip() != config.model:
         raise RuntimeError("installed launcher selects a different Mavis model")
+
+
+def _iris_drain_token() -> str:
+    path = Path.home() / ".omlx" / "model-drain-token"
+    descriptor = os.open(path, os.O_RDONLY | os.O_NOFOLLOW)
+    try:
+        details = os.fstat(descriptor)
+        if (not stat.S_ISREG(details.st_mode) or details.st_uid != os.getuid()
+                or stat.S_IMODE(details.st_mode) != 0o600):
+            raise RuntimeError("IRIS drain token has unsafe ownership or permissions")
+        token = os.read(descriptor, 256).decode("ascii").strip()
+        if not token or len(token) > 200:
+            raise RuntimeError("IRIS drain token is empty or malformed")
+        return token
+    finally:
+        os.close(descriptor)
+
+
+def iris_drain_headers(lease_id: str | None = None) -> dict[str, str]:
+    headers = {"X-OMLX-Drain-Token": _iris_drain_token()}
+    if lease_id is not None:
+        uuid.UUID(lease_id)
+        headers["X-OMLX-Drain-Lease-Id"] = lease_id
+    return headers
+
+
+def _drain_path(config: RuntimeConfig) -> str:
+    return f"/admin/api/model-drains/{quote(config.model, safe='')}"
+
+
+def acquire_iris_model_drain(config: RuntimeConfig, *, owner: str) -> str:
+    if not owner or len(owner) > 80:
+        raise ValueError("IRIS drain owner must be a short name")
+    result = request_json(config.iris_endpoint, _drain_path(config) + "/acquire",
+                          method="POST", headers=iris_drain_headers(),
+                          payload={"owner": owner})
+    if (not isinstance(result, dict)
+            or result.get("schema_version") != "omlx.model-drain/v1"
+            or result.get("model_id") != config.model
+            or result.get("state") not in {"draining", "drained"}):
+        raise RuntimeError("IRIS model drain returned an invalid lease")
+    lease_id = result.get("lease_id")
+    if not isinstance(lease_id, str):
+        raise RuntimeError("IRIS model drain returned no lease ID")
+    uuid.UUID(lease_id)
+    return lease_id
+
+
+def wait_iris_model_drain(config: RuntimeConfig, lease_id: str, *, timeout: float = 180) -> None:
+    uuid.UUID(lease_id)
+    deadline = time.monotonic() + timeout
+    path = _drain_path(config) + f"/status?lease_id={quote(lease_id, safe='')}"
+    while time.monotonic() < deadline:
+        result = request_json(config.iris_endpoint, path, headers=iris_drain_headers())
+        if (not isinstance(result, dict)
+                or result.get("schema_version") != "omlx.model-drain/v1"
+                or result.get("model_id") != config.model
+                or result.get("lease_id") != lease_id
+                or result.get("state") not in {"draining", "drained"}):
+            raise RuntimeError("IRIS model drain status changed unexpectedly")
+        if result["state"] == "drained":
+            return
+        time.sleep(0.2)
+    raise TimeoutError("IRIS model did not drain before handoff")
+
+
+def release_iris_model_drain(config: RuntimeConfig, lease_id: str) -> None:
+    uuid.UUID(lease_id)
+    result = request_json(config.iris_endpoint, _drain_path(config) + "/release",
+                          method="POST", headers=iris_drain_headers(),
+                          payload={"lease_id": lease_id})
+    if (not isinstance(result, dict)
+            or result.get("schema_version") != "omlx.model-drain/v1"
+            or result.get("model_id") != config.model
+            or result.get("lease_id") != lease_id
+            or result.get("state") != "released"):
+        raise RuntimeError("IRIS model drain release was not confirmed")
 
 
 def _port(endpoint: str) -> int:

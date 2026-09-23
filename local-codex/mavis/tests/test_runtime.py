@@ -7,12 +7,15 @@ from unittest.mock import patch
 from mavis.runtime import (
     RuntimeConfig,
     admission,
+    acquire_iris_model_drain,
     ensure_isolated_settings,
     loaded_generation_models,
     owns_running_server,
     require_idle_iris_handoff,
     require_installed_selected_model,
+    release_iris_model_drain,
     start_server,
+    wait_iris_model_drain,
 )
 from mavis.storage import write_json
 
@@ -64,6 +67,32 @@ class RuntimeTests(unittest.TestCase):
                 require_installed_selected_model(config)
             run.return_value.stdout = config.model + "\n"
             require_installed_selected_model(config)
+
+    def test_drain_lease_blocks_until_accepted_status_and_confirms_release(self):
+        config = RuntimeConfig(home=Path("/tmp/mavis-drain-test"))
+        lease_id = "4f9c8ae0-62f6-4ad5-b3e0-4891db2fcd62"
+        def response(state):
+            return {"schema_version": "omlx.model-drain/v1", "model_id": config.model,
+                    "lease_id": lease_id, "state": state}
+        with patch("mavis.runtime.iris_drain_headers", return_value={"X-OMLX-Drain-Token": "secret"}), \
+                patch("mavis.runtime.request_json", side_effect=[response("draining"),
+                      response("draining"), response("drained"), response("released")]) as request, \
+                patch("mavis.runtime.time.sleep"):
+            self.assertEqual(acquire_iris_model_drain(config, owner="mavis-e0"), lease_id)
+            wait_iris_model_drain(config, lease_id)
+            release_iris_model_drain(config, lease_id)
+            self.assertEqual(request.call_count, 4)
+            self.assertEqual(request.call_args_list[0].kwargs["payload"],
+                             {"owner": "mavis-e0"})
+            self.assertEqual(request.call_args_list[-1].kwargs["payload"],
+                             {"lease_id": lease_id})
+
+    def test_drain_refuses_untrusted_or_changed_lease(self):
+        config = RuntimeConfig(home=Path("/tmp/mavis-drain-test"))
+        with patch("mavis.runtime.iris_drain_headers", return_value={}), \
+                patch("mavis.runtime.request_json", return_value={"state": "drained"}), \
+                self.assertRaisesRegex(RuntimeError, "invalid lease"):
+            acquire_iris_model_drain(config, owner="mavis-e0")
 
     def test_ownership_requires_exact_binary_base_path_and_port(self):
         with tempfile.TemporaryDirectory() as directory:

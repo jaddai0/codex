@@ -18,10 +18,12 @@ import uuid
 from urllib.parse import quote
 
 from mavis.evaluations import installed_candidate_fingerprint
-from mavis.runtime import (RuntimeConfig, ensure_runtime, inventory,
+from mavis.runtime import (RuntimeConfig, acquire_iris_model_drain,
+                           ensure_runtime, inventory, iris_drain_headers,
                            load_model, loaded_generation_models, port_in_use,
                            request_json, require_idle_iris_handoff,
-                           require_installed_selected_model, stop_server)
+                           require_installed_selected_model, release_iris_model_drain,
+                           stop_server, wait_iris_model_drain)
 from mavis.storage import write_json
 
 
@@ -86,7 +88,11 @@ def main() -> int:
     result: dict[str, object] = {"candidate": candidate,
                                  "workspace": str(workspace),
                                  "fact": fact, "task_root": str(task)}
+    lease_id: str | None = None
     try:
+        lease_id = acquire_iris_model_drain(config, owner="mavis-observe_compaction_restart")
+        result["drain_lease_id"] = lease_id
+        wait_iris_model_drain(config, lease_id)
         require_idle_iris_handoff(config)
         request_json(config.iris_endpoint, model_path + "/unload", method="POST", timeout=180)
         if loaded(config.iris_endpoint):
@@ -164,10 +170,16 @@ def main() -> int:
         try:
             if loaded_generation_models(config.endpoint):
                 raise RuntimeError("cannot restore IRIS while Mavis holds the model")
+            if lease_id is None and not loaded(config.iris_endpoint):
+                raise RuntimeError("IRIS cannot be restored without a drain lease")
             if not loaded(config.iris_endpoint):
-                request_json(config.iris_endpoint, model_path + "/load", method="POST", timeout=900)
+                request_json(config.iris_endpoint, model_path + "/load", method="POST",
+                             timeout=900, headers=iris_drain_headers(lease_id))
             result["iris_loaded"] = loaded(config.iris_endpoint)
             result["mavis_loaded"] = bool(loaded_generation_models(config.endpoint))
+            if lease_id is not None and result["iris_loaded"] and not result["mavis_loaded"]:
+                release_iris_model_drain(config, lease_id)
+                result["drain_released"] = True
             result["candidate_after"] = installed_candidate_fingerprint()
         except BaseException as exc:
             result["iris_restore_error"] = repr(exc)
@@ -177,6 +189,7 @@ def main() -> int:
                  and result.get("exact_recovery") is True
                  and result.get("iris_loaded") is True
                  and result.get("mavis_loaded") is False
+                 and result.get("drain_released") is True
                  and result.get("candidate_after") == candidate) else 1
 
 
