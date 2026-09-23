@@ -437,6 +437,51 @@ class E0EvaluationTests(unittest.TestCase):
             self.assertEqual(result["status"], "blocked")
             request.assert_not_called()
 
+    def test_tool_roundtrip_shared_mode_requires_live_lease_and_idle_iris(self):
+        with tempfile.TemporaryDirectory() as directory:
+            evaluator = E0Evaluator(Path(directory), RuntimeConfig(home=Path(directory)))
+            first = {"id": "first", "output": [{
+                "type": "function_call", "name": "mavis_probe", "call_id": "call",
+                "arguments": '{"value":"E0_CANARY"}',
+            }]}
+            second = {"id": "second", "status": "completed"}
+            with (
+                patch.dict(os.environ, {"MAVIS_E0_SHARED_GPU_LEASE": "codex-mavis"}),
+                patch("mavis.evaluations.endpoint_alive", return_value=True),
+                patch("mavis.evaluations.inventory", return_value=[
+                    {"id": evaluator.config.model, "loaded": True}]),
+                patch("mavis.evaluations.subprocess.run", return_value=subprocess.CompletedProcess(
+                    ["gpu-lease", "status"], 0, "codex-mavis has the GPU: canary\n")),
+                patch("mavis.evaluations.require_idle_iris_handoff") as idle,
+                patch("mavis.evaluations.admission", return_value={"allowed": True}) as admission,
+                patch("mavis.evaluations._post_json", side_effect=[first, second]) as request,
+                patch("mavis.evaluations.installed_candidate_fingerprint", return_value={
+                    "core_sha256": "a" * 64}),
+            ):
+                result = evaluator.run_case("tool-roundtrip")
+            self.assertEqual(result["status"], "pass")
+            self.assertTrue(admission.call_args.args[0].allow_concurrent_local)
+            idle.assert_called_once_with(evaluator.config)
+            self.assertEqual(request.call_count, 2)
+
+    def test_tool_roundtrip_shared_mode_rejects_another_lease_holder(self):
+        with tempfile.TemporaryDirectory() as directory:
+            evaluator = E0Evaluator(Path(directory), RuntimeConfig(home=Path(directory)))
+            with (
+                patch.dict(os.environ, {"MAVIS_E0_SHARED_GPU_LEASE": "codex-mavis"}),
+                patch("mavis.evaluations.endpoint_alive", return_value=True),
+                patch("mavis.evaluations.inventory", return_value=[
+                    {"id": evaluator.config.model, "loaded": True}]),
+                patch("mavis.evaluations.subprocess.run", return_value=subprocess.CompletedProcess(
+                    ["gpu-lease", "status"], 0, "claude-battlemap has the GPU: job\n")),
+                patch("mavis.evaluations.admission") as admission,
+                patch("mavis.evaluations._post_json") as request,
+            ):
+                result = evaluator.run_case("tool-roundtrip")
+            self.assertEqual(result["status"], "reject")
+            admission.assert_not_called()
+            request.assert_not_called()
+
     def test_tool_roundtrip_reuses_only_same_run_installed_live_receipt(self):
         with tempfile.TemporaryDirectory() as directory:
             evaluator = E0Evaluator(Path(directory), RuntimeConfig(home=Path(directory)))

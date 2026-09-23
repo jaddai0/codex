@@ -10,6 +10,7 @@ from __future__ import annotations
 
 from datetime import datetime, timezone
 from contextlib import contextmanager
+from dataclasses import replace
 import fcntl
 import hashlib
 import json
@@ -26,7 +27,7 @@ from urllib.request import Request, urlopen
 from .evidence import run_command
 from .objectives import ObjectiveStore
 from .project_evidence import project_home
-from .runtime import RuntimeConfig, _listener_pids, admission, endpoint_alive, inventory, loaded_generation_models, omlx_live_process_binding, omlx_runtime_fingerprint
+from .runtime import RuntimeConfig, _listener_pids, admission, endpoint_alive, inventory, loaded_generation_models, omlx_live_process_binding, omlx_runtime_fingerprint, require_idle_iris_handoff
 from .storage import sha256_file, write_json
 
 
@@ -448,7 +449,22 @@ class E0Evaluator:
         )
         if not selected or not selected.get("loaded"):
             return self._receipt("tool-roundtrip", "blocked", ["Mavis model is not loaded; E0 will not trigger an implicit model load"])
-        decision = admission(self.config)
+        admission_config = self.config
+        if os.environ.get("MAVIS_E0_SHARED_GPU_LEASE"):
+            if os.environ["MAVIS_E0_SHARED_GPU_LEASE"] != "codex-mavis":
+                raise ValueError("E0 shared GPU lease holder is invalid")
+            lease = subprocess.run(
+                [str(Path.home() / ".local/bin/gpu-lease"), "status"],
+                capture_output=True, text=True, timeout=15, check=False,
+            )
+            if (lease.returncode != 0
+                    or not lease.stdout.startswith("codex-mavis has the GPU:")
+                    or "IRIS: a game is live" in lease.stdout
+                    or "IRIS: not answering" in lease.stdout):
+                raise RuntimeError("E0 shared GPU lease or IRIS game state is unsafe")
+            require_idle_iris_handoff(self.config)
+            admission_config = replace(self.config, allow_concurrent_local=True)
+        decision = admission(admission_config)
         if not decision["allowed"]:
             return self._receipt("tool-roundtrip", "blocked", decision["reasons"])
         payload = {

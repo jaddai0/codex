@@ -52,6 +52,7 @@ def main() -> int:
     shared: dict[str, object] | None = None
     try:
         with shared_mavis_model(config, "installed Mavis E0 tool roundtrip") as shared:
+            env["MAVIS_E0_SHARED_GPU_LEASE"] = "codex-mavis"
             with live_log.open("wb") as stream:
                 run = subprocess.run([sys.executable, "-m", "mavis", "eval", "e0",
                                       "--case", "tool-roundtrip"],
@@ -73,6 +74,7 @@ def main() -> int:
         reservation = None
         try:
             reservation = park_mavis_server(config)
+            env.pop("MAVIS_E0_SHARED_GPU_LEASE", None)
             with log.open("wb") as stream:
                 env["MAVIS_E0_PARK_OWNER_PID"] = str(os.getpid())
                 run = subprocess.run([sys.executable, "-m", "mavis", "eval", "e0"],
