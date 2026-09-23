@@ -10,9 +10,10 @@
   },
   "status": "partial",
   "uncertainty": [
-    "Installed E0 passed all ten cases on candidate core 969723b0 and service 4f862fe7; a distinct real maintenance task now passed, but Phase 1 still needs a completed multi-file Mavis task with independent verification and a fresh E0 run after the service changes are installed.",
-    "Phase 2 helper interfaces and E1 comparison runner pass source tests, but live helper model comparisons, native assignments, installed profile use, promotion, and rollback remain open.",
-    "Hosted Jev returned one typed answer with provider-reported usage matching the local capped ledger; external invoice reconciliation remains open."
+    "Installed E0 passed all ten mandatory cases on the current candidate; a distinct maintenance task passed, but Phase 1 still needs a completed multi-file Mavis task with independent verification.",
+    "Phase 2 memory and helper interfaces pass source tests; live embedding and helper comparisons, repeated-compaction quality, helper isolation, and net-benefit acceptance remain open.",
+    "Phase 3 E1 has native assignment plumbing and strict source gates, but candidate activation, a real paired comparison, independent promotion, and rollback remain open.",
+    "Hosted Jev returned one typed answer under the local capped ledger; external invoice reconciliation and a local Jev candidate remain open."
   ],
   "rejected_alternatives": [
     "Sharing IRIS port 8000 was rejected by the approved plan.",
@@ -34,13 +35,13 @@
       "id": "phase-1",
       "requirement": "Deliver a useful isolated Mavis with objectives, evidence, compaction, delegation, Jev, parsing, search, and interruption recovery; pass E0 plus two independently verified real tasks.",
       "status": "reject",
-      "command": "Installed Desktop Mavis E0 canaries, native ZCode review, and CODEX_HOME=~/.local-codex PYTHONPATH=~/.local/share/local-codex python3 -m mavis eval e0 under sequential IRIS/Mavis model handoff",
+      "command": "Installed Desktop Mavis small-repository, buried-failure, real TUI compaction/restart, isolation-recovery observers; CODEX_HOME=~/.local-codex MAVIS_HOME=~/.local-codex/mavis-service PYTHONPATH=~/.local/share/local-codex python3 -m mavis eval e0 under sequential IRIS/Mavis model handoff",
       "artifact": "/Users/dustinpainter/.local-codex/mavis-service/evaluations/e0/summary.json",
       "evidence": [
-        "All ten mandatory E0 cases passed on the installed candidate: core SHA-256 969723b0eb97773fca6814d21ef89091cfcad32eaa9a845b0dc079a1bf92f618 and service SHA-256 4f862fe7c976c569a031d246dffd81464ab35a36ddc2e4e0564fe39ceed4e1a2.",
-        "Fresh installed Mavis repaired seeded pricing code, two host tests passed, dirty user note hash held, and independent native ZCode review accepted. The raw-output canary retained 1600044 bytes and Mavis found the buried failure. Real TUI compaction and exact-session resume returned the fact. Mavis server outage/recovery preserved the same IRIS process and model. Gateway-bound external worker/Terra receipt revalidated.",
-        "A distinct real maintenance task completed: installed Mavis fixed Boolean citation validation in an isolated checkout, exited 0 after seven focused tests, and restored IRIS. Independent review accepted the two-file patch after seven focused and 90 full Mavis tests; report: /Users/dustinpainter/.Codex/reports/mavis-librarian-fix-independent-review-2026-09-22.md.",
-        "A previous Mavis multi-file compaction observer assignment produced edits but entered repetitive inspection and was stopped before a final result. Its corrected patch passed independent review and 90 source tests, but it does not satisfy the completed Mavis task requirement. A separate completed multi-file Mavis assignment and fresh installed E0 on the final service build remain open."
+        "Installed E0 summary at /Users/dustinpainter/.local-codex/mavis-service/evaluations/e0/summary.json passed all ten mandatory cases on core SHA-256 969723b0eb97773fca6814d21ef89091cfcad32eaa9a845b0dc079a1bf92f618 and service SHA-256 c616a39a30a219877614bf7c6382003241eefec81b827ea6debbae76512e7a61. The candidate fingerprint also binds the Desktop and shell launchers, profile preparation, launch wrapper, and prompt templates.",
+        "The current-candidate installed repair passed host tests and independent native ZCode review in /Users/dustinpainter/.local-codex/mavis-service/evaluations/e0/tasks/23ed392907934a6e81204f8e6b7c9cad. The current buried-failure, compaction/restart, and isolation-recovery receipts are under buried-live-81f17adeb8a74357b72a97cd97062b60, compaction-live-7275dddac9ae4999859a1ab2141136ea, and isolation-recovery-live.json; final model state was IRIS loaded and Mavis unloaded.",
+        "A distinct real maintenance task completed: installed Mavis fixed Boolean citation validation in an isolated checkout, exited 0 after seven focused tests, and independent review accepted the two-file patch; /Users/dustinpainter/.Codex/reports/mavis-librarian-fix-independent-review-2026-09-22.md.",
+        "Two installed Mavis archive-paging multi-file attempts stalled without an edit and were stopped with IRIS restored. MiniMax M2.7 completed the consulted implementation in its native OpenCode harness; independent review accepted the repaired bounded paging and 104 source tests, but that is not a completed Mavis multi-file assignment. A separate Mavis completion remains required."
       ]
     },
     {
@@ -50,7 +51,7 @@
       "command": "PYTHONDONTWRITEBYTECODE=1 PYTHONPATH=local-codex/mavis python3 -m unittest discover -s local-codex/mavis/tests -q",
       "artifact": "local-codex/mavis/reports/phase2-helper-interfaces.md",
       "evidence": [
-        "Project retrieval handles stale/deleted/renamed paths and hash-verified global records. Librarian/output-reader evidence boundaries and zero-failure parsing regression are implemented; combined Mavis source suite passed 90 tests. Native installed Mavis completed and independent review accepted a Boolean citation validation repair.",
+        "Project retrieval handles stale/deleted/renamed paths and hash-verified global records. Librarian/output-reader evidence boundaries, zero-failure parsing, and bounded archive paging are implemented; combined Mavis source suite passed 106 tests.",
         "Embedding comparison, live isolated helper models, repeated compactions, large-log helper trial, and net-benefit acceptance remain open."
       ]
     },
@@ -61,8 +62,8 @@
       "command": "PYTHONDONTWRITEBYTECODE=1 PYTHONPATH=local-codex/mavis python3 -m unittest discover -s local-codex/mavis/tests -q",
       "artifact": "local-codex/mavis/reports/phase3-e1-runner.md",
       "evidence": [
-        "E1 source runner freezes case revisions and checks, retains complete host receipts and raw output, tracks incomplete coverage, and rechecks evidence through promotion gates; combined Mavis source suite passed 90 tests.",
-        "Native worker dispatch, observed candidate configuration in installed Mavis, real failure comparison, independent promotion review, and rollback remain open."
+        "E1 source runner freezes revisions and checks, retains host receipts, dispatches native gateway assignments, and rejects dirty candidate checkouts. Main source suite passed 106 tests; gateway Mavis assignment fields passed 81 source tests.",
+        "Installed accepted main-profile selection has source tests and independent review, but no real accepted profile is active. Native candidate activation receipt, paired failure comparison, independent promotion review, and rollback remain open; compare-native intentionally fails closed until activation is proven."
       ]
     },
     {
