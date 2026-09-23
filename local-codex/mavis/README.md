@@ -98,12 +98,15 @@ evaluation runner yet. The source tests use injected gateway statuses and
 synthetic evaluation files. Phase 3 still needs a real failure, held-out
 comparison, accepted verifier job, staged runtime promotion, and rollback
 canary before it can be called complete.
+
 ### Project evidence
 
 When the Mavis launcher runs from a nested Git checkout, it records new project objectives,
 host command receipts, and transcript handoffs under that checkout's ignored
-`.mavis/` directory. `MAVIS_PROJECT_ROOT` can name the checkout explicitly for
-service commands run elsewhere. The directory has a private `.gitignore` and
+`.mavis/` directory. Select a checkout with `mavis -C /path/to/project` or
+`MAVIS_PROJECT_DIR=/path/to/project`; these take precedence over the shell's
+current directory. `MAVIS_PROJECT_ROOT` is an internal binding and must match
+the selected checkout if inherited. The directory has a private `.gitignore` and
 must pass `git check-ignore` before Mavis writes evidence. Project memory and
 the search index already use the same directory. Shared verified coding
 knowledge remains under `$MAVIS_HOME/knowledge`; service runtime, profiles,
@@ -120,7 +123,8 @@ command copies its objective, host evidence, bound session records, and
 transcript archive into `.mavis/legacy-import/objectives/OBJECTIVE_ID/`, then
 writes a hash manifest. It leaves the source evidence intact so old acceptance
 links continue to verify. A failed copy does not publish a final import. To
-roll back new routing, remove `MAVIS_PROJECT_ROOT` from a direct service
-invocation; old global records remain in place. Never delete the original
+use legacy service-home routing, start outside a specific checkout without
+`MAVIS_PROJECT_DIR` or `-C`, and clear any inherited `MAVIS_PROJECT_ROOT`.
+Old global records remain in place. Never delete the original
 service evidence before all linked acceptance and retention records have been
 checked separately.
