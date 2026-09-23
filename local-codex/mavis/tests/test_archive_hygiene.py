@@ -73,6 +73,64 @@ class ArchiveRetentionTests(unittest.TestCase):
             self.assertFalse(original.exists())
             self.assertEqual(len(archive.search("blue heron")), 1)
 
+    def test_compact_directory_swap_cannot_delete_outside_file(self):
+        with tempfile.TemporaryDirectory() as directory:
+            home = Path(directory) / "home"
+            archive, original, retention, closed = self._closed(home)
+            outside = Path(directory) / "outside"
+            outside.mkdir()
+            unique = outside / original.name
+            unique.write_text("outside unique evidence")
+            write_manifest = TranscriptArchive._write_manifest_locked
+            swapped = False
+
+            def swap_after_publish(instance, root_fd, manifest):
+                nonlocal swapped
+                write_manifest(instance, root_fd, manifest)
+                if not swapped and manifest["segments"][0].get("compression") == "gzip":
+                    swapped = True
+                    (archive.root / "segments").rename(archive.root / "segments-held")
+                    (archive.root / "segments").symlink_to(outside, target_is_directory=True)
+
+            with patch.object(TranscriptArchive, "_write_manifest_locked", swap_after_publish):
+                with self.assertRaisesRegex(ValueError, "directory was replaced"):
+                    retention.compact("project-1", now=closed + timedelta(days=31))
+            self.assertEqual(unique.read_text(), "outside unique evidence")
+            self.assertTrue((archive.root / "segments-held" / original.name).is_file())
+            (archive.root / "segments").unlink()
+            (archive.root / "segments-held").rename(archive.root / "segments")
+            self.assertEqual(len(archive.search("blue heron")), 1)
+
+    def test_restore_directory_swap_cannot_delete_outside_file(self):
+        with tempfile.TemporaryDirectory() as directory:
+            home = Path(directory) / "home"
+            archive, original, retention, closed = self._closed(home)
+            retention.compact("project-1", now=closed + timedelta(days=31))
+            compressed = Path(json.loads(archive.manifest_path.read_text())["segments"][0]["path"])
+            outside = Path(directory) / "outside"
+            outside.mkdir()
+            unique = outside / compressed.name
+            unique.write_text("outside unique compressed evidence")
+            write_manifest = TranscriptArchive._write_manifest_locked
+            swapped = False
+
+            def swap_after_publish(instance, root_fd, manifest):
+                nonlocal swapped
+                write_manifest(instance, root_fd, manifest)
+                if not swapped and manifest["segments"][0].get("compression") != "gzip":
+                    swapped = True
+                    (archive.root / "segments").rename(archive.root / "segments-held")
+                    (archive.root / "segments").symlink_to(outside, target_is_directory=True)
+
+            with patch.object(TranscriptArchive, "_write_manifest_locked", swap_after_publish):
+                with self.assertRaisesRegex(ValueError, "directory was replaced"):
+                    retention.restore("project-1")
+            self.assertEqual(unique.read_text(), "outside unique compressed evidence")
+            self.assertTrue((archive.root / "segments-held" / compressed.name).is_file())
+            (archive.root / "segments").unlink()
+            (archive.root / "segments-held").rename(archive.root / "segments")
+            self.assertEqual(len(archive.search("blue heron")), 1)
+
     def test_handoff_reference_keeps_raw_segment(self):
         with tempfile.TemporaryDirectory() as directory:
             home = Path(directory)
@@ -168,6 +226,18 @@ class ArchiveRetentionTests(unittest.TestCase):
             with ThreadPoolExecutor(max_workers=2) as pool:
                 outcomes = list(pool.map(claim, ("project-a", "project-b")))
             self.assertEqual(sorted(outcomes), ["overlap-refused", "registered"])
+
+    def test_mismatched_registry_filename_cannot_hide_duplicate_project(self):
+        with tempfile.TemporaryDirectory() as directory:
+            home = Path(directory)
+            archive, original, retention, closed = self._closed(home)
+            (retention.root / "forged.json").write_text(json.dumps({
+                "schema_version": "mavis.archive-project/v1", "project_id": "project-1",
+                "conversation_ids": ["conversation-1"], "state": "open",
+            }))
+            with self.assertRaisesRegex(ValueError, "filename or ownership"):
+                retention.compact("project-1", now=closed + timedelta(days=31))
+            self.assertTrue(original.is_file())
 
     def test_idle_sweep_compresses_due_project_and_foreground_skips_trigger(self):
         with tempfile.TemporaryDirectory() as directory:

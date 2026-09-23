@@ -11,7 +11,7 @@ import json
 import os
 from pathlib import Path
 import shutil
-import tempfile
+import stat
 import time
 from typing import Any
 import warnings
@@ -48,6 +48,145 @@ def _strings(value: Any):
     elif isinstance(value, list):
         for child in value:
             yield from _strings(child)
+
+
+class _PinnedSegments:
+    """Operate on one verified archive directory, never a later path lookup."""
+
+    def __init__(self, archive: TranscriptArchive, root_fd: int):
+        self.archive = archive
+        self.root_fd = root_fd
+        self.fd = os.open("segments", os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW,
+                          dir_fd=root_fd)
+        self.root_identity = (os.fstat(root_fd).st_dev, os.fstat(root_fd).st_ino)
+        self.identity = (os.fstat(self.fd).st_dev, os.fstat(self.fd).st_ino)
+        self.assert_attached()
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *_):
+        os.close(self.fd)
+
+    @staticmethod
+    def _name(name: str) -> str:
+        if not name or name in {".", ".."} or Path(name).name != name or "/" in name:
+            raise ValueError("segment filename is unsafe")
+        return name
+
+    def assert_attached(self) -> None:
+        root = self.archive.root
+        if root.parent.is_symlink() or root.is_symlink():
+            raise ValueError("archive directory was replaced")
+        root_stat = os.stat(root, follow_symlinks=False)
+        child = os.stat("segments", dir_fd=self.root_fd, follow_symlinks=False)
+        if (not stat.S_ISDIR(root_stat.st_mode) or not stat.S_ISDIR(child.st_mode)
+            or (root_stat.st_dev, root_stat.st_ino) != self.root_identity
+            or (child.st_dev, child.st_ino) != self.identity):
+            raise ValueError("archive segments directory was replaced")
+
+    def _open(self, name: str) -> tuple[int, os.stat_result]:
+        descriptor = os.open(self._name(name), os.O_RDONLY | os.O_NOFOLLOW,
+                             dir_fd=self.fd)
+        observed = os.fstat(descriptor)
+        if not stat.S_ISREG(observed.st_mode) or observed.st_nlink != 1:
+            os.close(descriptor)
+            raise ValueError("segment file is not a unique regular file")
+        return descriptor, observed
+
+    def exists(self, name: str) -> bool:
+        try:
+            observed = os.stat(self._name(name), dir_fd=self.fd, follow_symlinks=False)
+        except FileNotFoundError:
+            return False
+        if not stat.S_ISREG(observed.st_mode):
+            raise ValueError("segment path is not a regular file")
+        return True
+
+    @staticmethod
+    def segment_name(segment: dict[str, Any]) -> str:
+        segment_id = require_safe_id(str(segment["segment_id"]), "segment id")
+        suffix = ".jsonl.gz" if segment.get("compression") == "gzip" else ".jsonl"
+        expected = segment_id + suffix
+        if Path(segment["path"]).name != expected:
+            raise ValueError("manifest segment name does not match its identity")
+        return expected
+
+    def digest(self, name: str) -> tuple[str, tuple[int, int]]:
+        descriptor, observed = self._open(name)
+        digest = hashlib.sha256()
+        with os.fdopen(descriptor, "rb") as source:
+            for chunk in iter(lambda: source.read(1024 * 1024), b""):
+                digest.update(chunk)
+        return digest.hexdigest(), (observed.st_dev, observed.st_ino)
+
+    def reconstructed_digest(self, name: str) -> str:
+        descriptor, _ = self._open(name)
+        digest = hashlib.sha256()
+        try:
+            with os.fdopen(descriptor, "rb") as source:
+                with gzip.GzipFile(fileobj=source, mode="rb") as restored:
+                    for chunk in iter(lambda: restored.read(1024 * 1024), b""):
+                        digest.update(chunk)
+        except (OSError, EOFError) as exc:
+            raise ValueError("compressed segment cannot be reconstructed") from exc
+        return digest.hexdigest()
+
+    def unlink_verified(self, name: str, expected_sha256: str,
+                        expected_identity: tuple[int, int]) -> None:
+        self.assert_attached()
+        digest, identity = self.digest(name)
+        observed = os.stat(self._name(name), dir_fd=self.fd, follow_symlinks=False)
+        if (digest != expected_sha256 or identity != expected_identity
+            or (observed.st_dev, observed.st_ino) != identity):
+            raise ValueError("segment changed before duplicate removal")
+        os.unlink(name, dir_fd=self.fd)
+
+    def _temporary(self, stem: str) -> tuple[str, int]:
+        name = f".{stem}-{os.urandom(16).hex()}"
+        descriptor = os.open(name, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW,
+                             0o600, dir_fd=self.fd)
+        return name, descriptor
+
+    def write_gzip(self, raw_name: str, compressed_name: str) -> None:
+        temporary, target_fd = self._temporary("compress")
+        try:
+            with os.fdopen(target_fd, "wb") as target:
+                source_fd, _ = self._open(raw_name)
+                with os.fdopen(source_fd, "rb") as source:
+                    with gzip.GzipFile(filename="", mode="wb", fileobj=target, mtime=0) as zipper:
+                        shutil.copyfileobj(source, zipper, length=1024 * 1024)
+                target.flush()
+                os.fsync(target.fileno())
+            self.assert_attached()
+            os.link(temporary, self._name(compressed_name),
+                    src_dir_fd=self.fd, dst_dir_fd=self.fd, follow_symlinks=False)
+            os.fsync(self.fd)
+        finally:
+            try:
+                os.unlink(temporary, dir_fd=self.fd)
+            except FileNotFoundError:
+                pass
+
+    def write_raw(self, compressed_name: str, raw_name: str) -> None:
+        temporary, target_fd = self._temporary("restore")
+        try:
+            with os.fdopen(target_fd, "wb") as target:
+                source_fd, _ = self._open(compressed_name)
+                with os.fdopen(source_fd, "rb") as source:
+                    with gzip.GzipFile(fileobj=source, mode="rb") as restored:
+                        shutil.copyfileobj(restored, target, length=1024 * 1024)
+                target.flush()
+                os.fsync(target.fileno())
+            self.assert_attached()
+            os.link(temporary, self._name(raw_name),
+                    src_dir_fd=self.fd, dst_dir_fd=self.fd, follow_symlinks=False)
+            os.fsync(self.fd)
+        finally:
+            try:
+                os.unlink(temporary, dir_fd=self.fd)
+            except FileNotFoundError:
+                pass
 
 
 class ArchiveRetention:
@@ -90,7 +229,13 @@ class ArchiveRetention:
             other = read_json(path)
             if other.get("schema_version") != "mavis.archive-project/v1":
                 raise ValueError("archive project registry contains an invalid record")
-            if other.get("project_id") == record["project_id"]:
+            other_id = other.get("project_id")
+            if (not isinstance(other_id, str)
+                or path.name != f"{require_safe_id(other_id, 'project id')}.json"
+                or not isinstance(other.get("conversation_ids"), list)
+                or any(not isinstance(item, str) for item in other["conversation_ids"])):
+                raise ValueError("archive project filename or ownership record is invalid")
+            if other_id == record["project_id"]:
                 continue
             if owned.intersection(other.get("conversation_ids", [])):
                 raise ValueError("conversation belongs to another archive project")
@@ -263,65 +408,63 @@ class ArchiveRetention:
                 if {item["segment_id"]: item["sha256"] for item in manifest["segments"]} != record["segments_at_close"].get(conversation_id):
                     raise ValueError("archive segment set changed after project closure")
                 references = self._activity_and_references(record, archive, manifest, closed_at)
-                for segment in manifest["segments"]:
-                    original = Path(segment["path"])
-                    if segment.get("compression") == "gzip":
-                        raw_duplicate = original.with_suffix("")
-                        if raw_duplicate.exists():
-                            if (raw_duplicate.is_symlink() or raw_duplicate.stat().st_nlink != 1
-                                or sha256_file(raw_duplicate) != segment["sha256"]
-                                or str(raw_duplicate.resolve()) in references):
-                                raise ValueError("unverified or referenced raw duplicate remains")
-                            raw_duplicate.unlink()
-                        outcomes.append({"segment_id": segment["segment_id"], "status": "already-compressed"})
-                        continue
-                    if str(original.resolve()) in references:
-                        outcomes.append({"segment_id": segment["segment_id"], "status": "referenced"})
-                        continue
-                    if original.stat().st_nlink != 1:
-                        raise ValueError("hard-linked evidence cannot be compressed safely")
-                    compressed = original.with_name(original.name + ".gz")
-                    if compressed.is_symlink():
-                        raise ValueError("compressed path is a symlink")
-                    if not compressed.exists():
-                        descriptor, temporary = tempfile.mkstemp(prefix=".compress-", dir=original.parent)
+                with _PinnedSegments(archive, root_fd) as pinned:
+                    for segment in manifest["segments"]:
+                        pinned.assert_attached()
+                        name = pinned.segment_name(segment)
+                        source_path = Path(segment["path"])
+                        if segment.get("compression") == "gzip":
+                            compressed_sha, _ = pinned.digest(name)
+                            if (compressed_sha != segment["compressed_sha256"]
+                                or pinned.reconstructed_digest(name) != segment["sha256"]):
+                                raise ValueError("compressed segment changed")
+                            raw_name = name[:-3]
+                            if pinned.exists(raw_name):
+                                raw_path = source_path.with_suffix("")
+                                if str(raw_path) in references:
+                                    raise ValueError("referenced raw duplicate remains")
+                                raw_sha, raw_identity = pinned.digest(raw_name)
+                                if raw_sha != segment["sha256"]:
+                                    raise ValueError("unverified raw duplicate remains")
+                                pinned.unlink_verified(raw_name, raw_sha, raw_identity)
+                                pinned.assert_attached()
+                            outcomes.append({"segment_id": segment["segment_id"], "status": "already-compressed"})
+                            continue
+                        if str(source_path) in references:
+                            outcomes.append({"segment_id": segment["segment_id"], "status": "referenced"})
+                            continue
+                        raw_sha, raw_identity = pinned.digest(name)
+                        if raw_sha != segment["sha256"]:
+                            raise ValueError("raw segment changed")
+                        compressed_name = name + ".gz"
+                        if not pinned.exists(compressed_name):
+                            pinned.write_gzip(name, compressed_name)
+                        compressed_sha, _ = pinned.digest(compressed_name)
+                        if pinned.reconstructed_digest(compressed_name) != raw_sha:
+                            raise ValueError("compressed segment did not reconstruct exactly")
+                        prior = dict(segment)
+                        segment.update({"path": str(source_path.with_name(compressed_name)),
+                                        "compression": "gzip", "compressed_sha256": compressed_sha})
+                        published = False
+                        removed = False
                         try:
-                            with os.fdopen(descriptor, "wb") as target, original.open("rb") as source:
-                                with gzip.GzipFile(filename="", mode="wb", fileobj=target, mtime=0) as zipper:
-                                    shutil.copyfileobj(source, zipper, length=1024 * 1024)
-                                target.flush()
-                                os.fsync(target.fileno())
-                            os.chmod(temporary, 0o600)
-                            os.replace(temporary, compressed)
-                        finally:
-                            Path(temporary).unlink(missing_ok=True)
-                    if not compressed.is_file() or compressed.stat().st_nlink != 1:
-                        raise ValueError("compressed path is unsafe")
-                    digest = hashlib.sha256()
-                    try:
-                        with gzip.open(compressed, "rb") as restored:
-                            for chunk in iter(lambda: restored.read(1024 * 1024), b""):
-                                digest.update(chunk)
-                    except (OSError, EOFError) as exc:
-                        raise ValueError("compressed segment cannot be reconstructed") from exc
-                    if digest.hexdigest() != segment["sha256"]:
-                        raise ValueError("compressed segment did not reconstruct exactly")
-                    prior = dict(segment)
-                    segment.update({"path": str(compressed), "compression": "gzip",
-                                    "compressed_sha256": sha256_file(compressed)})
-                    try:
-                        archive.verify_segment(segment)
-                        archive._write_manifest_locked(root_fd, manifest)
-                    except BaseException:
-                        segment.clear()
-                        segment.update(prior)
-                        raise
-                    # The verified gzip is now authoritative. Raw bytes remain
-                    # only until the manifest transaction succeeds.
-                    original.unlink()
-                    outcomes.append({"segment_id": segment["segment_id"], "status": "compressed",
-                                     "original_sha256": segment["sha256"],
-                                     "compressed_sha256": segment["compressed_sha256"]})
+                            pinned.assert_attached()
+                            published = True  # A write may publish before raising.
+                            archive._write_manifest_locked(root_fd, manifest)
+                            pinned.assert_attached()
+                            pinned.unlink_verified(name, raw_sha, raw_identity)
+                            removed = True
+                            pinned.assert_attached()
+                        except BaseException:
+                            if not removed:
+                                segment.clear()
+                                segment.update(prior)
+                                if published:
+                                    archive._write_manifest_locked(root_fd, manifest)
+                            raise
+                        outcomes.append({"segment_id": segment["segment_id"], "status": "compressed",
+                                         "original_sha256": raw_sha,
+                                         "compressed_sha256": compressed_sha})
         return {"project_id": project_id, "segments": outcomes}
 
     def restore(self, project_id: str) -> dict[str, Any]:
@@ -332,42 +475,44 @@ class ArchiveRetention:
             archive = TranscriptArchive(self.home, conversation_id)
             with archive._locked() as root_fd:
                 manifest = self._safe_manifest(archive)
-                for segment in manifest["segments"]:
-                    if segment.get("compression") != "gzip":
-                        continue
-                    compressed = Path(segment["path"])
-                    raw = compressed.with_suffix("")
-                    if raw.is_symlink():
-                        raise ValueError("raw restoration path is a symlink")
-                    if raw.exists():
-                        if raw.stat().st_nlink != 1 or sha256_file(raw) != segment["sha256"]:
+                with _PinnedSegments(archive, root_fd) as pinned:
+                    for segment in manifest["segments"]:
+                        if segment.get("compression") != "gzip":
+                            continue
+                        pinned.assert_attached()
+                        compressed_name = pinned.segment_name(segment)
+                        compressed_sha, compressed_identity = pinned.digest(compressed_name)
+                        if (compressed_sha != segment["compressed_sha256"]
+                            or pinned.reconstructed_digest(compressed_name) != segment["sha256"]):
+                            raise ValueError("compressed segment changed")
+                        raw_name = compressed_name[:-3]
+                        if not pinned.exists(raw_name):
+                            pinned.write_raw(compressed_name, raw_name)
+                        raw_sha, _ = pinned.digest(raw_name)
+                        if raw_sha != segment["sha256"]:
                             raise ValueError("raw restoration path contains other evidence")
-                    else:
-                        descriptor, temporary = tempfile.mkstemp(prefix=".restore-", dir=raw.parent)
+                        prior = dict(segment)
+                        segment["path"] = str(Path(prior["path"]).with_suffix(""))
+                        segment.pop("compression")
+                        segment.pop("compressed_sha256")
+                        published = False
+                        removed = False
                         try:
-                            with os.fdopen(descriptor, "wb") as target, gzip.open(compressed, "rb") as source:
-                                shutil.copyfileobj(source, target, length=1024 * 1024)
-                                target.flush()
-                                os.fsync(target.fileno())
-                            os.chmod(temporary, 0o600)
-                            if sha256_file(temporary) != segment["sha256"]:
-                                raise ValueError("restored segment hash does not match")
-                            os.replace(temporary, raw)
-                        finally:
-                            Path(temporary).unlink(missing_ok=True)
-                    prior = dict(segment)
-                    segment["path"] = str(raw)
-                    segment.pop("compression")
-                    segment.pop("compressed_sha256")
-                    try:
-                        archive.verify_segment(segment)
-                        archive._write_manifest_locked(root_fd, manifest)
-                    except BaseException:
-                        segment.clear()
-                        segment.update(prior)
-                        raise
-                    compressed.unlink()
-                    restored.append(segment["segment_id"])
+                            pinned.assert_attached()
+                            published = True  # A write may publish before raising.
+                            archive._write_manifest_locked(root_fd, manifest)
+                            pinned.assert_attached()
+                            pinned.unlink_verified(compressed_name, compressed_sha, compressed_identity)
+                            removed = True
+                            pinned.assert_attached()
+                        except BaseException:
+                            if not removed:
+                                segment.clear()
+                                segment.update(prior)
+                                if published:
+                                    archive._write_manifest_locked(root_fd, manifest)
+                            raise
+                        restored.append(segment["segment_id"])
         return {"project_id": project_id, "restored_segments": restored}
 
     def reopen(self, project_id: str) -> dict[str, Any]:
