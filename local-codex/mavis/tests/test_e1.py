@@ -2,13 +2,14 @@ from pathlib import Path
 import hashlib
 import json
 import copy
+import importlib.util
 import signal
 import subprocess
 import tempfile
 import unittest
 from unittest.mock import patch
 
-from mavis import e1_bootstrap
+from mavis import e1_bootstrap, e1_bootstrap_gateway
 from mavis.e1 import E1Runner
 from mavis.evaluations import E0_CASES
 from mavis.experiments import (
@@ -485,7 +486,7 @@ class E1RunnerTests(unittest.TestCase):
         write_json(model_path / "tokenizer_config.json", {"bos_token": "<s>"})
         (model_path / "chat_template.jinja").write_text("{{ prompt }}")
         (model_path / "model-00001.safetensors").write_bytes(b"weights-one")
-        owner = {"provider": "zai", "model": "zcode-reviewer", "harness": "zcode"}
+        owner = {"provider": "minimax", "model": "minimax/MiniMax-M3", "harness": "opencode"}
         assignment_path = self.home / "e1/bootstrap/review-assignment.json"
         review = self.home / "verifications/e1-bootstrap/main.json"
         gateway_dir = self.root / "bootstrap-gateway-job"
@@ -940,6 +941,87 @@ class E1RunnerTests(unittest.TestCase):
                 ):
                     with self.assertRaises(ValueError):
                         e1_bootstrap.validate_bootstrap(self.home)
+
+    def test_bootstrap_gateway_completion_and_terra_contract(self):
+        """Exercise the canonical gateway's real receipt and acceptance rules."""
+        self._paired_bootstrap_trials()
+        source = (Path(__file__).resolve().parents[4] / "ai-skills-dev-mavis-gateway"
+                  / "marketplace/plugins/model-gateway/lib/harness_runner.py")
+        if not source.is_file():
+            self.skipTest("canonical model gateway source is not checked out")
+        spec = importlib.util.spec_from_file_location("mavis_test_gateway_runner", source)
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+        runner = module.HarnessJobRunner(self.root / "gateway-jobs", tmux_binary="/bin/false")
+        worker = self.root / "bootstrap-gateway-job"
+        verifier_job = "review-job-terra"
+        verifier_dir = self.root / "bootstrap-terra-job"
+        verifier_dir.mkdir()
+        runner._job_dir = lambda job_id: worker if job_id == "review-job" else verifier_dir
+        self.assertEqual(module.validate_assignment(read_json(worker / "assignment.json")), [])
+        command = module.build_native_command(
+            "minimax", prompt="Review frozen E1 evidence", model="minimax/MiniMax-M3")
+        self.assertEqual(command[command.index("-m") + 1], "minimax/MiniMax-M3")
+        self.assertNotIn("-m", module.build_native_command(
+            "zcode", prompt="Review frozen E1 evidence", model="zcode-reviewer"))
+        packet = read_json(self.home / "e1/bootstrap/review-assignment.json")
+        with self.assertRaisesRegex(ValueError, "model-selected MiniMax"):
+            e1_bootstrap._gateway_arguments(
+                {**packet, "owner": {"provider": "zai", "model": "zcode-reviewer", "harness": "zcode"}},
+                self.home / "e1/bootstrap/review-assignment.json", "review-job")
+
+        write_json(worker / "meta.json", {
+            "job_id": "review-job", "lane": "minimax", "command": command})
+        status = runner.status
+        complete = lambda job_id, checks: {
+            "success": True, **runner.record_completion(job_id, check_results=checks)}
+        with self.assertRaisesRegex(ValueError, "terminal receipt"):
+            e1_bootstrap_gateway.complete_bootstrap_review(
+                self.home, status_reader=status, completer=complete)
+        write_json(worker / "receipt.json", {"job_id": "review-job", "exit_code": 0})
+        completion = e1_bootstrap_gateway.complete_bootstrap_review(
+            self.home, status_reader=status, completer=complete)
+        self.assertEqual(completion["gateway_completion"]["check_results"][
+            "independent-bootstrap-review"]["exit_code"], 0)
+        self.assertIsNotNone(runner._target_binding("review-job"))
+        self.assertFalse(status("review-job")["accepted"])
+
+        def start_terra(job_id, verifier_job_id):
+            binding = runner._target_binding(job_id)
+            self.assertEqual(verifier_job_id, verifier_job)
+            write_json(verifier_dir / "assignment.json", {
+                "lane": "terra", "verification_target": binding})
+            write_json(verifier_dir / "meta.json", {
+                "job_id": verifier_job_id, "lane": "terra", "command": ["codex", "exec"]})
+            return {"success": True, "started": True, "accepted": False,
+                    "job_id": verifier_job_id}
+
+        e1_bootstrap_gateway.start_bootstrap_verifier(self.home, starter=start_terra)
+        write_json(verifier_dir / "receipt.json", {
+            "job_id": verifier_job, "exit_code": 0})
+        write_json(verifier_dir / "report.md", {
+            "target_sha256": "0" * 64, "verdict": "accepted", "findings": "wrong target"})
+        verify = lambda job_id, verifier_job_id, report_sha: {
+            "success": True, **runner.record_verification(
+                job_id, verifier="terra", verdict="accepted",
+                evidence_sha256=report_sha, verifier_job_id=verifier_job_id)}
+        with self.assertRaisesRegex(ValueError, "not accepted"):
+            e1_bootstrap_gateway.verify_and_import_bootstrap_review(
+                self.home, status_reader=status, verifier=verify)
+        self.assertFalse(status("review-job")["accepted"])
+        write_json(verifier_dir / "report.md", {
+            "target_sha256": runner._target_binding("review-job")["target_sha256"],
+            "verdict": "accepted", "findings": "Reviewed frozen E1 evidence."})
+        result = e1_bootstrap_gateway.verify_and_import_bootstrap_review(
+            self.home, status_reader=status, verifier=verify)
+        self.assertEqual(result["review_sha256"], sha256_file(worker / "report.md"))
+        self.assertTrue(status("review-job")["accepted"])
+        output = worker / "independent-bootstrap-review.json"
+        output.write_text("tampered\n")
+        self.assertFalse(status("review-job")["accepted"])
+        with patch.object(e1_bootstrap, "harness_job_status", status):
+            with self.assertRaises(ValueError):
+                e1_bootstrap.validate_bootstrap(self.home)
 
 
     def test_bootstrap_review_checkout_rejects_stale_installed_source(self):

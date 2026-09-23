@@ -13,6 +13,8 @@ from .e1 import E1Runner
 from .e1_bootstrap import (check_bootstrap_review, create_bootstrap,
                            dispatch_bootstrap_review, import_bootstrap_review_report,
                            prepare_bootstrap_review)
+from .e1_bootstrap_gateway import (complete_bootstrap_review, start_bootstrap_verifier,
+                                   verify_and_import_bootstrap_review)
 from .experiments import ExperimentStore, review_assignment_requirements
 from .e0_tasks import prepare_small_repository
 from .evaluations import E0_CASES, E0Evaluator
@@ -172,6 +174,9 @@ def build_parser() -> argparse.ArgumentParser:
     bootstrap_dispatch.add_argument("--job-id", required=True)
     bootstrap_check = e1_sub.add_parser("bootstrap-review-check")
     bootstrap_check.add_argument("--report", required=True, type=Path)
+    e1_sub.add_parser("bootstrap-review-complete")
+    e1_sub.add_parser("bootstrap-review-verifier-start")
+    e1_sub.add_parser("bootstrap-review-verify")
     e1_sub.add_parser("bootstrap-review-import")
     bootstrap = e1_sub.add_parser("bootstrap")
     bootstrap.add_argument("--review", required=True, type=Path)
@@ -412,6 +417,12 @@ def main(argv: list[str] | None = None) -> int:
             result = dispatch_bootstrap_review(home, args.job_id)
         elif args.e1_command == "bootstrap-review-check":
             result = check_bootstrap_review(home, args.report)
+        elif args.e1_command == "bootstrap-review-complete":
+            result = complete_bootstrap_review(home)
+        elif args.e1_command == "bootstrap-review-verifier-start":
+            result = start_bootstrap_verifier(home)
+        elif args.e1_command == "bootstrap-review-verify":
+            result = verify_and_import_bootstrap_review(home)
         elif args.e1_command == "bootstrap-review-import":
             result = {"review": str(import_bootstrap_review_report(home))}
         elif args.e1_command == "bootstrap":
