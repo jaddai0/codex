@@ -104,6 +104,24 @@ class RuntimeTests(unittest.TestCase):
                     os.killpg(child.pid, signal.SIGKILL)
                 child.wait()
 
+    def test_park_retries_denied_group_probe_until_process_disappears(self):
+        with tempfile.TemporaryDirectory() as directory:
+            with socket.socket() as probe:
+                probe.bind(("127.0.0.1", 0))
+                port = probe.getsockname()[1]
+            config = RuntimeConfig(home=Path(directory),
+                                   endpoint=f"http://127.0.0.1:{port}/v1")
+            write_json(config.state_path, {"pid": 1234})
+            with patch("mavis.runtime.endpoint_alive", return_value=False), \
+                    patch("mavis.runtime._listener_pids", side_effect=[
+                        set(), set(), {os.getpid()}]), \
+                    patch("mavis.runtime.os.killpg", side_effect=[
+                        PermissionError(1, "Operation not permitted"),
+                        ProcessLookupError(3, "No such process")]), \
+                    patch("mavis.runtime.time.sleep"):
+                reservation = park_mavis_server(config, timeout=1)
+            reservation.close()
+
     def test_loaded_generation_inventory_keeps_unknown_models_visible(self):
         rows = [{"id": "embed", "loaded": True, "engine_type": "embedding"},
                 {"id": "main", "loaded": True, "engine_type": "vlm"},

@@ -646,10 +646,20 @@ def park_mavis_server(config: RuntimeConfig, *, timeout: float = 30) -> socket.s
                 break
         else:
             try:
+                # A server started by this process remains a zombie until
+                # reaped. On macOS, probing its group can then return EPERM
+                # even though the server has exited.
+                os.waitpid(pid, os.WNOHANG)
+            except ChildProcessError:
+                pass
+            try:
                 os.killpg(pid, 0)
             except ProcessLookupError:
                 if not _listener_pids(_port(config.endpoint)):
                     break
+            except PermissionError:
+                # A denied probe is not proof that the port is safe.
+                pass
         time.sleep(0.2)
     else:
         raise TimeoutError("Mavis server or a model worker remained after stop")
