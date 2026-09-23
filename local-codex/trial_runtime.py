@@ -112,6 +112,35 @@ def prepare_trial(
     gateway_env_file: Path | None = None,
     package_manifest: Path | None = None,
 ) -> Path:
+    """Prepare one arm while holding the same lease used by runtime admission."""
+    from generation_lease import generation_lease
+
+    with generation_lease(mavis_home, purpose="e1-preparation"):
+        return _prepare_trial_locked(
+            binding,
+            mavis_home=mavis_home,
+            share=share,
+            core_binary=core_binary,
+            base_url=base_url,
+            records=records,
+            gateway_root=gateway_root,
+            gateway_env_file=gateway_env_file,
+            package_manifest=package_manifest,
+        )
+
+
+def _prepare_trial_locked(
+    binding: dict,
+    *,
+    mavis_home: Path,
+    share: Path,
+    core_binary: Path,
+    base_url: str,
+    records: list[dict],
+    gateway_root: Path | None = None,
+    gateway_env_file: Path | None = None,
+    package_manifest: Path | None = None,
+) -> Path:
     record = binding["record"]
     arm, case_id = binding["arm"], binding["case_id"]
     runtime_home = binding["root"] / "runtime" / arm / case_id
@@ -489,19 +518,19 @@ def run_trial(experiment_id: str, arm: str, case_id: str, task: str) -> Path:
     )
     runtime_home = binding["root"] / "runtime" / arm / case_id
     receipt_path = binding["root"] / "trials" / arm / f"{case_id}.json"
-    _recover_incomplete_preparation(
-        runtime_home,
-        receipt_path,
-        experiment_id=experiment_id,
-        arm=arm,
-        case_id=case_id,
-    )
-    if runtime_home.exists() or receipt_path.exists():
-        raise FileExistsError("E1 trial already prepared")
     from generation_lease import generation_lease
     from launch_core import launch_trial
 
     with generation_lease(mavis_home, purpose=f"e1:{experiment_id}:{arm}:{case_id}"):
+        _recover_incomplete_preparation(
+            runtime_home,
+            receipt_path,
+            experiment_id=experiment_id,
+            arm=arm,
+            case_id=case_id,
+        )
+        if runtime_home.exists() or receipt_path.exists():
+            raise FileExistsError("E1 trial already prepared")
         if endpoint_alive(runtime.iris_endpoint):
             if any(
                 item.get("loaded") and item.get("model_type") != "embedding"
@@ -517,7 +546,7 @@ def run_trial(experiment_id: str, arm: str, case_id: str, task: str) -> Path:
         ):
             raise ValueError("E1 trial inputs changed during runtime admission")
         binding = refreshed
-        receipt = prepare_trial(
+        receipt = _prepare_trial_locked(
             binding,
             mavis_home=mavis_home,
             share=share,

@@ -35,6 +35,43 @@ def _stop_process_group(child: subprocess.Popen) -> None:
         child.wait()
 
 
+class TrialSignalGuard:
+    """Catch termination before spawn and keep it bound to the new process group."""
+
+    def __init__(self):
+        self.child: subprocess.Popen | None = None
+        self.signal: int | None = None
+        self.at: float | None = None
+        self.previous: dict[int, object] = {}
+
+    def __enter__(self):
+        for signum in (signal.SIGTERM, signal.SIGINT):
+            self.previous[signum] = signal.signal(signum, self._forward)
+        return self
+
+    def __exit__(self, _exc_type, _exc, _traceback):
+        for signum, previous in self.previous.items():
+            signal.signal(signum, previous)
+
+    def register(self, child: subprocess.Popen) -> None:
+        self.child = child
+        if self.signal is not None:
+            self._terminate_child()
+
+    def _forward(self, signum, _frame):
+        if self.signal is None:
+            self.signal = signum
+            self.at = time.monotonic()
+        self._terminate_child()
+
+    def _terminate_child(self):
+        if self.child is not None:
+            try:
+                os.killpg(self.child.pid, signal.SIGTERM)
+            except ProcessLookupError:
+                pass
+
+
 def matching_trial_transcript(path: Path, runtime_home: Path, session_id: str) -> Path:
     home = runtime_home.resolve(strict=True)
     transcript = path.resolve(strict=True)
@@ -170,6 +207,13 @@ def launch_trial(
 
 
 def _launch_trial_unlocked(receipt_path: Path, argv: list[str]) -> int:
+    with TrialSignalGuard() as guard:
+        return _launch_trial_guarded(receipt_path, argv, guard)
+
+
+def _launch_trial_guarded(
+    receipt_path: Path, argv: list[str], guard: TrialSignalGuard
+) -> int:
     from trial_runtime import validate_trial_receipt
 
     if not argv:
@@ -217,6 +261,19 @@ def _launch_trial_unlocked(receipt_path: Path, argv: list[str]) -> int:
         Path(receipt["stdout_path"]).open("xb") as stdout,
         Path(receipt["stderr_path"]).open("xb") as stderr,
     ):
+        if guard.signal is not None:
+            receipt.update(
+                {
+                    "state": "terminated",
+                    "termination_signal": guard.signal,
+                    "observation_status": "inconclusive",
+                    "observation_error": "interrupted before core spawn",
+                }
+            )
+            atomic_write(
+                receipt_path, json.dumps(receipt, indent=2, sort_keys=True) + "\n"
+            )
+            return 2
         child = subprocess.Popen(
             launch_argv,
             cwd=checkout,
@@ -225,6 +282,7 @@ def _launch_trial_unlocked(receipt_path: Path, argv: list[str]) -> int:
             stderr=stderr,
             start_new_session=True,
         )
+        guard.register(child)
         receipt.update(
             {
                 "state": "spawned",
@@ -239,32 +297,13 @@ def _launch_trial_unlocked(receipt_path: Path, argv: list[str]) -> int:
         except BaseException:
             _stop_process_group(child)
             raise
-        terminated_signal = None
-        terminated_at = None
-        previous_handlers = {}
-
-        def forward(signum, _frame):
-            nonlocal terminated_signal, terminated_at
-            if terminated_signal is None:
-                terminated_signal = signum
-                terminated_at = time.monotonic()
-            try:
-                os.killpg(child.pid, signal.SIGTERM)
-            except ProcessLookupError:
-                pass
-
-        for signum in (signal.SIGINT, signal.SIGTERM):
-            previous_handlers[signum] = signal.signal(signum, forward)
         try:
             while True:
                 try:
                     exit_code = child.wait(timeout=0.2)
                     break
                 except subprocess.TimeoutExpired:
-                    if (
-                        terminated_at is not None
-                        and time.monotonic() - terminated_at >= 5
-                    ):
+                    if guard.at is not None and time.monotonic() - guard.at >= 5:
                         try:
                             os.killpg(child.pid, signal.SIGKILL)
                         except ProcessLookupError:
@@ -274,9 +313,7 @@ def _launch_trial_unlocked(receipt_path: Path, argv: list[str]) -> int:
         except BaseException:
             _stop_process_group(child)
             raise
-        finally:
-            for signum, old in previous_handlers.items():
-                signal.signal(signum, old)
+        terminated_signal = guard.signal
     receipt.update(
         {
             "state": "terminated" if terminated_signal is not None else "exited",
@@ -336,6 +373,15 @@ def _launch_trial_unlocked(receipt_path: Path, argv: list[str]) -> int:
         receipt.update(
             {"observation_status": "inconclusive", "observation_error": str(error)}
         )
+    if guard.signal is not None:
+        receipt.update(
+            {
+                "state": "terminated",
+                "termination_signal": guard.signal,
+                "observation_status": "inconclusive",
+                "observation_error": "E1 wrapper was interrupted",
+            }
+        )
     atomic_write(receipt_path, json.dumps(receipt, indent=2, sort_keys=True) + "\n")
     return (
         exit_code
@@ -343,6 +389,7 @@ def _launch_trial_unlocked(receipt_path: Path, argv: list[str]) -> int:
             exit_code == 0
             and receipt["observation_status"] == "matched_startup_config"
             and "checkout_observation_error" not in receipt
+            and guard.signal is None
         )
         else 2
     )
