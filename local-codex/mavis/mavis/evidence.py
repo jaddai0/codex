@@ -21,11 +21,13 @@ FAIL_MARKERS = (
     re.compile(r"\bnot ok\b", re.IGNORECASE),
     re.compile(r"Traceback \(most recent call last\)"),
 )
-PASS_MARKERS = (
-    re.compile(r"\bOK\b"),
-    re.compile(r"\b[1-9][0-9]* passed\b", re.IGNORECASE),
-    re.compile(r"\bok\b", re.IGNORECASE),
+INCOMPLETE_MARKERS = (
+    re.compile(r"\bRan\s+0\s+tests?\b", re.IGNORECASE),
+    re.compile(r"\b(?:no tests ran|collected 0 items|run interrupted before tests)\b", re.IGNORECASE),
 )
+PASS_COUNT = re.compile(r"\b[1-9][0-9]* passed\b", re.IGNORECASE)
+UNITTEST_COUNT = re.compile(r"(?m)^Ran\s+[1-9][0-9]*\s+tests?\s+in\s+[0-9.]+s\s*$")
+UNITTEST_OK = re.compile(r"(?m)^OK(?:\s+\(skipped=[0-9]+\))?\s*$")
 
 
 def _now() -> str:
@@ -49,7 +51,9 @@ def parse_test_output(text: str, exit_status: int, timed_out: bool = False) -> s
         return "incomplete"
     if exit_status != 0 or any(marker.search(text) for marker in FAIL_MARKERS):
         return "fail"
-    if any(marker.search(text) for marker in PASS_MARKERS):
+    if any(marker.search(text) for marker in INCOMPLETE_MARKERS):
+        return "incomplete"
+    if PASS_COUNT.search(text) or (UNITTEST_COUNT.search(text) and UNITTEST_OK.search(text)):
         return "pass"
     return "uncertain"
 

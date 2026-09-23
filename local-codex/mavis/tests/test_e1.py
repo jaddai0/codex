@@ -56,7 +56,7 @@ class E1RunnerTests(unittest.TestCase):
             "argv": [
                 "python3",
                 "-c",
-                "from pathlib import Path; import sys; good=Path('result.txt').read_text().strip()=='pass'; print('OK' if good else 'FAILED'); sys.exit(0 if good else 1)",
+                "from pathlib import Path; import sys; good=Path('result.txt').read_text().strip()=='pass'; print('1 passed' if good else 'FAILED'); sys.exit(0 if good else 1)",
             ],
             "timeout_seconds": 10,
         }
