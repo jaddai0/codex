@@ -1778,6 +1778,17 @@ impl Session {
             let initial_messages = initial_history.get_event_msgs();
             let thread_config =
                 session_configuration.thread_config_snapshot(turn_environments.selections());
+            let mavis_rollout_path = rollout_path.as_ref().map(|path| path.display().to_string());
+            crate::mavis_trial_observation::emit_if_requested(
+                &config.codex_home.to_path_buf(),
+                config.model_catalog.as_ref(),
+                &session_configuration.base_instructions,
+                session_id,
+                thread_id,
+                &thread_config.model,
+                &thread_config.model_provider_id,
+                mavis_rollout_path.as_deref(),
+            )?;
             let events = std::iter::once(Event {
                 id: INITIAL_SUBMIT_ID.to_owned(),
                 msg: EventMsg::SessionConfigured(SessionConfiguredEvent {
