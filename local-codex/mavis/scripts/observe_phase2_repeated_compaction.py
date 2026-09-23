@@ -305,9 +305,9 @@ def main() -> int:
                     "-qm", "fixture"], check=True)
     fact = f"P2_{uuid.uuid4().hex}=sqlite-before-postgres"
     prompts = (
-        f"Record this early design decision for project P2: {fact}. Reply only ACK1.",
-        "Continue this project after the first compaction. Reply only ACK2.",
-        "What was the exact early design decision for project P2? Reply with only its full value.",
+        f"Remember this exact early design decision for project P2: {fact}. Do not edit files. Reply only ACK1.",
+        "The first compaction is complete. Do not edit files. Reply only ACK2.",
+        "What was the exact early design decision for project P2? Do not edit files. Reply with only its full value.",
     )
     answers = ("ACK1", "ACK2", fact)
     sessions = home / ".local-codex" / "sessions"
