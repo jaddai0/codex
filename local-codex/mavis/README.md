@@ -26,6 +26,17 @@ The command exits nonzero and records `reject` until all ten mandatory cases
 have real receipts. Missing local-model or native-harness work is reported as
 blocked rather than replaced with synthetic success.
 
+## Architecture boundary check
+
+Run `PYTHONPATH=local-codex/mavis python3 -m mavis.architecture` from the fork
+root when Mavis code or dependencies change. The command exits nonzero for a
+provider SDK dependency/import, a provider catalog, or an HTTP transport outside
+the three reviewed local oMLX adapters. It parses Python syntax and the project
+manifest, so comments and documentation do not trigger findings. Its allowlist
+is in `mavis/architecture.py`; changes to a local adapter should review both
+that list and the adapter's loopback URL validation. This check is a source
+guard; runtime endpoint and installed-service acceptance remain separate.
+
 ## Source-only experiment lifecycle
 
 `mavis.experiments.ExperimentStore` keeps prompt, tool-setting, and retrieval

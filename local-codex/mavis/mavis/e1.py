@@ -639,6 +639,7 @@ class E1Runner:
                 or _git(checkout, "rev-parse", "HEAD") != case["revision"]
                 or _git(checkout, "status", "--porcelain")):
             raise ValueError("candidate checkout is not clean at its frozen revision")
+        # Translate this pinned lane for a single assignment; the gateway owns discovery.
         provider, harness = "minimax", "opencode"
         requirements = candidate_assignment_requirements(record)
         arguments = {
