@@ -41,7 +41,7 @@ class RuntimeTests(unittest.TestCase):
 
     def test_handoff_refuses_active_or_uncertain_iris_work(self):
         config = RuntimeConfig(home=Path("/tmp/mavis-handoff-test"))
-        idle = {"status": "ok", "loaded_models": [config.model],
+        idle = {"status": "ok", "loaded_models": [config.model], "models_loading": 0,
                 "active_requests": 0, "waiting_requests": 0}
         with patch("mavis.runtime.request_json", side_effect=[idle, idle]) as reader, \
                 patch("mavis.runtime.loaded_generation_models", return_value=[config.model]), \
@@ -49,7 +49,8 @@ class RuntimeTests(unittest.TestCase):
             require_idle_iris_handoff(config)
             self.assertEqual(reader.call_count, 2)
         for changed in ({"active_requests": 1}, {"waiting_requests": 1},
-                        {"loaded_models": []}, {"active_requests": None}):
+                        {"loaded_models": []}, {"active_requests": None},
+                        {"models_loading": 1}):
             with self.subTest(changed=changed), patch(
                 "mavis.runtime.request_json", return_value={**idle, **changed}
             ), self.assertRaisesRegex(RuntimeError, "handoff refused"):

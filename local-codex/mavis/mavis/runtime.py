@@ -98,6 +98,8 @@ def require_idle_iris_handoff(config: RuntimeConfig, *, interval_seconds: float 
         if (not isinstance(status, dict) or status.get("status") != "ok"
             or not isinstance(status.get("loaded_models"), list)
             or config.model not in status["loaded_models"]
+            or type(status.get("models_loading")) is not int
+            or status["models_loading"] != 0
             or type(status.get("active_requests")) is not int
             or type(status.get("waiting_requests")) is not int
             or status["active_requests"] != 0

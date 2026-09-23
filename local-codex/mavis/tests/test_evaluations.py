@@ -182,7 +182,10 @@ class E0EvaluationTests(unittest.TestCase):
             self.assertEqual(set(summary["case_receipts"]), set(E0_CASES))
             for case in E0_CASES:
                 self.assertEqual(summary["case_receipts"][case],
-                                 sha256_file(evaluator.root / f"{case}.json"))
+                                 sha256_file(evaluator.root / "runs" /
+                                             summary["run_id"] / f"{case}.json"))
+            self.assertEqual(json.loads((evaluator.root / "runs" / summary["run_id"] /
+                                         "summary.json").read_text()), summary)
 
     def test_buried_failure_and_compaction_require_live_receipts(self):
         with tempfile.TemporaryDirectory() as directory:

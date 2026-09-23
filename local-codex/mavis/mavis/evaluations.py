@@ -202,6 +202,7 @@ class E0Evaluator:
         self.home = Path(home)
         self.config = config
         self.root = self.home / "evaluations" / "e0"
+        self._run_root: Path | None = None
 
     def _receipt(self, case: str, status: str, evidence: list[str], **extra: Any) -> dict[str, Any]:
         if case not in E0_CASES:
@@ -216,6 +217,8 @@ class E0Evaluator:
             **extra,
         }
         write_json(self.root / f"{case}.json", payload)
+        if self._run_root is not None:
+            write_json(self._run_root / f"{case}.json", payload)
         return payload
 
     @contextmanager
@@ -365,25 +368,32 @@ class E0Evaluator:
         if not re.fullmatch(r"[0-9a-f]{32}", run_id):
             raise ValueError("E0 run ID must be 32 lowercase hexadecimal characters")
         with self._suite_lock():
-            results = [self._run_case_unlocked(item) for item in E0_CASES]
-            passed = len(results) == len(E0_CASES) and all(item["status"] == "pass" for item in results)
-            summary = {
-                "schema_version": "mavis.evaluation-suite/v1",
-                "suite": "e0",
-                "run_id": run_id,
-                "status": "pass" if passed else "reject",
-                "mandatory_cases": list(E0_CASES),
-                "results": [{"case": item["case"], "status": item["status"]} for item in results],
-                "observed_at": _now(),
-            }
-            if passed:
-                summary["installed_candidate"] = installed_candidate_fingerprint()
-                summary["model_id"] = self.config.model
-                summary["case_receipts"] = {
-                    item: sha256_file(self.root / f"{item}.json") for item in E0_CASES
+            self._run_root = self.root / "runs" / run_id
+            if self._run_root.exists():
+                raise FileExistsError("E0 run ID already exists")
+            try:
+                results = [self._run_case_unlocked(item) for item in E0_CASES]
+                passed = len(results) == len(E0_CASES) and all(item["status"] == "pass" for item in results)
+                summary = {
+                    "schema_version": "mavis.evaluation-suite/v1",
+                    "suite": "e0",
+                    "run_id": run_id,
+                    "status": "pass" if passed else "reject",
+                    "mandatory_cases": list(E0_CASES),
+                    "results": [{"case": item["case"], "status": item["status"]} for item in results],
+                    "observed_at": _now(),
                 }
-            write_json(self.root / "summary.json", summary)
-            return summary
+                if passed:
+                    summary["installed_candidate"] = installed_candidate_fingerprint()
+                    summary["model_id"] = self.config.model
+                    summary["case_receipts"] = {
+                        item: sha256_file(self._run_root / f"{item}.json") for item in E0_CASES
+                    }
+                write_json(self._run_root / "summary.json", summary)
+                write_json(self.root / "summary.json", summary)
+                return summary
+            finally:
+                self._run_root = None
 
     def _tool_roundtrip(self) -> dict[str, Any]:
         if not endpoint_alive(self.config.endpoint):
