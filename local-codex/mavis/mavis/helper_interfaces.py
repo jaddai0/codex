@@ -21,10 +21,14 @@ class LibrarianEvidence:
     def __init__(self, archive: TranscriptArchive):
         self.archive = archive
 
-    def search(self, query: str, limit: int = 20) -> list[dict[str, Any]]:
+    def search(
+        self, query: str, limit: int = 20, offset: int = 0
+    ) -> list[dict[str, Any]]:
         if not 1 <= limit <= 200:
             raise ValueError("limit must be 1..200")
-        return self.archive.search(query, limit=limit)
+        if type(offset) is not int or offset < 0:
+            raise ValueError("offset must be nonnegative")
+        return self.archive.search(query, limit=limit, offset=offset)
 
     def validate_answer(
         self, answer: dict[str, Any], evidence: list[dict[str, Any]]

@@ -4,11 +4,36 @@ import subprocess
 import sys
 import tempfile
 import unittest
+from unittest.mock import patch
 
 from mavis.transcripts import TranscriptArchive
 
 
 class TranscriptArchiveTests(unittest.TestCase):
+    def test_search_stops_scanning_after_page_but_verifies_later_segments(self):
+        with tempfile.TemporaryDirectory() as directory:
+            archive = TranscriptArchive(Path(directory), "conversation-1")
+            first = archive.append_segment(
+                [{"role": "user", "content": "decision first"}]
+            )
+            later = archive.append_segment(
+                [{"role": "user", "content": "decision later"}]
+            )
+            original = Path.read_text
+
+            def no_later_scan(path, *args, **kwargs):
+                if path.resolve() == later.resolve():
+                    raise AssertionError("later segment content was scanned after page filled")
+                return original(path, *args, **kwargs)
+
+            with patch.object(Path, "read_text", no_later_scan):
+                page = archive.search("decision", limit=1)
+            self.assertEqual(Path(page[0]["path"]).resolve(), first.resolve())
+            self.assertIn("decision later", archive.search("decision", offset=1)[0]["text"])
+            later.write_text("changed\n", encoding="utf-8")
+            with self.assertRaisesRegex(ValueError, "missing or changed"):
+                archive.search("decision", limit=1)
+
     def test_parallel_rollout_imports_publish_one_segment(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
@@ -116,6 +141,55 @@ class TranscriptArchiveTests(unittest.TestCase):
             )
             with self.assertRaisesRegex(ValueError, "missing or changed"):
                 archive.search("decision")
+
+    def test_search_pagination_page1_and_page2(self):
+        with tempfile.TemporaryDirectory() as directory:
+            archive = TranscriptArchive(Path(directory), "conversation-1")
+            archive.append_segment(
+                [
+                    {"role": "user", "content": "line one decision alpha"},
+                    {"role": "user", "content": "line two decision beta"},
+                    {"role": "user", "content": "line three decision gamma"},
+                ]
+            )
+            all_results = archive.search("decision")
+            self.assertEqual(len(all_results), 3)
+            page1 = archive.search("decision", limit=2, offset=0)
+            self.assertEqual(len(page1), 2)
+            self.assertIn("decision", page1[0]["text"])
+            self.assertIn("decision", page1[1]["text"])
+            page2 = archive.search("decision", limit=2, offset=2)
+            self.assertEqual(len(page2), 1)
+            self.assertIn("decision", page2[0]["text"])
+
+    def test_search_offset_beyond_results_returns_empty(self):
+        with tempfile.TemporaryDirectory() as directory:
+            archive = TranscriptArchive(Path(directory), "conversation-1")
+            archive.append_segment(
+                [{"role": "user", "content": "single decision point"}]
+            )
+            results = archive.search("decision", limit=10, offset=100)
+            self.assertEqual(results, [])
+
+    def test_search_invalid_negative_offset_raises(self):
+        with tempfile.TemporaryDirectory() as directory:
+            archive = TranscriptArchive(Path(directory), "conversation-1")
+            archive.append_segment(
+                [{"role": "user", "content": "decision one"}]
+            )
+            with self.assertRaisesRegex(ValueError, "nonnegative"):
+                archive.search("decision", offset=-1)
+
+    def test_search_invalid_limit_out_of_range_raises(self):
+        with tempfile.TemporaryDirectory() as directory:
+            archive = TranscriptArchive(Path(directory), "conversation-1")
+            archive.append_segment(
+                [{"role": "user", "content": "decision one"}]
+            )
+            with self.assertRaisesRegex(ValueError, "limit must be 1..200"):
+                archive.search("decision", limit=0)
+            with self.assertRaisesRegex(ValueError, "limit must be 1..200"):
+                archive.search("decision", limit=201)
 
 
 if __name__ == "__main__":
