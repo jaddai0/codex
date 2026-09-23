@@ -10,9 +10,15 @@ model_args=()
 gateway_env_args=()
 
 case "${1:-}" in
-  runtime|objective|run|output|archive-search|archive-retention|storage-pressure|pre-compact|project-index|project-memory|eval|e1|maintenance)
+  runtime|objective|run|output|archive-search|archive-retention|storage-pressure|pre-compact|project-evidence|project-index|project-memory|eval|e1|maintenance)
   export CODEX_HOME=${CODEX_HOME:-$runtime_home}
   export MAVIS_HOME=${MAVIS_HOME:-${HOME}/.local-codex/mavis-service}
+  if [[ -z ${MAVIS_PROJECT_ROOT:-} ]]; then
+    project_root=$(git rev-parse --show-toplevel 2>/dev/null || true)
+    if [[ -n "$project_root" && "$project_root" != "$HOME" ]]; then
+      export MAVIS_PROJECT_ROOT="$project_root"
+    fi
+  fi
   if [[ "$MAVIS_HOME" != /* ]]; then
     print -u2 "mavis: MAVIS_HOME must be an absolute path"
     exit 2
@@ -56,6 +62,12 @@ if [[ ! -x "$core_binary" ]]; then
 fi
 
 export MAVIS_HOME=${MAVIS_HOME:-${HOME}/.local-codex/mavis-service}
+if [[ -z ${MAVIS_PROJECT_ROOT:-} ]]; then
+  project_root=$(git rev-parse --show-toplevel 2>/dev/null || true)
+  if [[ -n "$project_root" && "$project_root" != "$HOME" ]]; then
+    export MAVIS_PROJECT_ROOT="$project_root"
+  fi
+fi
 if [[ "$MAVIS_HOME" != /* ]]; then
   print -u2 "mavis: MAVIS_HOME must be an absolute path"
   exit 2

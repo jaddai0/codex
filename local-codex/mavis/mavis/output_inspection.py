@@ -20,6 +20,7 @@ from .helper_eval import (
 )
 from .helper_interfaces import OutputReader
 from .objectives import _validate_receipt
+from .project_evidence import project_home
 from .runtime import inventory, request_json
 from .storage import read_json, require_safe_id, sha256_file
 
@@ -28,8 +29,13 @@ def _verified_receipt(home: Path, receipt_path: Path) -> tuple[Path, dict[str, A
     path = Path(receipt_path).resolve(strict=True)
     receipt = read_json(path)
     objective_id = require_safe_id(receipt.get("objective_id"), "objective id")
-    evidence_root = (Path(home) / "evidence" / objective_id).resolve()
-    if path.name != "receipt.json" or path.parent.parent != evidence_root:
+    evidence_root = path.parent.parent
+    service_root = (Path(home) / "evidence" / objective_id).resolve()
+    project_root = evidence_root.parent.parent
+    local_root = None
+    if project_root.name == ".mavis":
+        local_root = project_home(project_root.parent) / "evidence" / objective_id
+    if path.name != "receipt.json" or evidence_root not in {service_root, local_root}:
         raise ValueError("output inspection requires a host receipt under Mavis evidence")
     if path.parent.name != receipt.get("receipt_id"):
         raise ValueError("receipt ID does not match its evidence directory")
