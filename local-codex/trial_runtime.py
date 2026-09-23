@@ -11,8 +11,10 @@ import re
 import shutil
 import subprocess
 import sys
+import tomllib
 
 from mavis.e1 import E1Runner, _clean_revision
+from mavis.e1_bootstrap import _inventory_model, validate_bootstrap
 from mavis.package_provenance import package_tree_sha256
 from mavis.runtime import RuntimeConfig, endpoint_alive, ensure_runtime, inventory
 from mavis.storage import read_json, require_safe_id, sha256_file
@@ -68,9 +70,12 @@ def trial_binding(mavis_home: Path, experiment_id: str, arm: str, case_id: str) 
     if active["configuration"] != record["baseline"]:
         raise ValueError("E1 baseline no longer matches active configuration")
     profile = accepted_main_profile(mavis_home)
+    profile_source = "accepted-main"
+    if profile is None:
+        profile = validate_bootstrap(mavis_home)
+        profile_source = "e0-bootstrap"
     if (
-        profile is None
-        or {"prompts": profile["prompts"], "tool_settings": {}, "retrieval": {}}
+        {"prompts": profile["prompts"], "tool_settings": {}, "retrieval": {}}
         != baseline
     ):
         raise ValueError("E1 baseline no longer matches accepted main profile")
@@ -92,6 +97,7 @@ def trial_binding(mavis_home: Path, experiment_id: str, arm: str, case_id: str) 
         "manifest": manifest,
         "case": case,
         "profile": profile,
+        "profile_source": profile_source,
         "snapshot": record[arm],
         "configuration": baseline if arm == "baseline" else candidate,
         "root": root,
@@ -142,6 +148,17 @@ def _prepare_trial_locked(
     gateway_env_file: Path | None = None,
     package_manifest: Path | None = None,
 ) -> Path:
+    if binding["profile_source"] == "e0-bootstrap":
+        refreshed = trial_binding(mavis_home, binding["record"]["experiment_id"],
+                                  binding["arm"], binding["case_id"])
+        if (refreshed["profile_source"] != "e0-bootstrap"
+                or refreshed["profile"]["_source_sha256"] != binding["profile"]["_source_sha256"]):
+            raise ValueError("E1 bootstrap changed before trial preparation")
+        observed_model_path = _inventory_model(
+            records, binding["profile"]["model_identity"]["model_id"]
+        ).resolve(strict=True)
+        if str(observed_model_path) != binding["profile"]["model_artifacts"]["model_path"]:
+            raise ValueError("E1 bootstrap oMLX inventory model_path changed")
     record = binding["record"]
     arm, case_id = binding["arm"], binding["case_id"]
     runtime_home = binding["root"] / "runtime" / arm / case_id
@@ -321,9 +338,12 @@ def _write_trial_home(
         "manifest_sha256": record["workload"]["manifest_sha256"],
         "snapshot_path": binding["snapshot"]["path"],
         "snapshot_sha256": binding["snapshot"]["sha256"],
-        "accepted_profile_id": binding["profile"]["profile_id"],
-        "accepted_profile_path": binding["profile"]["_source_path"],
-        "accepted_profile_sha256": binding["profile"]["_source_sha256"],
+        "profile_source": binding["profile_source"],
+        "accepted_profile_id": binding["profile"]["profile_id"] if binding["profile_source"] == "accepted-main" else None,
+        "accepted_profile_path": binding["profile"]["_source_path"] if binding["profile_source"] == "accepted-main" else None,
+        "accepted_profile_sha256": binding["profile"]["_source_sha256"] if binding["profile_source"] == "accepted-main" else None,
+        "bootstrap_receipt_path": binding["profile"]["_source_path"] if binding["profile_source"] == "e0-bootstrap" else None,
+        "bootstrap_receipt_sha256": binding["profile"]["_source_sha256"] if binding["profile_source"] == "e0-bootstrap" else None,
         "checkout": str(binding["checkout"].resolve()),
         "starting_revision": binding["case"]["revision"],
         "runtime_home": str(runtime_home.resolve()),
@@ -349,6 +369,7 @@ def _write_trial_home(
         else None,
         "selected_model": selected,
         "model_provider": "omlx",
+        "model_endpoint": local_base_url(base_url),
         "config_path": str((runtime_home / "config.toml").resolve()),
         "config_sha256": sha256_file(runtime_home / "config.toml"),
         "catalog_path": str(catalog_path.resolve()),
@@ -377,12 +398,22 @@ def validate_trial_receipt(receipt: dict) -> None:
         home, receipt["experiment_id"], receipt["arm"], receipt["case_id"]
     )
     profile = binding["profile"]
+    if receipt.get("profile_source", "accepted-main") != binding["profile_source"]:
+        raise ValueError("E1 trial profile source changed")
+    if binding["profile_source"] == "e0-bootstrap":
+        if (receipt.get("accepted_profile_id") is not None
+                or receipt.get("accepted_profile_path") is not None
+                or receipt.get("accepted_profile_sha256") is not None
+                or receipt.get("bootstrap_receipt_path") != profile["_source_path"]
+                or receipt.get("bootstrap_receipt_sha256") != profile["_source_sha256"]):
+            raise ValueError("E1 trial bootstrap receipt changed")
+    elif (receipt.get("accepted_profile_sha256") != profile["_source_sha256"]
+          or receipt.get("accepted_profile_id") != profile["profile_id"]):
+        raise ValueError("E1 trial accepted profile changed")
     if (
         receipt["manifest_sha256"] != binding["record"]["workload"]["manifest_sha256"]
         or receipt["snapshot_path"] != binding["snapshot"]["path"]
         or receipt["snapshot_sha256"] != binding["snapshot"]["sha256"]
-        or receipt["accepted_profile_sha256"] != profile["_source_sha256"]
-        or receipt["accepted_profile_id"] != profile["profile_id"]
         or receipt["checkout"] != str(binding["checkout"].resolve())
         or receipt["starting_revision"] != binding["case"]["revision"]
         or receipt["selected_model"] != profile["model_identity"]["model_id"]
@@ -416,6 +447,14 @@ def validate_trial_receipt(receipt: dict) -> None:
         path_key = "core_binary" if name == "core" else f"{name}_path"
         if sha256_file(Path(receipt[path_key])) != receipt[f"{name}_sha256"]:
             raise ValueError(f"E1 trial {name} changed after preparation")
+    if binding["profile_source"] == "e0-bootstrap":
+        config = tomllib.loads(Path(receipt["config_path"]).read_text(encoding="utf-8"))
+        endpoint = config["model_providers"]["omlx"]["base_url"]
+        if receipt.get("model_endpoint") != endpoint or local_base_url(endpoint) != endpoint:
+            raise ValueError("E1 bootstrap model endpoint changed")
+        model_path = _inventory_model(inventory(endpoint), receipt["selected_model"]).resolve(strict=True)
+        if str(model_path) != profile["model_artifacts"]["model_path"]:
+            raise ValueError("E1 bootstrap oMLX inventory model_path changed before launch")
     if receipt.get("core_provenance") == "installed-package" and not receipt.get(
         "package_manifest"
     ):
