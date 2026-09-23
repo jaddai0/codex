@@ -61,6 +61,30 @@ def _now() -> str:
     return datetime.now(timezone.utc).isoformat()
 
 
+def _trusted_raw_output_path(raw: Path, repo: Path, service_home: Path) -> bool:
+    """Accept retained service-home references and ignored project-local capture."""
+    if raw.parent == service_home / "tool-output":
+        return raw.is_file()
+    state = repo.resolve() / ".mavis"
+    if not raw.is_file() or any(path.is_symlink() for path in
+                                (state, state / ".gitignore", raw.parent, raw)):
+        return False
+    if raw.parent.resolve() != state / "tool-output":
+        return False
+    git_env = {name: value for name, value in os.environ.items() if name not in
+               {"GIT_DIR", "GIT_WORK_TREE", "GIT_COMMON_DIR", "GIT_INDEX_FILE", "GIT_PREFIX"}}
+    git_root = subprocess.run(["git", "rev-parse", "--show-toplevel"], cwd=repo,
+                              text=True, stdout=subprocess.PIPE,
+                              stderr=subprocess.DEVNULL, env=git_env, check=False)
+    if git_root.returncode != 0 or Path(git_root.stdout.strip()).resolve() != repo.resolve():
+        return False
+    ignored = subprocess.run(
+        ["git", "check-ignore", "-q", "--", ".mavis/tool-output/probe.raw"],
+        cwd=repo, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+        env=git_env, check=False)
+    return ignored.returncode == 0
+
+
 def installed_candidate_fingerprint() -> dict[str, str]:
     """Bind E0 live work to every installed executable that prepares Mavis."""
     overrides = [name for name in E0_RUNTIME_OVERRIDES if os.environ.get(name)]
@@ -617,7 +641,7 @@ class E0Evaluator:
             if match is None:
                 continue
             raw = Path(match.group(1))
-            if raw.parent != self.home / "tool-output" or not raw.is_file():
+            if not _trusted_raw_output_path(raw, repo, self.home):
                 continue
             content = raw.read_bytes()
             if len(content) != int(match.group(2)):

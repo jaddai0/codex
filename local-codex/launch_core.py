@@ -112,9 +112,60 @@ def check_profile_cli_arguments(arguments: list[str]) -> None:
             raise ValueError(f"{argument} can override an accepted main profile")
 
 
+def bind_project_root(argv: list[str]) -> Path | None:
+    """Bind one launch to its effective checkout before any model preparation."""
+    core_args = argv[1:]
+    selected: list[str] = []
+    index = 0
+    while index < len(core_args):
+        argument = core_args[index]
+        if argument == "--":
+            break
+        if argument in ("-C", "--cd"):
+            if index + 1 >= len(core_args) or not core_args[index + 1]:
+                raise ValueError("Mavis -C/--cd requires a directory")
+            selected.append(core_args[index + 1])
+            index += 2
+            continue
+        elif argument.startswith("--cd="):
+            selected.append(argument.removeprefix("--cd="))
+        elif argument.startswith("-C="):
+            selected.append(argument.removeprefix("-C="))
+        elif argument.startswith("-C") and argument != "-C":
+            selected.append(argument[2:])
+        index += 1
+    if len(selected) > 1:
+        raise ValueError("Mavis project directory is ambiguous")
+    explicit_dir = os.environ.get("MAVIS_PROJECT_DIR")
+    anchor = Path(selected[0] if selected else explicit_dir or os.getcwd()).resolve(strict=True)
+    if not anchor.is_dir():
+        raise ValueError("Mavis project directory is not a directory")
+    if explicit_dir and selected and Path(explicit_dir).resolve(strict=True) != anchor:
+        raise ValueError("MAVIS_PROJECT_DIR differs from -C/--cd")
+    git_env = {name: value for name, value in os.environ.items() if name not in
+               {"GIT_DIR", "GIT_WORK_TREE", "GIT_COMMON_DIR", "GIT_INDEX_FILE", "GIT_PREFIX"}}
+    git = subprocess.run(
+        ["git", "rev-parse", "--show-toplevel"], cwd=anchor, text=True,
+        stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, env=git_env, check=False,
+    )
+    user_home = Path.home().resolve(strict=True)
+    root = Path(git.stdout.strip()).resolve(strict=True) if git.returncode == 0 else None
+    if root == user_home:
+        root = None
+    inherited = os.environ.get("MAVIS_PROJECT_ROOT")
+    if inherited and (root is None or Path(inherited).resolve(strict=True) != root):
+        raise ValueError("MAVIS_PROJECT_ROOT differs from the effective checkout")
+    if root is None:
+        os.environ.pop("MAVIS_PROJECT_ROOT", None)
+    else:
+        os.environ["MAVIS_PROJECT_ROOT"] = str(root)
+    return root
+
+
 def launch(
     receipt_path: Path | None, argv: list[str], *, mavis_home: Path | None = None
 ) -> int:
+    bind_project_root(argv)
     if receipt_path is not None:
         receipt = json.loads(receipt_path.read_text(encoding="utf-8"))
         with generation_lease(Path(receipt["mavis_home"]), purpose="accepted-main"):
@@ -167,6 +218,7 @@ def managed_launch(args: argparse.Namespace, argv: list[str]) -> int:
     """Hold the host lease through model preparation and the whole core session."""
     if not argv:
         raise ValueError("core binary is required")
+    bind_project_root(argv)
     needed = (
         "share_dir", "home", "mavis_home", "base_url", "iris_endpoint",
         "model_dir", "omlx_binary", "gateway_root",
@@ -362,6 +414,9 @@ def _launch_trial_guarded(
         os.pathsep + environment["PYTHONPATH"] if environment.get("PYTHONPATH") else ""
     )
     checkout = Path(receipt["checkout"])
+    # The frozen trial checkout owns its raw tool output even when launched elsewhere.
+    environment["MAVIS_PROJECT_ROOT"] = str(checkout.resolve(strict=True))
+    environment["MAVIS_PROJECT_DIR"] = environment["MAVIS_PROJECT_ROOT"]
     with (
         Path(receipt["stdout_path"]).open("xb") as stdout,
         Path(receipt["stderr_path"]).open("xb") as stderr,
