@@ -81,10 +81,22 @@ class LibrarianEvidence:
 
 
 FAILURE_LINE = re.compile(r"\b(?:FAILED|ERROR|FAIL|not ok|Traceback)\b", re.IGNORECASE)
+ZERO_FAILURE_COUNT = re.compile(r"\b0\s+(?:failed|errors?)\b", re.IGNORECASE)
+POSITIVE_FAILURE_COUNT = re.compile(r"\b[1-9]\d*\s+(?:failed|errors?)\b", re.IGNORECASE)
 COUNT = re.compile(
     r"\b(?:\d+\s+(?:passed|failed|errors?|tests?|skipped)|Ran\s+\d+\s+tests?)\b",
     re.IGNORECASE,
 )
+
+
+def _is_failure_line(line: str) -> bool:
+    # Known test summaries may report "0 failed" beside a passing count.
+    # Strip only those zero counts; an explicit marker or positive count on
+    # the same line still signals failure.
+    return bool(
+        POSITIVE_FAILURE_COUNT.search(line)
+        or FAILURE_LINE.search(ZERO_FAILURE_COUNT.sub("", line))
+    )
 
 
 class OutputReader:
@@ -118,7 +130,7 @@ class OutputReader:
         failures = [
             {"line": index, "text": line}
             for index, line in enumerate(lines, 1)
-            if FAILURE_LINE.search(line)
+            if _is_failure_line(line)
         ]
         counts = [
             {"line": index, "text": line}
