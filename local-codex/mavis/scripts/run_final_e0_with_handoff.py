@@ -63,6 +63,7 @@ def main() -> int:
         env.pop(key, None)
     env["PYTHONPATH"] = str(share)
     env["PYTHONDONTWRITEBYTECODE"] = "1"
+    env["CODEX_HOME"] = str(home / ".local-codex")
     env["MAVIS_E0_RUN_ID"] = run_id
     lease_id: str | None = None
     reservation = None
