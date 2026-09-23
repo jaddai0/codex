@@ -77,7 +77,7 @@ def terra_verifier_evidence(worker_dir: Path, worker_report: Path,
          "observation": f"The {ref} evidence record was checked against the frozen bootstrap packet and matched exactly."}
         for ref, digest in digests.items()
     ]
-    terra_report = worker_dir.parent / "bootstrap-terra-job" / "report.md"
+    terra_report = worker_dir.parent / "bootstrap-terra-evidence-fixture" / "report.md"
     write_json(terra_report, {"target_sha256": target, "verdict": "accepted",
                               "findings": findings})
     return {
@@ -88,6 +88,26 @@ def terra_verifier_evidence(worker_dir: Path, worker_report: Path,
         "report_path": str(terra_report), "report_sha256": sha256_file(terra_report),
         "findings": findings,
     }
+
+
+def canonical_terra_findings(runner, worker_job_id: str) -> list[dict]:
+    binding = runner._target_binding(worker_job_id)
+    completion = read_json(runner._job_dir(worker_job_id) / "completion.json")
+    assignment = read_json(runner._job_dir(worker_job_id) / "assignment.json")
+    hashes = {
+        "assignment": binding["assignment_sha256"],
+        "report": binding["report_sha256"],
+        "receipt": binding["receipt_sha256"],
+    }
+    hashes.update({
+        f"check:{name}": completion["check_results"][name]["output_sha256"]
+        for name in assignment["required_checks"]
+    })
+    return [
+        {"evidence_ref": ref, "sha256": digest, "assessment": "pass",
+         "observation": f"I checked the {ref} record against its frozen source and verified the recorded outcome and hash."}
+        for ref, digest in hashes.items()
+    ]
 
 
 class E1RunnerTests(unittest.TestCase):
@@ -941,7 +961,9 @@ class E1RunnerTests(unittest.TestCase):
             write_json(verifier_dir / "assignment.json", {
                 "lane": "terra", "verification_target": binding})
             write_json(verifier_dir / "meta.json", {
-                "job_id": verifier_job_id, "lane": "terra", "command": ["codex", "exec"]})
+                "job_id": verifier_job_id, "lane": "terra", "command": module.build_native_command(
+                    "terra", prompt="Verify paired E1 evidence", model="gpt-5.6-terra",
+                    output_last_message=str(verifier_dir / "report.md"), sandbox="read-only")})
             return {"success": True, "started": True, "accepted": False,
                     "job_id": verifier_job_id}
 
@@ -962,7 +984,8 @@ class E1RunnerTests(unittest.TestCase):
         self.assertFalse(status("independent-review-worker")["accepted"])
         write_json(verifier_dir / "report.md", {
             "target_sha256": runner._target_binding("independent-review-worker")["target_sha256"],
-            "verdict": "accepted", "findings": "Reviewed paired trial evidence."})
+            "verdict": "accepted", "findings": canonical_terra_findings(
+                runner, "independent-review-worker")})
         result = e1_review_gateway.verify_and_import_review(
             self.home, record, status_reader=status, verifier=verify)
         self.assertEqual(result["review_sha256"], sha256_file(report))
@@ -1168,6 +1191,7 @@ class E1RunnerTests(unittest.TestCase):
         status = runner.status
         complete = lambda job_id, checks: {
             "success": True, **runner.record_completion(job_id, check_results=checks)}
+        (worker / "receipt.json").unlink()
         with self.assertRaisesRegex(ValueError, "terminal receipt"):
             e1_bootstrap_gateway.complete_bootstrap_review(
                 self.home, status_reader=status, completer=complete)
@@ -1185,7 +1209,9 @@ class E1RunnerTests(unittest.TestCase):
             write_json(verifier_dir / "assignment.json", {
                 "lane": "terra", "verification_target": binding})
             write_json(verifier_dir / "meta.json", {
-                "job_id": verifier_job_id, "lane": "terra", "command": ["codex", "exec"]})
+                "job_id": verifier_job_id, "lane": "terra", "command": module.build_native_command(
+                    "terra", prompt="Verify frozen E1 evidence", model="gpt-5.6-terra",
+                    output_last_message=str(verifier_dir / "report.md"), sandbox="read-only")})
             return {"success": True, "started": True, "accepted": False,
                     "job_id": verifier_job_id}
 
@@ -1204,7 +1230,7 @@ class E1RunnerTests(unittest.TestCase):
         self.assertFalse(status("review-job")["accepted"])
         write_json(verifier_dir / "report.md", {
             "target_sha256": runner._target_binding("review-job")["target_sha256"],
-            "verdict": "accepted", "findings": "Reviewed frozen E1 evidence."})
+            "verdict": "accepted", "findings": canonical_terra_findings(runner, "review-job")})
         result = e1_bootstrap_gateway.verify_and_import_bootstrap_review(
             self.home, status_reader=status, verifier=verify)
         self.assertEqual(result["review_sha256"], sha256_file(worker / "report.md"))
