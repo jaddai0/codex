@@ -36,11 +36,6 @@ class E1BootstrapTests(unittest.TestCase):
         fixture.runner.prepare("repair", "baseline")
         fixture.runner.prepare("repair", "candidate")
         self.home = fixture.home
-        self.identity = {
-            "model_id": "model-a", "architecture": "qwen",
-            "weights_fingerprint": "weights-a", "tokenizer_fingerprint": "tok-a",
-            "chat_template_fingerprint": "template-a", "quantization": "4bit",
-        }
         self.fingerprint = {"core_sha256": "a" * 64, "service_sha256": "b" * 64}
         self.share = fixture.root / "share"
         self.share.mkdir()
@@ -82,6 +77,35 @@ class E1BootstrapTests(unittest.TestCase):
                                   "results": [{"case": x, "status": "pass"} for x in E0_CASES],
                                   "installed_candidate": self.fingerprint, "model_id": "model-a",
                                   "case_receipts": cases})
+        self.model_root = fixture.root / "models"
+        self.model_path = self.model_root / "model-a"
+        self.model_path.mkdir(parents=True)
+        write_json(self.model_path / "config.json", {
+            "architectures": ["QwenFixture"], "quantization": {"bits": 4},
+        })
+        write_json(self.model_path / "tokenizer.json", {"version": "fixture"})
+        write_json(self.model_path / "tokenizer_config.json", {"bos_token": "<s>"})
+        (self.model_path / "chat_template.jinja").write_text("{{ prompt }}")
+        (self.model_path / "model-00001.safetensors").write_bytes(b"weights-one")
+        (self.model_path / "model-00002.safetensors").write_bytes(b"weights-two")
+        self.records = [{"id": "model-a", "model_type": "llm", "loaded": True,
+                         "model_path": str(self.model_path.resolve())}]
+        self.owner = {"provider": "zcode", "model": "zcode-reviewer", "harness": "zcode"}
+        self.patches = [
+            patch.object(e1_bootstrap, "installed_candidate_fingerprint", return_value=self.fingerprint),
+            patch.object(e1_bootstrap, "_package_manifest_path", return_value=self.package),
+            patch.object(e1_bootstrap, "_model_root_path", return_value=self.model_root),
+            patch.object(e1_bootstrap, "harness_job_status", side_effect=self._status),
+            patch.object(trial_runtime, "inventory", side_effect=lambda _: self.records),
+        ]
+        for item in self.patches:
+            item.start()
+            self.addCleanup(item.stop)
+        self.assignment = e1_bootstrap.prepare_bootstrap_review(
+            self.home, self.owner, inventory_reader=lambda _: self.records
+        )
+        self.assignment_path = self.home / "e1/bootstrap/review-assignment.json"
+        self.identity = self.assignment["model_identity"]
         baseline = fixture.runner.store.active("main")["configuration"]
         self.review = self.home / "verifications/e1-bootstrap/main.json"
         write_json(self.review, {
@@ -91,32 +115,35 @@ class E1BootstrapTests(unittest.TestCase):
             "package_manifest_sha256": sha256_file(self.package),
             "installed_candidate_digest": e1_bootstrap._digest(self.fingerprint),
             "model_identity_digest": e1_bootstrap._digest(self.identity),
+            "assignment_sha256": sha256_file(self.assignment_path),
             "gateway_worker_job_id": "review-job", "verifier_job_id": "terra-job",
         })
-        self.records = [{"id": "model-a", "model_type": "llm", "loaded": True}]
-        self.patches = [
-            patch.object(e1_bootstrap, "installed_candidate_fingerprint", return_value=self.fingerprint),
-            patch.object(e1_bootstrap, "_package_manifest_path", return_value=self.package),
-            patch.object(e1_bootstrap, "harness_job_status", side_effect=self._status),
-        ]
-        for item in self.patches:
-            item.start()
-            self.addCleanup(item.stop)
 
     def _status(self, job_id):
         return {
             "job_id": job_id, "state": "completed", "exit_code": 0, "accepted": True,
             "receipt": {"job_id": job_id, "exit_code": 0},
             "acceptance": {"accepted": True, "job_id": job_id, "verifier": "terra",
-                           "verifier_job_id": "terra-job", "target_sha256": "a" * 64,
+                           "verifier_job_id": "terra-job", "target_sha256": sha256_file(self.assignment_path),
                            "evidence_sha256": "b" * 64, "report_sha256_on_disk": sha256_file(self.review),
                            "verifier_verdict_sha256": "d" * 64},
-            "mavis_binding": {"objective_id": "e1-bootstrap-main",
-                              "report_sha256": sha256_file(self.review)},
+            "mavis_binding": {
+                "schema_version": "mavis.e1-bootstrap-gateway-binding/v1",
+                "objective_id": "e1-bootstrap-main", "scope": "main",
+                "cwd": self.assignment["cwd"], "owner": self.owner,
+                "starting_revision": self.assignment["starting_revision"],
+                "changed_revision": self.assignment["starting_revision"],
+                "owned_paths": self.assignment["owned_paths"],
+                "requirements": self.assignment["requirements"],
+                "required_checks": self.assignment["required_checks"],
+                "assignment_sha256": sha256_file(self.assignment_path),
+                "report_sha256": sha256_file(self.review),
+                "target_sha256": sha256_file(self.assignment_path),
+            },
         }
 
     def _create(self):
-        return e1_bootstrap.create_bootstrap(self.home, self.identity, self.review)
+        return e1_bootstrap.create_bootstrap(self.home, self.review)
 
     def test_first_profile_uses_same_reviewed_model_for_both_trial_arms(self):
         bootstrap = self._create()
@@ -191,14 +218,75 @@ class E1BootstrapTests(unittest.TestCase):
             trial_runtime.validate_trial_receipt(read_json(receipt_path))
 
     def test_wrong_model_or_review_rejected(self):
-        wrong = {**self.identity, "model_id": "model-b"}
-        with self.assertRaisesRegex(ValueError, "model differs"):
-            e1_bootstrap.create_bootstrap(self.home, wrong, self.review)
+        self.records[0]["id"] = "model-b"
+        with self.assertRaisesRegex(ValueError, "unique model_path"):
+            e1_bootstrap._inventory_model(self.records, "model-a")
+        self.records[0]["id"] = "model-a"
         review = read_json(self.review)
         review["verifier_job_id"] = "wrong"
         write_json(self.review, review)
         with self.assertRaisesRegex(ValueError, "independent gateway acceptance"):
             self._create()
+
+    def test_same_model_id_with_changed_weight_bytes_rejected(self):
+        self._create()
+        (self.model_path / "model-00002.safetensors").write_bytes(b"changed-bytes")
+        with self.assertRaisesRegex(ValueError, "artifact bytes changed"):
+            trial_runtime.trial_binding(self.home, "repair", "baseline", "regression")
+
+    def test_symlinked_model_file_rejected(self):
+        self._create()
+        target = self.model_path / "model-00002.safetensors"
+        target.unlink()
+        target.symlink_to(self.model_path / "model-00001.safetensors")
+        with self.assertRaisesRegex(ValueError, "symlink"):
+            trial_runtime.trial_binding(self.home, "repair", "baseline", "regression")
+
+    def test_gateway_assignment_fields_must_match_frozen_file(self):
+        for field, changed in (("owner", {"provider": "minimax", "model": "other", "harness": "opencode"}),
+                               ("scope", "other"), ("requirements", []),
+                               ("assignment_sha256", "f" * 64)):
+            with self.subTest(field=field):
+                status = self._status("review-job")
+                status["mavis_binding"][field] = changed
+                with patch.object(e1_bootstrap, "harness_job_status", return_value=status):
+                    with self.assertRaisesRegex(ValueError, "independent gateway acceptance"):
+                        self._create()
+
+    def test_changed_frozen_assignment_rejected_after_bootstrap(self):
+        self._create()
+        self.assignment_path.write_bytes(self.assignment_path.read_bytes() + b" ")
+        with self.assertRaises(ValueError):
+            trial_runtime.trial_binding(self.home, "repair", "baseline", "regression")
+
+    def test_preparation_rechecks_inventory_model_path(self):
+        self._create()
+        binding = trial_runtime.trial_binding(self.home, "repair", "baseline", "regression")
+        elsewhere = self.model_root / "other-model"
+        shutil.copytree(self.model_path, elsewhere)
+        self.records[0]["model_path"] = str(elsewhere.resolve())
+        with self.assertRaisesRegex(ValueError, "model_path changed"):
+            trial_runtime.prepare_trial(
+                binding, mavis_home=self.home, share=self.share, core_binary=self.core,
+                base_url="http://127.0.0.1:8001/v1", records=self.records,
+                package_manifest=self.package,
+            )
+
+    def test_launch_rechecks_live_inventory_model_path(self):
+        self._create()
+        binding = trial_runtime.trial_binding(self.home, "repair", "baseline", "regression")
+        receipt_path = trial_runtime.prepare_trial(
+            binding, mavis_home=self.home, share=self.share, core_binary=self.core,
+            base_url="http://127.0.0.1:8001/v1", records=self.records,
+            package_manifest=self.package,
+        )
+        receipt = read_json(receipt_path)
+        trial_runtime.validate_trial_receipt(receipt)
+        elsewhere = self.model_root / "other-model"
+        shutil.copytree(self.model_path, elsewhere)
+        self.records[0]["model_path"] = str(elsewhere.resolve())
+        with self.assertRaisesRegex(ValueError, "model_path changed before launch"):
+            trial_runtime.validate_trial_receipt(receipt)
 
     def test_review_acceptance_must_attest_exact_review_bytes(self):
         status = self._status("review-job")

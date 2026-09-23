@@ -11,9 +11,10 @@ import re
 import shutil
 import subprocess
 import sys
+import tomllib
 
 from mavis.e1 import E1Runner, _clean_revision
-from mavis.e1_bootstrap import validate_bootstrap
+from mavis.e1_bootstrap import _inventory_model, validate_bootstrap
 from mavis.package_provenance import package_tree_sha256
 from mavis.runtime import RuntimeConfig, endpoint_alive, ensure_runtime, inventory
 from mavis.storage import read_json, require_safe_id, sha256_file
@@ -153,6 +154,11 @@ def _prepare_trial_locked(
         if (refreshed["profile_source"] != "e0-bootstrap"
                 or refreshed["profile"]["_source_sha256"] != binding["profile"]["_source_sha256"]):
             raise ValueError("E1 bootstrap changed before trial preparation")
+        observed_model_path = _inventory_model(
+            records, binding["profile"]["model_identity"]["model_id"]
+        ).resolve(strict=True)
+        if str(observed_model_path) != binding["profile"]["model_artifacts"]["model_path"]:
+            raise ValueError("E1 bootstrap oMLX inventory model_path changed")
     record = binding["record"]
     arm, case_id = binding["arm"], binding["case_id"]
     runtime_home = binding["root"] / "runtime" / arm / case_id
@@ -363,6 +369,7 @@ def _write_trial_home(
         else None,
         "selected_model": selected,
         "model_provider": "omlx",
+        "model_endpoint": local_base_url(base_url),
         "config_path": str((runtime_home / "config.toml").resolve()),
         "config_sha256": sha256_file(runtime_home / "config.toml"),
         "catalog_path": str(catalog_path.resolve()),
@@ -440,6 +447,14 @@ def validate_trial_receipt(receipt: dict) -> None:
         path_key = "core_binary" if name == "core" else f"{name}_path"
         if sha256_file(Path(receipt[path_key])) != receipt[f"{name}_sha256"]:
             raise ValueError(f"E1 trial {name} changed after preparation")
+    if binding["profile_source"] == "e0-bootstrap":
+        config = tomllib.loads(Path(receipt["config_path"]).read_text(encoding="utf-8"))
+        endpoint = config["model_providers"]["omlx"]["base_url"]
+        if receipt.get("model_endpoint") != endpoint or local_base_url(endpoint) != endpoint:
+            raise ValueError("E1 bootstrap model endpoint changed")
+        model_path = _inventory_model(inventory(endpoint), receipt["selected_model"]).resolve(strict=True)
+        if str(model_path) != profile["model_artifacts"]["model_path"]:
+            raise ValueError("E1 bootstrap oMLX inventory model_path changed before launch")
     if receipt.get("core_provenance") == "installed-package" and not receipt.get(
         "package_manifest"
     ):
