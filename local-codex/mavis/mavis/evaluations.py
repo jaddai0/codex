@@ -327,6 +327,12 @@ class E0Evaluator:
             "results": [{"case": item["case"], "status": item["status"]} for item in results],
             "observed_at": _now(),
         }
+        if passed:
+            summary["installed_candidate"] = installed_candidate_fingerprint()
+            summary["model_id"] = self.config.model
+            summary["case_receipts"] = {
+                item: sha256_file(self.root / f"{item}.json") for item in E0_CASES
+            }
         write_json(self.root / "summary.json", summary)
         return summary
 

@@ -13,6 +13,7 @@ import subprocess
 import sys
 
 from mavis.e1 import E1Runner, _clean_revision
+from mavis.e1_bootstrap import validate_bootstrap
 from mavis.runtime import RuntimeConfig, endpoint_alive, ensure_runtime, inventory
 from mavis.storage import read_json, require_safe_id, sha256_file
 from prepare_runtime import (
@@ -67,9 +68,12 @@ def trial_binding(mavis_home: Path, experiment_id: str, arm: str, case_id: str) 
     if active["configuration"] != record["baseline"]:
         raise ValueError("E1 baseline no longer matches active configuration")
     profile = accepted_main_profile(mavis_home)
+    profile_source = "accepted-main"
+    if profile is None:
+        profile = validate_bootstrap(mavis_home)
+        profile_source = "e0-bootstrap"
     if (
-        profile is None
-        or {"prompts": profile["prompts"], "tool_settings": {}, "retrieval": {}}
+        {"prompts": profile["prompts"], "tool_settings": {}, "retrieval": {}}
         != baseline
     ):
         raise ValueError("E1 baseline no longer matches accepted main profile")
@@ -91,6 +95,7 @@ def trial_binding(mavis_home: Path, experiment_id: str, arm: str, case_id: str) 
         "manifest": manifest,
         "case": case,
         "profile": profile,
+        "profile_source": profile_source,
         "snapshot": record[arm],
         "configuration": baseline if arm == "baseline" else candidate,
         "root": root,
@@ -141,6 +146,12 @@ def _prepare_trial_locked(
     gateway_env_file: Path | None = None,
     package_manifest: Path | None = None,
 ) -> Path:
+    if binding["profile_source"] == "e0-bootstrap":
+        refreshed = trial_binding(mavis_home, binding["record"]["experiment_id"],
+                                  binding["arm"], binding["case_id"])
+        if (refreshed["profile_source"] != "e0-bootstrap"
+                or refreshed["profile"]["_source_sha256"] != binding["profile"]["_source_sha256"]):
+            raise ValueError("E1 bootstrap changed before trial preparation")
     record = binding["record"]
     arm, case_id = binding["arm"], binding["case_id"]
     runtime_home = binding["root"] / "runtime" / arm / case_id
@@ -314,9 +325,12 @@ def _write_trial_home(
         "manifest_sha256": record["workload"]["manifest_sha256"],
         "snapshot_path": binding["snapshot"]["path"],
         "snapshot_sha256": binding["snapshot"]["sha256"],
-        "accepted_profile_id": binding["profile"]["profile_id"],
-        "accepted_profile_path": binding["profile"]["_source_path"],
-        "accepted_profile_sha256": binding["profile"]["_source_sha256"],
+        "profile_source": binding["profile_source"],
+        "accepted_profile_id": binding["profile"]["profile_id"] if binding["profile_source"] == "accepted-main" else None,
+        "accepted_profile_path": binding["profile"]["_source_path"] if binding["profile_source"] == "accepted-main" else None,
+        "accepted_profile_sha256": binding["profile"]["_source_sha256"] if binding["profile_source"] == "accepted-main" else None,
+        "bootstrap_receipt_path": binding["profile"]["_source_path"] if binding["profile_source"] == "e0-bootstrap" else None,
+        "bootstrap_receipt_sha256": binding["profile"]["_source_sha256"] if binding["profile_source"] == "e0-bootstrap" else None,
         "checkout": str(binding["checkout"].resolve()),
         "starting_revision": binding["case"]["revision"],
         "runtime_home": str(runtime_home.resolve()),
@@ -370,12 +384,22 @@ def validate_trial_receipt(receipt: dict) -> None:
         home, receipt["experiment_id"], receipt["arm"], receipt["case_id"]
     )
     profile = binding["profile"]
+    if receipt.get("profile_source", "accepted-main") != binding["profile_source"]:
+        raise ValueError("E1 trial profile source changed")
+    if binding["profile_source"] == "e0-bootstrap":
+        if (receipt.get("accepted_profile_id") is not None
+                or receipt.get("accepted_profile_path") is not None
+                or receipt.get("accepted_profile_sha256") is not None
+                or receipt.get("bootstrap_receipt_path") != profile["_source_path"]
+                or receipt.get("bootstrap_receipt_sha256") != profile["_source_sha256"]):
+            raise ValueError("E1 trial bootstrap receipt changed")
+    elif (receipt.get("accepted_profile_sha256") != profile["_source_sha256"]
+          or receipt.get("accepted_profile_id") != profile["profile_id"]):
+        raise ValueError("E1 trial accepted profile changed")
     if (
         receipt["manifest_sha256"] != binding["record"]["workload"]["manifest_sha256"]
         or receipt["snapshot_path"] != binding["snapshot"]["path"]
         or receipt["snapshot_sha256"] != binding["snapshot"]["sha256"]
-        or receipt["accepted_profile_sha256"] != profile["_source_sha256"]
-        or receipt["accepted_profile_id"] != profile["profile_id"]
         or receipt["checkout"] != str(binding["checkout"].resolve())
         or receipt["starting_revision"] != binding["case"]["revision"]
         or receipt["selected_model"] != profile["model_identity"]["model_id"]
