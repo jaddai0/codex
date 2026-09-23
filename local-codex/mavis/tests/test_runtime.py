@@ -43,6 +43,21 @@ class FakeProcess:
 
 
 class RuntimeTests(unittest.TestCase):
+    def test_park_reserves_empty_port_without_starting_server(self):
+        with tempfile.TemporaryDirectory() as directory:
+            with socket.socket() as probe:
+                probe.bind(("127.0.0.1", 0))
+                port = probe.getsockname()[1]
+            config = RuntimeConfig(home=Path(directory),
+                                   endpoint=f"http://127.0.0.1:{port}/v1")
+            reservation = park_mavis_server(config)
+            try:
+                with socket.socket() as probe:
+                    self.assertEqual(probe.connect_ex(("127.0.0.1", port)), 0)
+                self.assertFalse(config.state_path.exists())
+            finally:
+                reservation.close()
+
     def test_park_waits_for_process_group_and_exclusively_reserves_port(self):
         with tempfile.TemporaryDirectory() as directory:
             with socket.socket() as probe:
@@ -70,7 +85,8 @@ class RuntimeTests(unittest.TestCase):
                         "waiting_requests": 0, "models_loading": 0}
                 reaper = threading.Thread(target=child.wait, daemon=True)
                 reaper.start()
-                with patch("mavis.runtime.request_json", return_value=idle), \
+                with patch("mavis.runtime.endpoint_alive", return_value=True), \
+                        patch("mavis.runtime.request_json", return_value=idle), \
                         patch("mavis.runtime.owns_running_server", return_value=True):
                     reservation = park_mavis_server(config)
                 try:

@@ -49,8 +49,7 @@ def main() -> int:
         raise RuntimeError("final E0 requires the complete installed Mavis package")
     if not endpoint_alive(config.iris_endpoint) or not loaded(config.iris_endpoint):
         raise RuntimeError("IRIS must own the original model before E0")
-    ensure_runtime(config, load=False)
-    if loaded_generation_models(config.endpoint):
+    if endpoint_alive(config.endpoint) and loaded_generation_models(config.endpoint):
         raise RuntimeError("Mavis generation models must be unloaded before handoff")
     before = installed_candidate_fingerprint()
     run_id = uuid.uuid4().hex

@@ -85,7 +85,8 @@ def main() -> int:
     signal.signal(signal.SIGTERM, on_signal)
     signal.signal(signal.SIGINT, on_signal)
     require_installed_selected_model(config)
-    if not loaded(config.iris_endpoint) or loaded_generation_models(config.endpoint):
+    if (not loaded(config.iris_endpoint)
+            or (endpoint_alive(config.endpoint) and loaded_generation_models(config.endpoint))):
         raise RuntimeError("IRIS must own the model and Mavis must be unloaded")
     candidate = installed_candidate_fingerprint()
     result: dict[str, object] = {"candidate": candidate,

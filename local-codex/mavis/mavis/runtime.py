@@ -507,32 +507,43 @@ def stop_server(config: RuntimeConfig) -> None:
 
 
 def park_mavis_server(config: RuntimeConfig, *, timeout: float = 30) -> socket.socket:
-    """Stop the owned server and reserve its port through IRIS restoration.
+    """Stop the owned server or reserve its empty port through IRIS restoration.
 
     The caller must keep the returned listening socket open until IRIS is
     restored and its drain released. A failed stop never proves safe handoff.
     """
-    status = request_json(config.endpoint, "/api/status")
-    if (not isinstance(status, dict) or status.get("status") != "ok"
-            or type(status.get("active_requests")) is not int
-            or type(status.get("waiting_requests")) is not int
-            or type(status.get("models_loading")) is not int
-            or any(status[key] != 0 for key in
-                   ("active_requests", "waiting_requests", "models_loading"))):
-        raise RuntimeError("Mavis server has active, queued, or loading work")
-    if not owns_running_server(config):
-        raise RuntimeError("refusing to park a server Mavis does not own")
-    pid = int(read_json(config.state_path)["pid"])
-    if os.getpgid(pid) != pid:
-        raise RuntimeError("Mavis server is not in its dedicated process group")
-    os.killpg(pid, signal.SIGTERM)
+    pid = read_json(config.state_path).get("pid") if config.state_path.is_file() else None
+    if pid is not None and (not isinstance(pid, int) or pid <= 0):
+        raise RuntimeError("Mavis owned server PID is invalid")
+    if endpoint_alive(config.endpoint):
+        status = request_json(config.endpoint, "/api/status")
+        if (not isinstance(status, dict) or status.get("status") != "ok"
+                or type(status.get("active_requests")) is not int
+                or type(status.get("waiting_requests")) is not int
+                or type(status.get("models_loading")) is not int
+                or any(status[key] != 0 for key in
+                       ("active_requests", "waiting_requests", "models_loading"))):
+            raise RuntimeError("Mavis server has active, queued, or loading work")
+        if not owns_running_server(config):
+            raise RuntimeError("refusing to park a server Mavis does not own")
+        if pid is None:
+            raise RuntimeError("Mavis live server lacks owned process state")
+        if os.getpgid(pid) != pid:
+            raise RuntimeError("Mavis server is not in its dedicated process group")
+        os.killpg(pid, signal.SIGTERM)
+    elif _listener_pids(_port(config.endpoint)):
+        raise RuntimeError("Mavis endpoint is occupied by an unidentified listener")
     deadline = time.monotonic() + timeout
     while time.monotonic() < deadline:
-        try:
-            os.killpg(pid, 0)
-        except ProcessLookupError:
+        if pid is None:
             if not _listener_pids(_port(config.endpoint)):
                 break
+        else:
+            try:
+                os.killpg(pid, 0)
+            except ProcessLookupError:
+                if not _listener_pids(_port(config.endpoint)):
+                    break
         time.sleep(0.2)
     else:
         raise TimeoutError("Mavis server or a model worker remained after stop")
