@@ -15,6 +15,7 @@ from threading import Thread
 
 
 MODULE_PATH = Path(__file__).parents[1] / "prepare_runtime.py"
+sys.path.insert(0, str(MODULE_PATH.parent / "mavis"))
 SPEC = importlib.util.spec_from_file_location("prepare_runtime", MODULE_PATH)
 prepare_runtime = importlib.util.module_from_spec(SPEC)
 assert SPEC.loader is not None
@@ -34,7 +35,7 @@ class PrepareRuntimeTests(unittest.TestCase):
             (share / "persona.toml").write_text('name = "Mavis"\n')
             (share / "base-instructions.md").write_text("Base instructions\n")
             stub = share / "mavis"
-            stub.mkdir()
+            shutil.copytree(MODULE_PATH.parent / "mavis" / "mavis", stub)
             (stub / "__main__.py").write_text(
                 "import json, os, sys\n"
                 "open(os.environ['STUB_RUNTIME_ARGS'], 'w').write(json.dumps(sys.argv[1:]))\n"
@@ -78,20 +79,46 @@ class PrepareRuntimeTests(unittest.TestCase):
                 self.assertEqual(receipt["state"], "exited")
                 self.assertEqual(receipt["selected_model"], "model-b")
                 self.assertEqual(receipt["core_exit_code"], 0)
+                (root / "runtime-args.json").unlink()
+                blocked = subprocess.run(["zsh", str(MODULE_PATH.parent / "bin/local-codex"),
+                                          "-c", 'model_provider="other"'],
+                                         env=env, capture_output=True, text=True, timeout=15)
+                self.assertEqual(blocked.returncode, 2)
+                self.assertFalse((root / "runtime-args.json").exists())
             finally:
                 server.shutdown()
                 server.server_close()
                 thread.join()
 
     def _accepted_profile(self, mavis_home, version, model_id, prompt, previous_version=None):
+        from mavis.experiments import ExperimentStore
+        from mavis.storage import read_json, write_json, sha256_file
+
         role = mavis_home / "profiles" / "main"
         role.mkdir(parents=True, exist_ok=True)
-        retained = {}
-        for name in ("accepted_experiment", "verifier_receipt"):
-            path = mavis_home / name / f"v{version}.json"
-            path.parent.mkdir(parents=True, exist_ok=True)
-            path.write_text('{"accepted":true}\n')
-            retained[name] = {"path": str(path), "sha256": hashlib.sha256(path.read_bytes()).hexdigest()}
+        experiment_store = ExperimentStore(mavis_home)
+        active_path = experiment_store._active_path("main")
+        previous = read_json(active_path) if active_path.exists() else None
+        configuration = {"prompts": {"system": prompt}, "tool_settings": {}, "retrieval": {}}
+        candidate = experiment_store._snapshot(configuration)
+        experiment_id = f"exp-v{version}"
+        verifier_path = mavis_home / "verifications" / "experiments" / f"{experiment_id}.json"
+        write_json(verifier_path, {"verdict": "accepted", "experiment_id": experiment_id})
+        experiment_path = experiment_store._record_path(experiment_id)
+        write_json(experiment_path, {"schema_version": "mavis.experiment-lifecycle/v1",
+                                     "experiment_id": experiment_id, "scope": "main", "state": "promoted",
+                                     "candidate": candidate,
+                                     "baseline": previous["configuration"] if previous else candidate,
+                                     "history": [],
+                                     "review": {"path": str(verifier_path.resolve()),
+                                                "sha256": sha256_file(verifier_path), "verdict": "accepted"}})
+        write_json(active_path, {"schema_version": "mavis.experiment-active/v1", "scope": "main",
+                                 "configuration": candidate, "experiment_id": experiment_id,
+                                 "previous": previous})
+        retained = {"accepted_experiment": {"path": str(experiment_path.resolve()),
+                                             "sha256": sha256_file(experiment_path)},
+                    "verifier_receipt": {"path": str(verifier_path.resolve()),
+                                         "sha256": sha256_file(verifier_path)}}
         profile_path = role / f"v{version}.json"
         profile_path.write_text(json.dumps({
             "schema_version": "mavis.model-profile/v1", "profile_id": f"profile-{version}",
@@ -101,7 +128,8 @@ class PrepareRuntimeTests(unittest.TestCase):
                 "tokenizer_fingerprint": "tokenizer", "chat_template_fingerprint": "template",
                 "quantization": "4bit"},
             "runtime": {"name": "omlx", "version": "1"}, "prompts": {"system": prompt},
-            "tool_settings": {}, "context_policy": {"retrieval": {}}, **retained,
+            "tool_settings": {}, "context_policy": {"retrieval": {}},
+            "experiments": [experiment_id], **retained,
         }))
         (role / "active.json").write_text(json.dumps({"version": version, "path": str(profile_path.resolve())}))
         return profile_path
@@ -138,14 +166,74 @@ class PrepareRuntimeTests(unittest.TestCase):
                                     if json.loads(path.read_text())["profile_sha256"] ==
                                     hashlib.sha256((mavis_home / "profiles/main" / f"v{version}.json").read_bytes()).hexdigest()
                                     and json.loads(path.read_text())["state"] == "prepared")
+                stub_core = root / "stub-core"
+                stub_core.write_text("#!/bin/sh\nexit 0\n")
+                stub_core.chmod(0o755)
                 run = subprocess.run([sys.executable, str(MODULE_PATH.parent / "launch_core.py"),
-                                      "--receipt", str(receipt_path), "--", "/bin/sh", "-c", "exit 0"],
-                                     capture_output=True, text=True)
+                                      "--receipt", str(receipt_path), "--", str(stub_core)],
+                                     capture_output=True, text=True,
+                                     env={**os.environ, "PYTHONPATH": str(MODULE_PATH.parent / "mavis")})
                 self.assertEqual(run.returncode, 0, run.stderr)
                 launched = json.loads(receipt_path.read_text())
                 self.assertEqual(launched["state"], "exited")
                 self.assertEqual(launched["core_exit_code"], 0)
                 self.assertGreater(launched["core_pid"], 0)
+
+    def test_rolled_back_experiment_cannot_launch_stale_profile(self):
+        from mavis.experiments import ExperimentStore
+
+        with tempfile.TemporaryDirectory() as directory:
+            home = Path(directory)
+            self._accepted_profile(home, 1, "model-a", "A")
+            self._accepted_profile(home, 2, "model-b", "B", 1)
+            codex_home = home / "codex"
+            persona = home / "persona.toml"
+            instructions = home / "instructions.md"
+            persona.write_text('name = "Mavis"\n')
+            instructions.write_text("Base\n")
+            argv = ["prepare_runtime.py", "--home", str(codex_home), "--mavis-home", str(home),
+                    "--base-url", "http://127.0.0.1:8001/v1", "--persona-template", str(persona),
+                    "--instructions-template", str(instructions)]
+            with patch.object(sys, "argv", argv), patch.object(prepare_runtime, "read_json", return_value=[
+                {"id": "model-b", "model_type": "llm", "loaded": True}]):
+                self.assertEqual(prepare_runtime.main(), 0)
+            prepared_receipt = next((home / "launches").glob("*.json"))
+            ExperimentStore(home).rollback("exp-v2", reason="regression")
+            marker = home / "core-ran"
+            core = home / "core"
+            core.write_text(f"#!/bin/sh\ntouch {marker}\n")
+            core.chmod(0o755)
+            blocked = subprocess.run([sys.executable, str(MODULE_PATH.parent / "launch_core.py"),
+                                      "--receipt", str(prepared_receipt), "--", str(core)],
+                                     capture_output=True, text=True,
+                                     env={**os.environ, "PYTHONPATH": str(MODULE_PATH.parent / "mavis")})
+            self.assertEqual(blocked.returncode, 2)
+            self.assertFalse(marker.exists())
+            with self.assertRaisesRegex(ValueError, "evidence changed"):
+                prepare_runtime.accepted_main_profile(home)
+            profile_path = home / "profiles" / "main" / "v2.json"
+            stale = json.loads(profile_path.read_text())
+            stale["accepted_experiment"]["sha256"] = hashlib.sha256(
+                (home / "experiments" / "records" / "exp-v2.json").read_bytes()).hexdigest()
+            profile_path.write_text(json.dumps(stale))
+            with self.assertRaisesRegex(ValueError, "active promoted experiment"):
+                prepare_runtime.accepted_main_profile(home)
+            self._accepted_profile(home, 1, "model-a", "A", 2)
+            self.assertEqual(prepare_runtime.accepted_main_profile(home)["model_identity"]["model_id"], "model-a")
+
+    def test_profile_cli_overrides_are_rejected_before_core_spawn(self):
+        path = MODULE_PATH.parent / "launch_core.py"
+        for arguments in (("-c", 'model_provider="other"'),
+                          ("--config=model_instructions_file=\"/tmp/x\"",),
+                          ("--config", 'model_catalog_json="/tmp/other"'),
+                          ("--profile", "other"), ("-pother",),
+                          ("--model", "other"), ("-mother",),
+                          ("--oss",), ("--local-provider", "ollama"),
+                          ("--enable", "example")):
+            with self.subTest(arguments=arguments):
+                result = subprocess.run([sys.executable, str(path), "--check-args", "--", *arguments],
+                                        capture_output=True, text=True)
+                self.assertEqual(result.returncode, 2, result.stderr)
 
     def test_shipped_persona_is_mavis(self):
         persona = (MODULE_PATH.parent / "persona.toml").read_text(encoding="utf-8")
