@@ -12,6 +12,7 @@ import uuid
 
 INTERVALS = {"immediate", "daily", "weekly", "monthly"}
 STATES = {"queued", "running", "paused", "complete", "failed", "cancelled"}
+CANCELLABLE_STATES = {"queued", "paused"}
 
 
 def _now() -> str:
@@ -140,6 +141,29 @@ class MaintenanceQueue:
             connection.execute(
                 "UPDATE jobs SET state=?, detail=?, updated_at=? WHERE job_id=?",
                 ("complete" if success else "failed", detail, _now(), job_id),
+            )
+            connection.commit()
+        finally:
+            connection.close()
+        return self.get(job_id)
+
+    def cancel(self, job_id: str, *, reason: str) -> dict[str, Any]:
+        connection = self._connect()
+        try:
+            connection.execute("BEGIN IMMEDIATE")
+            current = connection.execute(
+                "SELECT state FROM jobs WHERE job_id=?", (job_id,)
+            ).fetchone()
+            if current is None:
+                raise KeyError(job_id)
+            if current["state"] not in CANCELLABLE_STATES:
+                raise ValueError(
+                    f"cannot cancel maintenance job in state: {current['state']}"
+                )
+            connection.execute(
+                "UPDATE jobs SET state='cancelled', detail=?, updated_at=? "
+                "WHERE job_id=? AND state IN ('queued','paused')",
+                (reason, _now(), job_id),
             )
             connection.commit()
         finally:
