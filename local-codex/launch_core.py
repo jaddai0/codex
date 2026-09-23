@@ -10,12 +10,47 @@ import signal
 import subprocess
 import sys
 import os
+import time
 
 from prepare_runtime import accepted_main_profile, atomic_write
+from generation_lease import generation_lease
 
 
 def digest(path: Path) -> str:
     return hashlib.sha256(path.read_bytes()).hexdigest()
+
+
+def _stop_process_group(child: subprocess.Popen) -> None:
+    try:
+        os.killpg(child.pid, signal.SIGTERM)
+    except ProcessLookupError:
+        pass
+    try:
+        child.wait(timeout=5)
+    except subprocess.TimeoutExpired:
+        try:
+            os.killpg(child.pid, signal.SIGKILL)
+        except ProcessLookupError:
+            pass
+        child.wait()
+
+
+def matching_trial_transcript(path: Path, runtime_home: Path, session_id: str) -> Path:
+    home = runtime_home.resolve(strict=True)
+    transcript = path.resolve(strict=True)
+    if home not in transcript.parents or not transcript.is_file():
+        raise ValueError("core E1 transcript is outside disposable home")
+    with transcript.open(encoding="utf-8") as stream:
+        first = json.loads(stream.readline())
+    metadata = first.get("payload") if isinstance(first, dict) else None
+    if (
+        not isinstance(first, dict)
+        or first.get("type") != "session_meta"
+        or not isinstance(metadata, dict)
+        or str(metadata.get("id")) != str(session_id)
+    ):
+        raise ValueError("core E1 transcript session differs from observation")
+    return transcript
 
 
 def check_profile_cli_arguments(arguments: list[str]) -> None:
@@ -41,6 +76,14 @@ def check_profile_cli_arguments(arguments: list[str]) -> None:
 
 
 def launch(receipt_path: Path | None, argv: list[str]) -> int:
+    if receipt_path is not None:
+        receipt = json.loads(receipt_path.read_text(encoding="utf-8"))
+        with generation_lease(Path(receipt["mavis_home"]), purpose="accepted-main"):
+            return _launch_unlocked(receipt_path, argv)
+    return _launch_unlocked(receipt_path, argv)
+
+
+def _launch_unlocked(receipt_path: Path | None, argv: list[str]) -> int:
     if not argv:
         raise ValueError("core binary is required")
     receipt = None
@@ -115,8 +158,18 @@ def launch(receipt_path: Path | None, argv: list[str]) -> int:
     return return_code if return_code >= 0 else 128 - return_code
 
 
-def launch_trial(receipt_path: Path, argv: list[str]) -> int:
+def launch_trial(
+    receipt_path: Path, argv: list[str], *, lease_held: bool = False
+) -> int:
     """Run a frozen E1 arm; process exit alone never establishes trial success."""
+    if not lease_held:
+        receipt = json.loads(receipt_path.read_text(encoding="utf-8"))
+        with generation_lease(Path(receipt["mavis_home"]), purpose="e1-trial"):
+            return _launch_trial_unlocked(receipt_path, argv)
+    return _launch_trial_unlocked(receipt_path, argv)
+
+
+def _launch_trial_unlocked(receipt_path: Path, argv: list[str]) -> int:
     from trial_runtime import validate_trial_receipt
 
     if not argv:
@@ -124,6 +177,8 @@ def launch_trial(receipt_path: Path, argv: list[str]) -> int:
     check_profile_cli_arguments(argv[1:])
     receipt = json.loads(receipt_path.read_text(encoding="utf-8"))
     validate_trial_receipt(receipt)
+    if argv != receipt["core_argv"]:
+        raise ValueError("E1 core command differs from frozen receipt")
     bindings = {
         "model": receipt["selected_model"],
         "model_provider": "omlx",
@@ -137,6 +192,10 @@ def launch_trial(receipt_path: Path, argv: list[str]) -> int:
         *argv[1:],
     ]
     receipt["binding_overrides"] = overrides
+    receipt["effective_argv"] = launch_argv
+    receipt["effective_argv_sha256"] = hashlib.sha256(
+        json.dumps(launch_argv, separators=(",", ":")).encode()
+    ).hexdigest()
     environment = os.environ.copy()
     environment.update(
         {
@@ -159,7 +218,12 @@ def launch_trial(receipt_path: Path, argv: list[str]) -> int:
         Path(receipt["stderr_path"]).open("xb") as stderr,
     ):
         child = subprocess.Popen(
-            launch_argv, cwd=checkout, env=environment, stdout=stdout, stderr=stderr
+            launch_argv,
+            cwd=checkout,
+            env=environment,
+            stdout=stdout,
+            stderr=stderr,
+            start_new_session=True,
         )
         receipt.update(
             {
@@ -173,31 +237,72 @@ def launch_trial(receipt_path: Path, argv: list[str]) -> int:
                 receipt_path, json.dumps(receipt, indent=2, sort_keys=True) + "\n"
             )
         except BaseException:
-            child.terminate()
-            child.wait()
+            _stop_process_group(child)
             raise
+        terminated_signal = None
+        terminated_at = None
+        previous_handlers = {}
+
+        def forward(signum, _frame):
+            nonlocal terminated_signal, terminated_at
+            if terminated_signal is None:
+                terminated_signal = signum
+                terminated_at = time.monotonic()
+            try:
+                os.killpg(child.pid, signal.SIGTERM)
+            except ProcessLookupError:
+                pass
+
+        for signum in (signal.SIGINT, signal.SIGTERM):
+            previous_handlers[signum] = signal.signal(signum, forward)
         try:
-            exit_code = child.wait()
+            while True:
+                try:
+                    exit_code = child.wait(timeout=0.2)
+                    break
+                except subprocess.TimeoutExpired:
+                    if (
+                        terminated_at is not None
+                        and time.monotonic() - terminated_at >= 5
+                    ):
+                        try:
+                            os.killpg(child.pid, signal.SIGKILL)
+                        except ProcessLookupError:
+                            pass
+                        exit_code = child.wait()
+                        break
         except BaseException:
-            child.terminate()
-            child.wait()
+            _stop_process_group(child)
             raise
+        finally:
+            for signum, old in previous_handlers.items():
+                signal.signal(signum, old)
     receipt.update(
         {
-            "state": "exited",
+            "state": "terminated" if terminated_signal is not None else "exited",
             "exited_at": datetime.now(timezone.utc).isoformat(),
             "core_exit_code": exit_code,
+            "termination_signal": terminated_signal,
             "stdout_sha256": digest(Path(receipt["stdout_path"])),
             "stderr_sha256": digest(Path(receipt["stderr_path"])),
         }
     )
-    from trial_runtime import _git
+    from mavis.e1 import _git
 
-    receipt["resulting_revision"] = _git(checkout, "rev-parse", "HEAD")
-    receipt["checkout_dirty"] = bool(
-        _git(checkout, "status", "--porcelain", "--untracked-files=all", "--ignored")
-    )
     try:
+        receipt["resulting_revision"] = _git(checkout, "rev-parse", "HEAD")
+        receipt["checkout_dirty"] = bool(
+            _git(
+                checkout, "status", "--porcelain", "--untracked-files=all", "--ignored"
+            )
+        )
+    except (OSError, subprocess.CalledProcessError) as error:
+        receipt["checkout_observation_error"] = str(error)
+    try:
+        if terminated_signal is not None:
+            raise ValueError("E1 core was interrupted")
+        if receipt.get("core_provenance") != "installed-package":
+            raise ValueError("E1 core has no installed package provenance")
         event_path = Path(receipt["observation_path"])
         event = json.loads(event_path.read_text(encoding="utf-8"))
         expected = {
@@ -214,12 +319,14 @@ def launch_trial(receipt_path: Path, argv: list[str]) -> int:
             raise ValueError(
                 "core effective-config observation differs from frozen E1 arm"
             )
-        transcript = Path(event["rollout_path"])
-        if not transcript.is_file():
-            raise ValueError("core E1 transcript is missing")
+        transcript = matching_trial_transcript(
+            Path(event["rollout_path"]),
+            Path(receipt["runtime_home"]),
+            event["session_id"],
+        )
         receipt.update(
             {
-                "observation_status": "matched",
+                "observation_status": "matched_startup_config",
                 "observation_sha256": digest(event_path),
                 "transcript_path": str(transcript.resolve()),
                 "transcript_sha256": digest(transcript),
@@ -232,7 +339,11 @@ def launch_trial(receipt_path: Path, argv: list[str]) -> int:
     atomic_write(receipt_path, json.dumps(receipt, indent=2, sort_keys=True) + "\n")
     return (
         exit_code
-        if exit_code == 0 and receipt["observation_status"] == "matched"
+        if (
+            exit_code == 0
+            and receipt["observation_status"] == "matched_startup_config"
+            and "checkout_observation_error" not in receipt
+        )
         else 2
     )
 

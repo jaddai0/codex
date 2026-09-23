@@ -1,7 +1,10 @@
+# ruff: noqa: E402
 import os
 from pathlib import Path
+import signal
 import subprocess
 import sys
+import time
 import unittest
 from unittest.mock import patch
 
@@ -13,7 +16,8 @@ sys.path.insert(0, str(ROOT / "mavis" / "tests"))
 from mavis.storage import read_json, sha256_file, write_json
 from test_e1 import E1RunnerTests
 import trial_runtime
-from launch_core import launch_trial
+from launch_core import launch_trial, matching_trial_transcript
+from generation_lease import generation_lease
 
 
 class TrialRuntimeTests(unittest.TestCase):
@@ -22,6 +26,10 @@ class TrialRuntimeTests(unittest.TestCase):
         fixture.setUp()
         self.addCleanup(fixture.temp.cleanup)
         self.fixture = fixture
+        manifest = read_json(fixture.manifest)
+        for case in manifest["cases"]:
+            case["task"] = "task"
+        write_json(fixture.manifest, manifest)
         fixture._freeze()
         fixture.runner.prepare("repair", "baseline")
         fixture.runner.prepare("repair", "candidate")
@@ -111,10 +119,17 @@ class TrialRuntimeTests(unittest.TestCase):
             {"prompts": {"system": "stale"}, "tool_settings": {}, "retrieval": {}}
         )
         write_json(active_path, active)
-        with (patch.dict(os.environ, {"MAVIS_HOME": str(self.fixture.home),
-                                   "LOCAL_CODEX_SHARE_DIR": str(self.share),
-                                   "LOCAL_CODEX_BIN": str(self.core)}),
-              patch.object(trial_runtime, "ensure_runtime") as ensure):
+        with (
+            patch.dict(
+                os.environ,
+                {
+                    "MAVIS_HOME": str(self.fixture.home),
+                    "LOCAL_CODEX_SHARE_DIR": str(self.share),
+                    "LOCAL_CODEX_BIN": str(self.core),
+                },
+            ),
+            patch.object(trial_runtime, "ensure_runtime") as ensure,
+        ):
             with self.assertRaisesRegex(ValueError, "baseline no longer matches"):
                 trial_runtime.run_trial("repair", "candidate", "regression", "task")
         ensure.assert_not_called()
@@ -149,6 +164,11 @@ class TrialRuntimeTests(unittest.TestCase):
             trial_runtime, "accepted_main_profile", return_value=self.profile
         ):
             trial_runtime.validate_trial_receipt(receipt)
+            wrong_task = dict(receipt, task="different task")
+            with self.assertRaisesRegex(ValueError, "task or core command"):
+                trial_runtime.validate_trial_receipt(wrong_task)
+            with self.assertRaisesRegex(ValueError, "core command differs"):
+                launch_trial(path, [*receipt["core_argv"][:-1], "different task"])
             Path(receipt["instructions_path"]).write_text("changed")
             with self.assertRaisesRegex(ValueError, "instructions changed"):
                 trial_runtime.validate_trial_receipt(receipt)
@@ -164,13 +184,11 @@ class TrialRuntimeTests(unittest.TestCase):
             base_url="http://127.0.0.1:8001/v1",
             records=self.records,
         )
-        checkout = str(binding["checkout"])
+        argv = read_json(path)["core_argv"]
         with patch.object(
             trial_runtime, "accepted_main_profile", return_value=self.profile
         ):
-            result = launch_trial(
-                path, [str(self.core), "exec", "-C", checkout, "--", "task"]
-            )
+            result = launch_trial(path, argv)
         receipt = read_json(path)
         self.assertEqual(result, 2)
         self.assertEqual(receipt["core_exit_code"], 0)
@@ -196,6 +214,245 @@ class TrialRuntimeTests(unittest.TestCase):
         self.assertEqual(result.returncode, 2)
         self.assertIn("required", result.stderr)
         self.assertNotIn("core binary not found", result.stderr)
+
+    def test_frozen_task_and_trial_id_fail_before_admission(self):
+        with self.assertRaisesRegex(ValueError, "trial IDs"):
+            trial_runtime.trial_binding(
+                self.fixture.home, "repair", "candidate", "held.a"
+            )
+        with (
+            patch.dict(os.environ, {"MAVIS_HOME": str(self.fixture.home)}),
+            patch.object(
+                trial_runtime, "accepted_main_profile", return_value=self.profile
+            ),
+            patch.object(trial_runtime, "ensure_runtime") as ensure,
+        ):
+            with self.assertRaisesRegex(ValueError, "task differs"):
+                trial_runtime.run_trial(
+                    "repair", "candidate", "regression", "different task"
+                )
+        ensure.assert_not_called()
+
+    def test_failed_preparation_removes_only_incomplete_home(self):
+        binding = self._binding("candidate")
+        with patch.object(
+            trial_runtime, "write_profile", side_effect=OSError("write failed")
+        ):
+            with self.assertRaisesRegex(OSError, "write failed"):
+                trial_runtime.prepare_trial(
+                    binding,
+                    mavis_home=self.fixture.home,
+                    share=self.share,
+                    core_binary=self.core,
+                    base_url="http://127.0.0.1:8001/v1",
+                    records=self.records,
+                )
+        self.assertFalse((binding["root"] / "runtime/candidate/regression").exists())
+        self.assertFalse(
+            (binding["root"] / "trials/candidate/regression.json").exists()
+        )
+        path = trial_runtime.prepare_trial(
+            binding,
+            mavis_home=self.fixture.home,
+            share=self.share,
+            core_binary=self.core,
+            base_url="http://127.0.0.1:8001/v1",
+            records=self.records,
+        )
+        self.assertTrue(path.is_file())
+
+    def test_crashed_preparation_recovers_only_owned_partial_files(self):
+        binding = self._binding("candidate")
+        home = binding["root"] / "runtime/candidate/regression"
+        home.mkdir(parents=True)
+        write_json(
+            home / ".e1-preparing.json",
+            {
+                "schema_version": "mavis.e1-preparing/v1",
+                "experiment_id": "repair",
+                "arm": "candidate",
+                "case_id": "regression",
+            },
+        )
+        (home / "config.toml").write_text("partial")
+        path = trial_runtime.prepare_trial(
+            binding,
+            mavis_home=self.fixture.home,
+            share=self.share,
+            core_binary=self.core,
+            base_url="http://127.0.0.1:8001/v1",
+            records=self.records,
+        )
+        self.assertTrue(path.is_file())
+        self.assertFalse((home / ".e1-preparing.json").exists())
+
+    def test_trial_registers_production_gateway_and_package_provenance(self):
+        gateway = self.fixture.root / "gateway"
+        (gateway / "bin").mkdir(parents=True)
+        launcher = gateway / "bin/mcp-server.sh"
+        launcher.write_text("#!/bin/sh\nexit 0\n")
+        launcher.chmod(0o755)
+        env_file = self.fixture.root / "gateway.env"
+        env_file.write_text("TEST_ONLY=1\n")
+        manifest = self.share / "install-manifest.json"
+        write_json(
+            manifest,
+            {
+                "schema_version": "mavis.installed-core/v1",
+                "core_binary": str(self.core.resolve()),
+                "core_sha256": sha256_file(self.core),
+                "trial_runtime_sha256": sha256_file(Path(trial_runtime.__file__)),
+                "launcher": str((ROOT / "bin/local-codex").resolve()),
+                "launcher_sha256": sha256_file(ROOT / "bin/local-codex"),
+            },
+        )
+        binding = self._binding("candidate")
+        path = trial_runtime.prepare_trial(
+            binding,
+            mavis_home=self.fixture.home,
+            share=self.share,
+            core_binary=self.core,
+            base_url="http://127.0.0.1:8001/v1",
+            records=self.records,
+            gateway_root=gateway,
+            gateway_env_file=env_file,
+            package_manifest=manifest,
+        )
+        receipt = read_json(path)
+        config = Path(receipt["config_path"]).read_text()
+        self.assertIn("[mcp_servers.model-gateway]", config)
+        self.assertIn(str(launcher.resolve()), config)
+        self.assertEqual(receipt["core_provenance"], "installed-package")
+        with patch.object(
+            trial_runtime, "accepted_main_profile", return_value=self.profile
+        ):
+            trial_runtime.validate_trial_receipt(receipt)
+            launcher.write_text("changed")
+            with self.assertRaisesRegex(ValueError, "gateway source changed"):
+                trial_runtime.validate_trial_receipt(receipt)
+
+    def test_generation_lease_refuses_second_owner(self):
+        with generation_lease(self.fixture.home, purpose="foreground"):
+            with self.assertRaisesRegex(RuntimeError, "owns the host lease"):
+                with generation_lease(self.fixture.home, purpose="e1-trial"):
+                    pass
+        with generation_lease(self.fixture.home, purpose="e1-trial"):
+            pass
+
+    def test_contended_trial_stops_before_runtime_load(self):
+        gateway = self.fixture.root / "gateway"
+        (gateway / "bin").mkdir(parents=True)
+        script = gateway / "bin/mcp-server.sh"
+        script.write_text("#!/bin/sh\nexit 0\n")
+        script.chmod(0o755)
+        env_file = self.fixture.root / "gateway.env"
+        env_file.write_text("TEST_ONLY=1\n")
+        write_json(
+            self.share / "install-manifest.json",
+            {
+                "schema_version": "mavis.installed-core/v1",
+                "core_binary": str(self.core.resolve()),
+                "core_sha256": sha256_file(self.core),
+                "trial_runtime_sha256": sha256_file(Path(trial_runtime.__file__)),
+                "launcher": str((ROOT / "bin/local-codex").resolve()),
+                "launcher_sha256": sha256_file(ROOT / "bin/local-codex"),
+            },
+        )
+        environment = {
+            "MAVIS_HOME": str(self.fixture.home),
+            "LOCAL_CODEX_SHARE_DIR": str(self.share),
+            "LOCAL_CODEX_BIN": str(self.core),
+            "MAVIS_GATEWAY_ROOT": str(gateway),
+            "MAVIS_GATEWAY_ENV_FILE": str(env_file),
+        }
+        with (
+            patch.dict(os.environ, environment),
+            patch.object(
+                trial_runtime, "accepted_main_profile", return_value=self.profile
+            ),
+            patch.object(trial_runtime, "ensure_runtime") as ensure,
+            generation_lease(self.fixture.home, purpose="foreground"),
+        ):
+            with self.assertRaisesRegex(RuntimeError, "owns the host lease"):
+                trial_runtime.run_trial("repair", "candidate", "regression", "task")
+        ensure.assert_not_called()
+
+    def test_transcript_must_belong_to_observed_session_and_home(self):
+        home = self.fixture.root / "trial-home"
+        home.mkdir()
+        transcript = home / "rollout.jsonl"
+        transcript.write_text('{"type":"session_meta","payload":{"id":"session-a"}}\n')
+        self.assertEqual(
+            matching_trial_transcript(transcript, home, "session-a"),
+            transcript.resolve(),
+        )
+        with self.assertRaisesRegex(ValueError, "session differs"):
+            matching_trial_transcript(transcript, home, "session-b")
+        outside = self.fixture.root / "other.jsonl"
+        outside.write_text(transcript.read_text())
+        with self.assertRaisesRegex(ValueError, "outside disposable home"):
+            matching_trial_transcript(outside, home, "session-a")
+
+    def test_terminated_wrapper_reaps_core_and_finalizes_receipt(self):
+        self.core.write_text(
+            '#!/bin/sh\nprintf "%s" "$$" > "$CODEX_HOME/core.pid"\nexec sleep 30\n'
+        )
+        binding = self._binding("candidate")
+        path = trial_runtime.prepare_trial(
+            binding,
+            mavis_home=self.fixture.home,
+            share=self.share,
+            core_binary=self.core,
+            base_url="http://127.0.0.1:8001/v1",
+            records=self.records,
+        )
+        argv = read_json(path)["core_argv"]
+        script = (
+            "import sys; from unittest.mock import patch; import trial_runtime, launch_core; "
+            "patch.object(trial_runtime, 'validate_trial_receipt').start(); "
+            "sys.exit(launch_core.launch_trial(__import__('pathlib').Path(sys.argv[1]), sys.argv[2:]))"
+        )
+        environment = os.environ.copy()
+        environment["PYTHONPATH"] = os.pathsep.join((str(ROOT), str(ROOT / "mavis")))
+        wrapper = subprocess.Popen(
+            [sys.executable, "-c", script, str(path), *argv],
+            env=environment,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+        )
+        pid_path = Path(read_json(path)["runtime_home"]) / "core.pid"
+        try:
+            deadline = time.monotonic() + 10
+            while (
+                not pid_path.exists()
+                and wrapper.poll() is None
+                and time.monotonic() < deadline
+            ):
+                time.sleep(0.05)
+            self.assertTrue(
+                pid_path.is_file(),
+                wrapper.stderr.read().decode() if wrapper.poll() is not None else "",
+            )
+            child_pid = int(pid_path.read_text())
+            wrapper.terminate()
+            wrapper.communicate(timeout=10)
+            self.assertFalse(_pid_alive(child_pid))
+            receipt = read_json(path)
+            self.assertEqual(receipt["state"], "terminated")
+            self.assertEqual(receipt["termination_signal"], signal.SIGTERM)
+            self.assertEqual(receipt["observation_status"], "inconclusive")
+        finally:
+            if wrapper.poll() is None:
+                wrapper.kill()
+                wrapper.wait()
+
+
+def _pid_alive(pid: int) -> bool:
+    try:
+        os.kill(pid, 0)
+        return True
+    except ProcessLookupError:
+        return False
 
 
 if __name__ == "__main__":
