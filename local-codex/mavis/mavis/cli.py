@@ -13,6 +13,7 @@ from .e1 import E1Runner
 from .e1_bootstrap import create_bootstrap, prepare_bootstrap_review
 from .experiments import ExperimentStore, review_assignment_requirements
 from .e0_tasks import prepare_small_repository
+from .e2_tasks import prepare_heldout, verify_heldout
 from .evaluations import E0_CASES, E0Evaluator
 from .maintenance import MaintenanceQueue
 from .objectives import ObjectiveStore
@@ -151,6 +152,11 @@ def build_parser() -> argparse.ArgumentParser:
         "--omlx-binary", default="/Users/dustinpainter/.venvs/omlx-dev/bin/omlx"
     )
     evaluate_sub.add_parser("prepare-small")
+    e2 = evaluate_sub.add_parser("e2")
+    e2_sub = e2.add_subparsers(dest="e2_command", required=True)
+    e2_sub.add_parser("prepare-heldout")
+    e2_verify = e2_sub.add_parser("verify-heldout")
+    e2_verify.add_argument("manifest", type=Path)
 
     e1 = subcommands.add_parser("e1")
     e1_sub = e1.add_subparsers(dest="e1_command", required=True)
@@ -372,6 +378,12 @@ def main(argv: list[str] | None = None) -> int:
     if args.command == "eval":
         if args.eval_suite == "prepare-small":
             print_json({"manifest": str(prepare_small_repository(home))})
+            return 0
+        if args.eval_suite == "e2":
+            if args.e2_command == "prepare-heldout":
+                print_json({"manifest": str(prepare_heldout(home))})
+            else:
+                print_json(verify_heldout(args.manifest))
             return 0
         result = E0Evaluator(home, runtime_config(args)).run(args.case)
         print_json(result)
