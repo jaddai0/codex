@@ -26,6 +26,7 @@ from .evaluations import E0_CASES, E0Evaluator
 from .maintenance import MaintenanceQueue
 from .maintenance_runtime import tick as maintenance_tick
 from .objectives import ObjectiveStore
+from .output_inspection import inspect_output
 from .project_memory import ProjectMemory, KINDS
 from .retrieval import ProjectIndex
 from .runtime import (
@@ -113,6 +114,15 @@ def build_parser() -> argparse.ArgumentParser:
     run.add_argument("--timeout", type=float)
     run.add_argument("--check-id", action="append", default=[])
     run.add_argument("argv", nargs=argparse.REMAINDER)
+
+    output = subcommands.add_parser("output")
+    output_sub = output.add_subparsers(dest="output_command", required=True)
+    inspect = output_sub.add_parser("inspect")
+    inspect.add_argument("receipt", type=Path)
+    inspect.add_argument("--model-id")
+    inspect.add_argument("--model-path", type=Path)
+    inspect.add_argument("--endpoint", default="http://127.0.0.1:8001/v1")
+    inspect.add_argument("--timeout", type=float, default=90.0)
 
     search = subcommands.add_parser("archive-search")
     search.add_argument("conversation_id")
@@ -433,6 +443,14 @@ def main(argv: list[str] | None = None) -> int:
         ObjectiveStore(home).add_receipt(args.objective_id, receipt)
         print(receipt)
         return 0
+    if args.command == "output":
+        result = inspect_output(
+            home, args.receipt, model_id=args.model_id,
+            model_path=args.model_path, endpoint=args.endpoint,
+            timeout=args.timeout,
+        )
+        print_json(result)
+        return 1 if result["model"]["status"] in {"inconclusive", "unavailable"} else 0
     if args.command == "eval":
         if args.eval_suite == "prepare-small":
             print_json({"manifest": str(prepare_small_repository(home))})

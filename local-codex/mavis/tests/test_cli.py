@@ -329,7 +329,7 @@ class LauncherRoutingTests(unittest.TestCase):
             env = {**os.environ, "LOCAL_CODEX_SHARE_DIR": str(share),
                    "MAVIS_HOME": str(Path(directory) / "service"),
                    "CODEX_HOME": str(Path(directory) / "codex")}
-            for command in ("objective", "archive-retention", "maintenance", "e1"):
+            for command in ("objective", "archive-retention", "maintenance", "e1", "output"):
                 with self.subTest(command=command):
                     run = subprocess.run([str(launcher), command, "--help"],
                                          env=env, text=True, capture_output=True, timeout=15)

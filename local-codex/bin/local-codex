@@ -10,7 +10,7 @@ model_args=()
 gateway_env_args=()
 
 case "${1:-}" in
-  runtime|objective|run|archive-search|archive-retention|storage-pressure|pre-compact|project-index|project-memory|eval|e1|maintenance)
+  runtime|objective|run|output|archive-search|archive-retention|storage-pressure|pre-compact|project-index|project-memory|eval|e1|maintenance)
   export CODEX_HOME=${CODEX_HOME:-$runtime_home}
   export MAVIS_HOME=${MAVIS_HOME:-${HOME}/.local-codex/mavis-service}
   if [[ "$MAVIS_HOME" != /* ]]; then

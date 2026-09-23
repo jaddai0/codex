@@ -26,6 +26,21 @@ The command exits nonzero and records `reject` until all ten mandatory cases
 have real receipts. Missing local-model or native-harness work is reported as
 blocked rather than replaced with synthetic success.
 
+## Inspect a command receipt
+
+`local-codex output inspect RECEIPT.json` (or
+`PYTHONPATH=local-codex/mavis python3 -m mavis output inspect RECEIPT.json` in
+the source checkout)
+checks an existing Mavis host receipt and its complete raw logs, then prints the
+host verdict, exit status, timeout, failure and count lines, and raw output
+reference. Known test formats use deterministic parsing. For irregular output,
+`--model-id ID --model-path PATH` opts into exact-line observations from a
+small model already loaded on Mavis's local port 8001. The model cannot change
+the host verdict. If the full log exceeds the bounded model request, the
+command returns an inconclusive model result and a nonzero exit while keeping
+the verified host evidence visible. This source route does not claim that an
+installed model transport has been exercised.
+
 ## Architecture boundary check
 
 Run `PYTHONPATH=local-codex/mavis python3 -m mavis.architecture` from the fork
