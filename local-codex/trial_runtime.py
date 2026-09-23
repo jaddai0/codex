@@ -7,11 +7,13 @@ import hashlib
 import json
 import os
 from pathlib import Path
+import re
+import shutil
 import subprocess
 import sys
 
-from mavis.e1 import E1Runner, _clean_revision, _git
-from mavis.runtime import RuntimeConfig, ensure_runtime, inventory
+from mavis.e1 import E1Runner, _clean_revision
+from mavis.runtime import RuntimeConfig, endpoint_alive, ensure_runtime, inventory
 from mavis.storage import read_json, require_safe_id, sha256_file
 from prepare_runtime import (
     accepted_main_profile,
@@ -26,6 +28,12 @@ from prepare_runtime import (
 def trial_binding(mavis_home: Path, experiment_id: str, arm: str, case_id: str) -> dict:
     experiment_id = require_safe_id(experiment_id, "experiment id")
     case_id = require_safe_id(case_id, "case id")
+    if not all(
+        re.fullmatch(r"[A-Za-z0-9_-]+", value) for value in (experiment_id, case_id)
+    ):
+        raise ValueError(
+            "E1 trial IDs must use letters, digits, underscores, or hyphens"
+        )
     if arm not in {"baseline", "candidate"}:
         raise ValueError("E1 trial arm must be baseline or candidate")
     runner = E1Runner(mavis_home)
@@ -39,6 +47,8 @@ def trial_binding(mavis_home: Path, experiment_id: str, arm: str, case_id: str) 
     case = next((item for item in manifest["cases"] if item["id"] == case_id), None)
     if case is None:
         raise ValueError("unknown E1 case")
+    if not isinstance(case.get("task"), str) or not case["task"].strip():
+        raise ValueError("E1 case needs one frozen task")
     baseline = runner.store._read_snapshot(record["baseline"])
     candidate = runner.store._read_snapshot(record["candidate"])
     if (
@@ -98,15 +108,39 @@ def prepare_trial(
     core_binary: Path,
     base_url: str,
     records: list[dict],
+    gateway_root: Path | None = None,
+    gateway_env_file: Path | None = None,
+    package_manifest: Path | None = None,
 ) -> Path:
     record = binding["record"]
     arm, case_id = binding["arm"], binding["case_id"]
     runtime_home = binding["root"] / "runtime" / arm / case_id
     receipt_path = binding["root"] / "trials" / arm / f"{case_id}.json"
+    _recover_incomplete_preparation(
+        runtime_home,
+        receipt_path,
+        experiment_id=record["experiment_id"],
+        arm=arm,
+        case_id=case_id,
+    )
     if runtime_home.exists() or receipt_path.exists():
         raise FileExistsError("E1 trial already prepared")
     if not core_binary.is_file() or not os.access(core_binary, os.X_OK):
         raise FileNotFoundError("installed Mavis core is unavailable")
+    package_hash = None
+    if package_manifest is not None:
+        package = read_json(package_manifest)
+        launcher = Path(package.get("launcher", ""))
+        if (
+            package.get("schema_version") != "mavis.installed-core/v1"
+            or Path(package.get("core_binary", "")).resolve() != core_binary.resolve()
+            or package.get("core_sha256") != sha256_file(core_binary)
+            or package.get("trial_runtime_sha256") != sha256_file(Path(__file__))
+            or not launcher.is_file()
+            or package.get("launcher_sha256") != sha256_file(launcher)
+        ):
+            raise ValueError("E1 installed core differs from package manifest")
+        package_hash = sha256_file(package_manifest)
     template = (share / "base-instructions.md").read_text(encoding="utf-8")
     if not template.strip():
         raise ValueError("Mavis base instructions are empty")
@@ -119,6 +153,99 @@ def prepare_trial(
     model_id = binding["profile"]["model_identity"]["model_id"]
     catalog, selected = prepare_catalog(records, model_id, effective)
     runtime_home.mkdir(parents=True, mode=0o700)
+    marker = runtime_home / ".e1-preparing.json"
+    try:
+        atomic_write(
+            marker,
+            json.dumps(
+                {
+                    "schema_version": "mavis.e1-preparing/v1",
+                    "experiment_id": record["experiment_id"],
+                    "arm": arm,
+                    "case_id": case_id,
+                }
+            )
+            + "\n",
+        )
+        result = _write_trial_home(
+            binding,
+            mavis_home=mavis_home,
+            share=share,
+            core_binary=core_binary,
+            base_url=base_url,
+            catalog=catalog,
+            selected=selected,
+            effective=effective,
+            runtime_home=runtime_home,
+            receipt_path=receipt_path,
+            gateway_root=gateway_root,
+            gateway_env_file=gateway_env_file,
+            package_manifest=package_manifest,
+            package_hash=package_hash,
+        )
+        marker.unlink()
+        return result
+    except BaseException:
+        if not receipt_path.exists():
+            shutil.rmtree(runtime_home)
+        raise
+
+
+def _recover_incomplete_preparation(
+    runtime_home: Path,
+    receipt_path: Path,
+    *,
+    experiment_id: str,
+    arm: str,
+    case_id: str,
+) -> None:
+    if not runtime_home.exists() or receipt_path.exists():
+        return
+    marker_path = runtime_home / ".e1-preparing.json"
+    if not marker_path.is_file() or runtime_home.is_symlink():
+        return
+    marker = read_json(marker_path)
+    if marker != {
+        "schema_version": "mavis.e1-preparing/v1",
+        "experiment_id": experiment_id,
+        "arm": arm,
+        "case_id": case_id,
+    }:
+        return
+    expected = {
+        marker_path.name,
+        "accepted-model-instructions.md",
+        "omlx-models.json",
+        "config.toml",
+        "AGENTS.md",
+    }
+    if any(
+        path.name not in expected or path.is_symlink() or not path.is_file()
+        for path in runtime_home.iterdir()
+    ):
+        raise ValueError("E1 incomplete trial home has unexpected content")
+    shutil.rmtree(runtime_home)
+
+
+def _write_trial_home(
+    binding: dict,
+    *,
+    mavis_home: Path,
+    share: Path,
+    core_binary: Path,
+    base_url: str,
+    catalog: dict,
+    selected: str,
+    effective: str,
+    runtime_home: Path,
+    receipt_path: Path,
+    gateway_root: Path | None,
+    gateway_env_file: Path | None,
+    package_manifest: Path | None,
+    package_hash: str | None,
+) -> Path:
+    record = binding["record"]
+    arm, case_id = binding["arm"], binding["case_id"]
     instructions_path = runtime_home / "accepted-model-instructions.md"
     catalog_path = runtime_home / "omlx-models.json"
     atomic_write(instructions_path, effective)
@@ -127,10 +254,20 @@ def prepare_trial(
         runtime_home,
         local_base_url(base_url),
         selected,
+        gateway_root=gateway_root,
+        gateway_env_file=gateway_env_file,
         accepted_instructions_path=instructions_path,
     )
     ensure_persona(runtime_home, share / "persona.toml")
     trial_id = f"{record['experiment_id']}-{arm}-{case_id}"
+    core_argv = [
+        str(core_binary.resolve()),
+        "exec",
+        "-C",
+        str(binding["checkout"].resolve()),
+        "--",
+        binding["case"]["task"],
+    ]
     receipt = {
         "schema_version": "mavis.e1-trial-launch/v1",
         "state": "prepared",
@@ -139,6 +276,12 @@ def prepare_trial(
         "experiment_id": record["experiment_id"],
         "arm": arm,
         "case_id": case_id,
+        "task": binding["case"]["task"],
+        "task_sha256": hashlib.sha256(binding["case"]["task"].encode()).hexdigest(),
+        "core_argv": core_argv,
+        "core_argv_sha256": hashlib.sha256(
+            json.dumps(core_argv, separators=(",", ":")).encode()
+        ).hexdigest(),
         "manifest_sha256": record["workload"]["manifest_sha256"],
         "snapshot_path": binding["snapshot"]["path"],
         "snapshot_sha256": binding["snapshot"]["sha256"],
@@ -151,6 +294,23 @@ def prepare_trial(
         "mavis_home": str(mavis_home.resolve()),
         "core_binary": str(core_binary.resolve()),
         "core_sha256": sha256_file(core_binary),
+        "package_manifest": str(package_manifest.resolve())
+        if package_manifest
+        else None,
+        "package_manifest_sha256": package_hash,
+        "core_provenance": "installed-package"
+        if package_manifest
+        else "fixture-unverified",
+        "gateway_root": str(gateway_root.resolve()) if gateway_root else None,
+        "gateway_launcher_sha256": sha256_file(gateway_root / "bin/mcp-server.sh")
+        if gateway_root
+        else None,
+        "gateway_env_file": str(gateway_env_file.resolve())
+        if gateway_env_file
+        else None,
+        "gateway_env_sha256": sha256_file(gateway_env_file)
+        if gateway_env_file
+        else None,
         "selected_model": selected,
         "model_provider": "omlx",
         "config_path": str((runtime_home / "config.toml").resolve()),
@@ -192,6 +352,25 @@ def validate_trial_receipt(receipt: dict) -> None:
         or receipt["selected_model"] != profile["model_identity"]["model_id"]
     ):
         raise ValueError("E1 trial receipt lost its frozen binding")
+    expected_argv = [
+        receipt["core_binary"],
+        "exec",
+        "-C",
+        receipt["checkout"],
+        "--",
+        binding["case"]["task"],
+    ]
+    if (
+        receipt.get("task") != binding["case"]["task"]
+        or receipt.get("task_sha256")
+        != hashlib.sha256(binding["case"]["task"].encode()).hexdigest()
+        or receipt.get("core_argv") != expected_argv
+        or receipt.get("core_argv_sha256")
+        != hashlib.sha256(
+            json.dumps(expected_argv, separators=(",", ":")).encode()
+        ).hexdigest()
+    ):
+        raise ValueError("E1 trial task or core command differs from frozen case")
     if (
         Path(receipt["runtime_home"]).resolve()
         != (binding["root"] / "runtime" / receipt["arm"] / receipt["case_id"]).resolve()
@@ -201,6 +380,37 @@ def validate_trial_receipt(receipt: dict) -> None:
         path_key = "core_binary" if name == "core" else f"{name}_path"
         if sha256_file(Path(receipt[path_key])) != receipt[f"{name}_sha256"]:
             raise ValueError(f"E1 trial {name} changed after preparation")
+    if receipt.get("core_provenance") == "installed-package" and not receipt.get(
+        "package_manifest"
+    ):
+        raise ValueError("E1 installed core provenance is missing")
+    if receipt.get("package_manifest"):
+        package_path = Path(receipt["package_manifest"])
+        package = read_json(package_path)
+        launcher = Path(package.get("launcher", ""))
+        if (
+            sha256_file(package_path) != receipt.get("package_manifest_sha256")
+            or package.get("schema_version") != "mavis.installed-core/v1"
+            or package.get("core_binary") != receipt["core_binary"]
+            or package.get("core_sha256") != receipt["core_sha256"]
+            or package.get("trial_runtime_sha256") != sha256_file(Path(__file__))
+            or not launcher.is_file()
+            or package.get("launcher_sha256") != sha256_file(launcher)
+            or receipt.get("core_provenance") != "installed-package"
+        ):
+            raise ValueError("E1 installed core provenance changed")
+    for key, digest_key in (
+        ("gateway_root", "gateway_launcher_sha256"),
+        ("gateway_env_file", "gateway_env_sha256"),
+    ):
+        if receipt.get(key):
+            path = (
+                Path(receipt[key]) / "bin/mcp-server.sh"
+                if key == "gateway_root"
+                else Path(receipt[key])
+            )
+            if sha256_file(path) != receipt[digest_key]:
+                raise ValueError("E1 gateway source changed")
     if receipt["instructions_sha256"] != receipt["effective_system_prompt_sha256"]:
         raise ValueError("E1 trial effective instructions changed")
 
@@ -221,6 +431,44 @@ def run_trial(experiment_id: str, arm: str, case_id: str, task: str) -> Path:
     ).resolve()
     endpoint = os.environ.get("OMLX_BASE_URL", "http://127.0.0.1:8001/v1")
     binding = trial_binding(mavis_home, experiment_id, arm, case_id)
+    if task != binding["case"]["task"]:
+        raise ValueError("E1 task differs from frozen case")
+    package_manifest = share / "install-manifest.json"
+    if (
+        core_binary != (share / "local-codex-core").resolve()
+        or not package_manifest.is_file()
+    ):
+        raise ValueError("E1 trial requires the installed package core")
+    package = read_json(package_manifest)
+    launcher = Path(package.get("launcher", ""))
+    if (
+        package.get("schema_version") != "mavis.installed-core/v1"
+        or package.get("core_binary") != str(core_binary)
+        or package.get("core_sha256") != sha256_file(core_binary)
+        or package.get("trial_runtime_sha256") != sha256_file(Path(__file__))
+        or not launcher.is_file()
+        or package.get("launcher_sha256") != sha256_file(launcher)
+    ):
+        raise ValueError("E1 installed package manifest differs from trial runtime")
+    gateway_root = Path(
+        os.environ.get(
+            "MAVIS_GATEWAY_ROOT",
+            Path.home()
+            / "Dev-Projects/ai-skills-dev-mavis-gateway/marketplace/plugins/model-gateway",
+        )
+    ).resolve()
+    gateway_launcher = gateway_root / "bin/mcp-server.sh"
+    if not gateway_launcher.is_file() or not os.access(gateway_launcher, os.X_OK):
+        raise FileNotFoundError("trusted Mavis gateway launcher is unavailable")
+    configured_env = os.environ.get("MAVIS_GATEWAY_ENV_FILE")
+    default_env = Path.home() / "Dev-Projects/env.env"
+    gateway_env_file = (
+        Path(configured_env).resolve()
+        if configured_env
+        else (default_env.resolve() if default_env.is_file() else None)
+    )
+    if gateway_env_file is not None and not gateway_env_file.is_file():
+        raise FileNotFoundError("configured gateway environment file is unavailable")
     if (
         not core_binary.is_file()
         or not os.access(core_binary, os.X_OK)
@@ -239,40 +487,60 @@ def run_trial(experiment_id: str, arm: str, case_id: str, task: str) -> Path:
             os.environ.get("MAVIS_OMLX_BIN", Path.home() / ".venvs/omlx-dev/bin/omlx")
         ),
     )
-    if (binding["root"] / "runtime" / arm / case_id).exists() or (
-        binding["root"] / "trials" / arm / f"{case_id}.json"
-    ).exists():
-        raise FileExistsError("E1 trial already prepared")
-    ensure_runtime(runtime)
-    refreshed = trial_binding(mavis_home, experiment_id, arm, case_id)
-    if (
-        refreshed["snapshot"] != binding["snapshot"]
-        or refreshed["profile"]["_source_sha256"]
-        != binding["profile"]["_source_sha256"]
-    ):
-        raise ValueError("E1 trial inputs changed during runtime admission")
-    binding = refreshed
-    receipt = prepare_trial(
-        binding,
-        mavis_home=mavis_home,
-        share=share,
-        core_binary=core_binary,
-        base_url=endpoint,
-        records=inventory(endpoint),
+    runtime_home = binding["root"] / "runtime" / arm / case_id
+    receipt_path = binding["root"] / "trials" / arm / f"{case_id}.json"
+    _recover_incomplete_preparation(
+        runtime_home,
+        receipt_path,
+        experiment_id=experiment_id,
+        arm=arm,
+        case_id=case_id,
     )
+    if runtime_home.exists() or receipt_path.exists():
+        raise FileExistsError("E1 trial already prepared")
+    from generation_lease import generation_lease
     from launch_core import launch_trial
 
-    if (
-        launch_trial(
-            receipt,
-            [str(core_binary), "exec", "-C", str(binding["checkout"]), "--", task],
+    with generation_lease(mavis_home, purpose=f"e1:{experiment_id}:{arm}:{case_id}"):
+        if endpoint_alive(runtime.iris_endpoint):
+            if any(
+                item.get("loaded") and item.get("model_type") != "embedding"
+                for item in inventory(runtime.iris_endpoint)
+            ):
+                raise RuntimeError("IRIS has a loaded local generation model")
+        ensure_runtime(runtime)
+        refreshed = trial_binding(mavis_home, experiment_id, arm, case_id)
+        if (
+            refreshed["snapshot"] != binding["snapshot"]
+            or refreshed["profile"]["_source_sha256"]
+            != binding["profile"]["_source_sha256"]
+        ):
+            raise ValueError("E1 trial inputs changed during runtime admission")
+        binding = refreshed
+        receipt = prepare_trial(
+            binding,
+            mavis_home=mavis_home,
+            share=share,
+            core_binary=core_binary,
+            base_url=endpoint,
+            records=inventory(endpoint),
+            gateway_root=gateway_root,
+            gateway_env_file=gateway_env_file,
+            package_manifest=package_manifest,
         )
-        != 0
-    ):
-        raise RuntimeError(
-            f"E1 trial did not produce a matching effective-config observation: {receipt}"
-        )
-    return receipt
+        argv = [
+            str(core_binary),
+            "exec",
+            "-C",
+            str(binding["checkout"].resolve()),
+            "--",
+            task,
+        ]
+        if launch_trial(receipt, argv, lease_held=True) != 0:
+            raise RuntimeError(
+                f"E1 trial did not produce a matching effective-config observation: {receipt}"
+            )
+        return receipt
 
 
 def main() -> int:
