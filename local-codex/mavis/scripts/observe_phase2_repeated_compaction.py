@@ -307,7 +307,7 @@ def main() -> int:
     prompts = (
         f"Remember this exact early design decision for project P2: {fact}. Do not edit files. Reply only ACK1.",
         "The first compaction is complete. Do not edit files. Reply only ACK2.",
-        "What was the exact early design decision for project P2? Do not edit files. Reply with only its full value.",
+        "What exact P2 marker did I give at the start? Copy the entire string from P2_ through =sqlite-before-postgres. Do not edit files. Reply only with that complete marker.",
     )
     answers = ("ACK1", "ACK2", fact)
     sessions = home / ".local-codex" / "sessions"
