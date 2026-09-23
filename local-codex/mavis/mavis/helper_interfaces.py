@@ -51,7 +51,13 @@ class LibrarianEvidence:
         if not self.archive.manifest_path.is_file():
             raise ValueError("transcript archive has no manifest")
         manifest = read_json(self.archive.manifest_path)
-        archived = {(item["path"], item["sha256"]) for item in manifest["segments"]}
+        archived = set()
+        for item in manifest["segments"]:
+            try:
+                resolved = self.archive.resolve_segment_file(item["path"])
+            except ValueError:
+                continue
+            archived.add((str(resolved), item["sha256"]))
         allowed = set()
         for item in evidence:
             if (
@@ -61,8 +67,11 @@ class LibrarianEvidence:
                 continue
             if (item["path"], item["sha256"]) not in archived:
                 continue
-            path = Path(item["path"])
-            if not path.is_file() or sha256_file(path) != item["sha256"]:
+            try:
+                path = self.archive.resolve_segment_file(item["path"])
+            except ValueError:
+                continue
+            if sha256_file(path) != item["sha256"]:
                 continue
             lines = path.read_text(encoding="utf-8").splitlines()
             line = item["line"]
