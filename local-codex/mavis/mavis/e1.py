@@ -19,6 +19,14 @@ def _git(path: Path, *args: str) -> str:
     return result.stdout.strip()
 
 
+def _clean_revision(checkout: Path) -> str:
+    """Bind E1 to committed content; ignored files are disallowed too."""
+    revision = _git(checkout, "rev-parse", "HEAD")
+    if _git(checkout, "status", "--porcelain", "--untracked-files=all", "--ignored"):
+        raise ValueError("E1 checkout must be clean, including ignored files")
+    return revision
+
+
 def _verify_host_receipt(
     path: Path, *, command: list[str], cwd: Path, check_id: str, revision: str
 ) -> dict[str, Any]:
@@ -183,6 +191,7 @@ def validate_e1_bundle(home: Path, record: dict[str, Any]) -> str:
             case_id = case["id"]
             result_path = root / "results" / arm / f"{case_id}.json"
             result = read_json(result_path)
+            checkout = root / "checkouts" / arm / case_id
             if (
                 result.get("schema_version") != "mavis.e1-case-result/v1"
                 or result.get("experiment_id") != record["experiment_id"]
@@ -194,6 +203,8 @@ def validate_e1_bundle(home: Path, record: dict[str, Any]) -> str:
                 or len(result.get("checks", [])) != len(case["checks"])
             ):
                 raise ValueError("E1 case result lost its frozen binding")
+            if _clean_revision(checkout) != result["checked_revision"]:
+                raise ValueError("E1 checked checkout changed after host evidence")
             check_hashes = []
             for expected, check in zip(case["checks"], result["checks"], strict=True):
                 receipt_path = Path(check["receipt"])
@@ -427,48 +438,17 @@ class E1Runner:
         return receipt
 
     def compare_native(self, experiment_id: str, case_id: str) -> dict[str, Any]:
-        """Use the accepted gateway job's retained report, with no supplied file."""
-        record, manifest = self._frozen(experiment_id)
-        case = next((item for item in manifest["cases"] if item["id"] == case_id), None)
-        if case is None:
-            raise ValueError("unknown E1 case")
-        receipt = read_json(self._root(experiment_id) / "dispatch" / f"{case_id}.json")
-        checkout = self._root(experiment_id) / "checkouts" / "candidate" / case_id
-        if (receipt.get("schema_version") != "mavis.e1-native-dispatch/v1"
-                or receipt.get("experiment_id") != experiment_id or receipt.get("case_id") != case_id
-                or receipt.get("candidate_sha256") != record["candidate"]["sha256"]
-                or receipt.get("starting_revision") != case["revision"]
-                or Path(receipt.get("checkout", "")).resolve() != checkout.resolve()):
-            raise ValueError("native dispatch lost its frozen candidate binding")
-        job_id = require_safe_id(receipt.get("job_id"), "candidate job id")
-        status = self.store.gateway_status_reader(job_id)
-        _validate_gateway_status(status, job_id)
-        binding = status.get("mavis_binding") if isinstance(status, dict) else None
-        report = Path(receipt.get("report_path", ""))
-        job_dir = Path(receipt.get("job_dir", ""))
-        assignment = Path(receipt.get("assignment_path", ""))
-        saved_assignment = read_json(assignment)
-        case_result = read_json(self._root(experiment_id) / "results" / "candidate" / f"{case_id}.json")
-        if (not isinstance(status, dict) or status.get("job_id") != job_id
-                or status.get("state") != "completed" or status.get("exit_code") != 0
-                or status.get("accepted") is not True or not isinstance(binding, dict)
-                or binding.get("objective_id") != experiment_id
-                or binding.get("starting_revision") != case["revision"]
-                or binding.get("changed_revision") != case_result.get("checked_revision")
-                or Path(binding.get("cwd", "")).resolve() != checkout.resolve()
-                or binding.get("owned_paths") != [str(checkout)]
-                or binding.get("owner") != saved_assignment.get("mavis_owner")
-                or binding.get("required_checks") != [check["id"] for check in case["checks"]]
-                or not isinstance(binding.get("requirements"), list)
-                or not all(item in binding["requirements"] for item in candidate_assignment_requirements(record))
-                or not job_dir.is_absolute() or not report.is_absolute()
-                or report.parent.resolve() != job_dir.resolve() or not report.is_file()
-                or not assignment.is_absolute() or assignment.parent.resolve() != job_dir.resolve()
-                or sha256_file(assignment) != receipt.get("assignment_sha256")
-                or binding.get("assignment_sha256") != receipt.get("assignment_sha256")
-                or binding.get("report_sha256") != sha256_file(report)):
-            raise ValueError("native gateway candidate receipt or report is not accepted and bound")
-        return self.compare(experiment_id, job_id, report)
+        """Gate native comparison on installed-runtime profile evidence.
+
+        Native gateway acceptance proves the worker's code task, not that Mavis
+        selected the frozen profile for E1. The selector has no host receipt yet.
+        """
+        self._frozen(experiment_id)
+        require_safe_id(case_id, "case id")
+        raise ValueError(
+            "native E1 comparison requires a host-produced installed Mavis runtime "
+            "profile activation receipt; the selector does not expose one yet"
+        )
 
     def check(self, experiment_id: str, arm: str, case_id: str) -> dict[str, Any]:
         record, manifest = self._frozen(experiment_id)
@@ -490,7 +470,7 @@ class E1Runner:
             or entry["starting_revision"] != case["revision"]
         ):
             raise ValueError("case lacks a matching prepared checkout")
-        checked_revision = _git(checkout, "rev-parse", "HEAD")
+        checked_revision = _clean_revision(checkout)
         if (
             subprocess.run(
                 [
@@ -527,6 +507,8 @@ class E1Runner:
                     "verdict": receipt["verdict"],
                 }
             )
+        if _clean_revision(checkout) != checked_revision:
+            raise ValueError("E1 check changed the committed checkout")
         result = {
             "schema_version": "mavis.e1-case-result/v1",
             "experiment_id": experiment_id,
@@ -586,14 +568,14 @@ class E1Runner:
                     or not result.get("checked_revision")
                 ):
                     raise ValueError("E1 case result lost its frozen binding")
+                checkout = self._root(experiment_id) / "checkouts" / arm / case["id"]
+                if _clean_revision(checkout) != result["checked_revision"]:
+                    raise ValueError("E1 checked checkout changed before comparison")
                 for expected, check in zip(
                     case["checks"], result["checks"], strict=True
                 ):
                     receipt_path = Path(check["receipt"])
                     receipt = read_json(receipt_path)
-                    checkout = (
-                        self._root(experiment_id) / "checkouts" / arm / case["id"]
-                    )
                     if (
                         check["id"] != expected["id"]
                         or sha256_file(receipt_path) != check["sha256"]
