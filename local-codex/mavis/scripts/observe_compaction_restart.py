@@ -1,8 +1,4 @@
-"""Drive a real installed TUI compact/resume canary from a terminal.
-
-After the first ACK, enter /compact, wait for its completion, then /exit.
-After the resumed answer, enter /exit. Each command needs Return.
-"""
+"""Drive real installed TUI compaction and resume in a private terminal."""
 
 from __future__ import annotations
 
@@ -15,28 +11,17 @@ import sys
 import tempfile
 import time
 import uuid
-from urllib.parse import quote
 
 from mavis.evaluations import installed_candidate_fingerprint
-from mavis.runtime import (RuntimeConfig, acquire_iris_model_drain,
-                           endpoint_alive, ensure_runtime, handoff_lease_fd, inventory,
-                           iris_drain_headers, load_model, loaded_generation_models,
-                           park_mavis_server,
-                           request_json, require_idle_iris_handoff,
-                           require_installed_selected_model, release_iris_model_drain,
-                           wait_iris_model_drain,
-                           with_mavis_handoff_lease)
+from mavis.runtime import RuntimeConfig, require_installed_selected_model, with_mavis_handoff_lease
 from mavis.storage import write_json
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+from observe_phase2_repeated_compaction import _run_stage
+from shared_gpu_observation import renew_gpu_lease, shared_mavis_model
 
 
 def events(path: Path) -> list[dict]:
-    """Parse a rollout JSONL file, tolerating only an incomplete trailing line.
-
-    A live rollout can end in a partially written record while its writer is
-    still running. That single trailing fragment is dropped. Any malformed
-    newline-terminated line is a real integrity failure and is reported
-    clearly rather than surfacing a bare JSONDecodeError.
-    """
+    """Parse rollout JSONL, ignoring only an incomplete trailing record."""
     records: list[dict] = []
     data = path.read_bytes()
     lines = data.split(b"\n")
@@ -64,8 +49,7 @@ def events(path: Path) -> list[dict]:
 def main() -> int:
     home = Path.home()
     service = home / ".local-codex" / "mavis-service"
-    config = RuntimeConfig(home=service)
-    model_path = f"/v1/models/{quote(config.model, safe='')}"
+    config = RuntimeConfig(home=service, allow_concurrent_local=True)
     task = service / "evaluations" / "e0" / f"compaction-live-{uuid.uuid4().hex}"
     task.mkdir(parents=True)
     workspace = Path(tempfile.mkdtemp(prefix="mavis-e0-compact-", dir="/private/tmp")).resolve()
@@ -74,10 +58,10 @@ def main() -> int:
                     "-c", "user.email=mavis@local.invalid", "commit", "--allow-empty",
                     "-qm", "fixture"], check=True)
     fact = f"MAVIS_E0_COMPACT_{uuid.uuid4().hex}=orchid-lantern-47"
-
-    def loaded(endpoint: str) -> bool:
-        return any(item.get("id") == config.model and item.get("loaded")
-                   for item in inventory(endpoint))
+    prompts = (f"Remember this exact fact: {fact}. Reply only ACK.",
+               "What exact fact did I give before compaction? Reply with only the fact.")
+    sessions = home / ".local-codex" / "sessions"
+    launcher = str(home / "Desktop" / "Mavis.command")
 
     def on_signal(number: int, _frame: object) -> None:
         raise KeyboardInterrupt(f"signal {number}")
@@ -85,116 +69,63 @@ def main() -> int:
     signal.signal(signal.SIGTERM, on_signal)
     signal.signal(signal.SIGINT, on_signal)
     require_installed_selected_model(config)
-    if (not loaded(config.iris_endpoint)
-            or (endpoint_alive(config.endpoint) and loaded_generation_models(config.endpoint))):
-        raise RuntimeError("IRIS must own the model and Mavis must be unloaded")
     candidate = installed_candidate_fingerprint()
     result: dict[str, object] = {"candidate": candidate,
                                  "workspace": str(workspace),
                                  "fact": fact, "task_root": str(task)}
-    lease_id: str | None = None
-    reservation = None
+    shared: dict[str, object] | None = None
     try:
-        reservation = park_mavis_server(config)
-        lease_id = acquire_iris_model_drain(config, owner="mavis-observe_compaction_restart")
-        result["drain_lease_id"] = lease_id
-        wait_iris_model_drain(config, lease_id)
-        require_idle_iris_handoff(config)
-        request_json(config.iris_endpoint, model_path + "/unload", method="POST",
-                     timeout=180, headers=iris_drain_headers(lease_id))
-        if loaded(config.iris_endpoint):
-            raise RuntimeError("IRIS model did not unload")
-        reservation.close()
-        reservation = None
-        ensure_runtime(config, load=False)
-        load_model(config)
-        lease_fd = handoff_lease_fd()
-        env = {**os.environ, "MAVIS_PROJECT_DIR": str(workspace),
-               "PYTHONDONTWRITEBYTECODE": "1",
-               "MAVIS_GENERATION_LEASE_FD": str(lease_fd)}
-        launcher = str(home / "Desktop" / "Mavis.command")
-        started = time.time()
-        print(f"First Mavis TUI in {workspace}; wait for ACK, then /compact and /exit", flush=True)
-        first = subprocess.run([launcher, "--no-daemon", "--no-alt-screen", "-C",
-                                str(workspace), f"Remember this exact fact: {fact}. Reply only ACK."],
-                               cwd=workspace, env=env, pass_fds=(lease_fd,), timeout=900)
-        result["first_exit"] = first.returncode
-        session_root = home / ".local-codex" / "sessions"
-        transcript: list[dict] = []
-        rollout: Path | None = None
-        for path in sorted(session_root.glob("**/rollout-*.jsonl"),
-                           key=lambda item: item.stat().st_mtime, reverse=True):
-            if path.stat().st_mtime < started - 2:
-                continue
-            records = events(path)
-            if records and records[0].get("payload", {}).get("cwd") == str(workspace):
-                rollout = path
-                transcript = records
-                break
-        if rollout is None:
-            raise RuntimeError("first TUI did not create a rollout in the fixture")
-        result["rollout"] = str(rollout)
-        session = transcript[0]["payload"]["id"]
-        result["session_id"] = session
-        result["first_answer"] = next((item.get("payload", {}).get("last_agent_message")
-                                       for item in transcript if item.get("type") == "event_msg"
-                                       and item.get("payload", {}).get("type") == "task_complete"
-                                       and item.get("payload", {}).get("last_agent_message") == "ACK"), None)
-        result["compacted_event"] = any(item.get("type") == "compacted" for item in transcript)
-        handoff_dir = service / "transcripts" / session / "handoffs"
-        result["handoffs"] = [str(path) for path in handoff_dir.glob("*.json")]
-        if not (first.returncode == 0 and result["first_answer"] == "ACK"
-                and result["compacted_event"] and result["handoffs"]):
-            raise RuntimeError("first TUI or real compaction did not complete")
-        print("Resuming the same Mavis session; wait for the answer, then /exit", flush=True)
-        second = subprocess.run([launcher, "resume", "--no-daemon", "--no-alt-screen",
-                                 "-C", str(workspace), session,
-                                 "What exact fact did I give before compaction? Reply with only the fact."],
-                                cwd=workspace, env=env, pass_fds=(lease_fd,), timeout=900)
-        result["resume_exit"] = second.returncode
-        transcript = events(rollout)
-        answers = [item.get("payload", {}).get("last_agent_message")
-                   for item in transcript if item.get("type") == "event_msg"
-                   and item.get("payload", {}).get("type") == "task_complete"]
-        result["resumed_answer"] = answers[-1] if answers else None
-        result["exact_recovery"] = result["resumed_answer"] == fact
+        with shared_mavis_model(config, "installed Mavis compaction canary") as shared:
+            env = {"CODEX_HOME": str(home / ".local-codex"),
+                   "MAVIS_PROJECT_DIR": str(workspace),
+                   "MAVIS_PROJECT_ROOT": str(workspace),
+                   "PYTHONDONTWRITEBYTECODE": "1"}
+            env = {**os.environ, **env}
+            _pid, rollout, rows, first_exit = _run_stage(
+                [launcher, "--no-daemon", "--no-alt-screen", "-C", str(workspace), prompts[0]],
+                workspace=workspace, env=env, log=task / "terminal-first.log",
+                sessions=sessions, prompt=prompts[0], expected_answer="ACK",
+                expected_compactions=1, rollout=None, launch_started=time.time())
+            session = rows[0].get("payload", {}).get("id")
+            if not isinstance(session, str) or not session:
+                raise RuntimeError("first TUI did not create a session")
+            result.update({"rollout": str(rollout), "session_id": session,
+                           "first_exit": first_exit, "first_answer": "ACK",
+                           "compacted_event": any(row.get("type") == "compacted" for row in rows)})
+            handoff_dir = service / "transcripts" / session / "handoffs"
+            result["handoffs"] = [str(path) for path in handoff_dir.glob("*.json")]
+            if not result["compacted_event"] or not result["handoffs"]:
+                raise RuntimeError("first TUI did not persist its compaction handoff")
+            renew_gpu_lease()
+            _pid, resumed_rollout, _resumed_rows, resume_exit = _run_stage(
+                [launcher, "resume", "--no-daemon", "--no-alt-screen",
+                 "-C", str(workspace), session, prompts[1]],
+                workspace=workspace, env=env, log=task / "terminal-resume.log",
+                sessions=sessions, prompt=prompts[1], expected_answer=fact,
+                expected_compactions=0, rollout=rollout, launch_started=time.time())
+            if resumed_rollout != rollout:
+                raise RuntimeError("resumed TUI changed the rollout")
+            result["resume_exit"] = resume_exit
+            transcript = events(rollout)
+            answers = [item.get("payload", {}).get("last_agent_message")
+                       for item in transcript if item.get("type") == "event_msg"
+                       and item.get("payload", {}).get("type") == "task_complete"]
+            result["resumed_answer"] = answers[-1] if answers else None
+            result["exact_recovery"] = result["resumed_answer"] == fact
     except BaseException as exc:
         result["error"] = repr(exc)
     finally:
-        try:
-            if reservation is None:
-                if loaded_generation_models(config.endpoint):
-                    request_json(config.endpoint, model_path + "/unload", method="POST", timeout=180)
-                if loaded_generation_models(config.endpoint):
-                    raise RuntimeError("Mavis model remained loaded")
-                reservation = park_mavis_server(config)
-        except BaseException as exc:
-            result["mavis_unload_error"] = repr(exc)
-        try:
-            if reservation is None or endpoint_alive(config.endpoint):
-                raise RuntimeError("cannot restore IRIS without an exclusive Mavis port reservation")
-            if lease_id is None and not loaded(config.iris_endpoint):
-                raise RuntimeError("IRIS cannot be restored without a drain lease")
-            if not loaded(config.iris_endpoint):
-                request_json(config.iris_endpoint, model_path + "/load", method="POST",
-                             timeout=900, headers=iris_drain_headers(lease_id))
-            result["iris_loaded"] = loaded(config.iris_endpoint)
-            result["mavis_loaded"] = False
-            if lease_id is not None and result["iris_loaded"] and not result["mavis_loaded"]:
-                release_iris_model_drain(config, lease_id)
-                result["drain_released"] = True
-            result["candidate_after"] = installed_candidate_fingerprint()
-        except BaseException as exc:
-            result["iris_restore_error"] = repr(exc)
-        if reservation is not None:
-            reservation.close()
+        if shared is not None:
+            result.update(shared)
+            result["iris_loaded"] = shared.get("iris_stayed_loaded")
+        result["candidate_after"] = installed_candidate_fingerprint()
         write_json(task / "result.json", result)
         print(task / "result.json", flush=True)
     return 0 if (result.get("first_exit") == result.get("resume_exit") == 0
                  and result.get("exact_recovery") is True
                  and result.get("iris_loaded") is True
                  and result.get("mavis_loaded") is False
-                 and result.get("drain_released") is True
+                 and result.get("gpu_lease_released") is True
                  and result.get("candidate_after") == candidate) else 1
 
 

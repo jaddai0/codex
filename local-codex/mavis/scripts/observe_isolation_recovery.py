@@ -1,22 +1,18 @@
 #!/usr/bin/env python3
-"""Observe an owned Mavis outage while IRIS holds a model drain lease."""
+"""Observe Mavis service recovery while IRIS keeps its model and process."""
 
 from __future__ import annotations
 
 import json
 from pathlib import Path
 import sys
-from urllib.parse import quote
 
 from mavis.evaluations import installed_candidate_fingerprint
 from mavis.runtime import (
-    RuntimeConfig, _listener_pids, acquire_iris_model_drain, endpoint_alive,
-    ensure_runtime, inventory, iris_drain_headers, loaded_generation_models,
-    omlx_live_process_binding, omlx_runtime_fingerprint, owns_running_server,
-    park_mavis_server,
-    release_iris_model_drain, request_json, require_idle_iris_handoff,
-    require_installed_selected_model, wait_iris_model_drain,
-    with_mavis_handoff_lease,
+    RuntimeConfig, _listener_pids, endpoint_alive, ensure_runtime, inventory,
+    loaded_generation_models, omlx_live_process_binding,
+    omlx_runtime_fingerprint, owns_running_server, park_mavis_server,
+    require_installed_selected_model, with_mavis_handoff_lease,
 )
 from mavis.storage import write_json
 
@@ -25,9 +21,8 @@ from mavis.storage import write_json
 def main() -> int:
     home = Path.home() / ".local-codex" / "mavis-service"
     config = RuntimeConfig(home=home)
-    model_path = f"/v1/models/{quote(config.model, safe='')}"
     root = home / "evaluations" / "e0"
-    result_path = root / "isolation-recovery-handoff.json"
+    result_path = root / "isolation-recovery-shared.json"
 
     def iris_loaded() -> bool:
         return any(row.get("id") == config.model and row.get("loaded") is True
@@ -37,7 +32,7 @@ def main() -> int:
     candidate = installed_candidate_fingerprint()
     runtime = omlx_runtime_fingerprint(config)
     if not endpoint_alive(config.iris_endpoint) or not iris_loaded():
-        raise RuntimeError("IRIS must own the model before service recovery")
+        raise RuntimeError("IRIS must keep its model for service recovery")
     if endpoint_alive(config.endpoint) and loaded_generation_models(config.endpoint):
         raise RuntimeError("Mavis must not own a model before service recovery")
     iris_pids = sorted(_listener_pids(8000))
@@ -46,7 +41,6 @@ def main() -> int:
     iris_process = omlx_live_process_binding(config, config.iris_endpoint, runtime)
 
     reservation = None
-    lease_id: str | None = None
     before_mavis: list[int] = []
     after_mavis: list[int] = []
     mavis_recovered_process: dict[str, object] | None = None
@@ -55,15 +49,6 @@ def main() -> int:
                                  "iris_pids": iris_pids}
     try:
         reservation = park_mavis_server(config)
-        lease_id = acquire_iris_model_drain(config, owner="mavis-isolation-recovery")
-        result["drain_lease_id"] = lease_id
-        wait_iris_model_drain(config, lease_id)
-        require_idle_iris_handoff(config)
-        request_json(config.iris_endpoint, model_path + "/unload", method="POST",
-                     timeout=180, headers=iris_drain_headers(lease_id))
-        if iris_loaded():
-            raise RuntimeError("IRIS model did not unload under its drain")
-
         reservation.close()
         reservation = None
         ensure_runtime(config, load=False)
@@ -76,8 +61,8 @@ def main() -> int:
         reservation = park_mavis_server(config)
         outage_observed = not endpoint_alive(config.endpoint)
         if (not outage_observed or not endpoint_alive(config.iris_endpoint)
-                or iris_loaded() or sorted(_listener_pids(8000)) != iris_pids):
-            raise RuntimeError("IRIS drain or Mavis outage was not observed")
+                or not iris_loaded() or sorted(_listener_pids(8000)) != iris_pids):
+            raise RuntimeError("IRIS changed or Mavis outage was not observed")
         reservation.close()
         reservation = None
         ensure_runtime(config, load=False)
@@ -85,8 +70,8 @@ def main() -> int:
         if (not after_mavis or after_mavis == before_mavis
                 or not owns_running_server(config)
                 or loaded_generation_models(config.endpoint)
-                or iris_loaded() or sorted(_listener_pids(8000)) != iris_pids):
-            raise RuntimeError("Mavis did not recover under the IRIS drain")
+                or not iris_loaded() or sorted(_listener_pids(8000)) != iris_pids):
+            raise RuntimeError("Mavis did not recover while IRIS stayed loaded")
         mavis_recovered_process = omlx_live_process_binding(config, config.endpoint, runtime)
     except BaseException as error:
         result["observation_error"] = repr(error)
@@ -94,23 +79,14 @@ def main() -> int:
         try:
             if reservation is None:
                 reservation = park_mavis_server(config)
-            if endpoint_alive(config.endpoint):
-                raise RuntimeError("Mavis port is not exclusively reserved")
-            if lease_id is None and not iris_loaded():
-                raise RuntimeError("IRIS model cannot be restored without its drain lease")
-            if not iris_loaded():
-                request_json(config.iris_endpoint, model_path + "/load", method="POST",
-                             timeout=900, headers=iris_drain_headers(lease_id))
-            if (not iris_loaded() or sorted(_listener_pids(8000)) != iris_pids
+            if (endpoint_alive(config.endpoint) or not iris_loaded()
+                    or sorted(_listener_pids(8000)) != iris_pids
                     or omlx_live_process_binding(config, config.iris_endpoint, runtime)
                     != iris_process):
-                raise RuntimeError("IRIS model or listener was not restored")
-            if lease_id is not None:
-                release_iris_model_drain(config, lease_id)
-                result["drain_released"] = True
-            result["iris_restored"] = True
+                raise RuntimeError("Mavis did not park or IRIS model/listener changed")
+            result["iris_stayed_loaded"] = True
         except BaseException as error:
-            result["restore_error"] = repr(error)
+            result["cleanup_error"] = repr(error)
         if reservation is not None:
             reservation.close()
         result.update({"before_mavis_pids": before_mavis,
@@ -118,8 +94,8 @@ def main() -> int:
                        "outage_observed": outage_observed})
         write_json(result_path, result)
 
-    if (result.get("observation_error") or result.get("restore_error")
-            or result.get("drain_released") is not True or not outage_observed
+    if (result.get("observation_error") or result.get("cleanup_error")
+            or result.get("iris_stayed_loaded") is not True or not outage_observed
             or not before_mavis or not after_mavis or before_mavis == after_mavis):
         print(result_path)
         return 1
@@ -129,13 +105,13 @@ def main() -> int:
         "omlx_runtime": runtime,
         "iris_process": iris_process,
         "mavis_recovered_process": mavis_recovered_process,
-        "recovery_under_iris_drain": True,
+        "recovery_while_iris_loaded": True,
         "before": {"iris_pids": iris_pids, "iris_model_loaded": True,
                    "mavis_pids": before_mavis},
         "after": {"iris_pids": iris_pids, "iris_model_loaded": True,
                   "mavis_pids": after_mavis},
         "outage_observed": True,
-        "handoff_receipt": str(result_path),
+        "shared_receipt": str(result_path),
     }
     path = root / "isolation-recovery-live.json"
     write_json(path, proof)

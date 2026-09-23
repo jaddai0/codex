@@ -1,4 +1,4 @@
-"""Run the installed E0 repair, then a separate read-only native Terra review."""
+"""Run the installed E0 repair with the shared GPU, then native Terra review."""
 
 from __future__ import annotations
 
@@ -7,28 +7,22 @@ import os
 from pathlib import Path
 import subprocess
 import sys
-from urllib.parse import quote
 
 from mavis.e0_tasks import prepare_small_repository, small_repository_review_prompt
 from mavis.e2_tasks import codex_terra_review_completed, terra_review_command
 from mavis.evaluations import installed_candidate_fingerprint
-from mavis.runtime import (RuntimeConfig, acquire_iris_model_drain,
-                           endpoint_alive, ensure_runtime, handoff_lease_fd, inventory,
-                           iris_drain_headers, load_model, loaded_generation_models,
-                           park_mavis_server,
-                           request_json, require_idle_iris_handoff,
-                           require_installed_selected_model, release_iris_model_drain,
-                           wait_iris_model_drain,
-                           with_mavis_handoff_lease)
+from mavis.runtime import (RuntimeConfig, endpoint_alive, handoff_lease_fd,
+                           inventory, loaded_generation_models,
+                           require_installed_selected_model, with_mavis_handoff_lease)
 from mavis.storage import sha256_file, write_json
+from shared_gpu_observation import shared_mavis_model
 
 
 @with_mavis_handoff_lease("observe_small_repository")
 def main() -> int:
     home = Path.home()
     service = home / ".local-codex" / "mavis-service"
-    config = RuntimeConfig(home=service)
-    model_path = f"/v1/models/{quote(config.model, safe='')}"
+    config = RuntimeConfig(home=service, allow_concurrent_local=True)
     manifest_path = prepare_small_repository(service)
     manifest = json.loads(manifest_path.read_text())
     repo = Path(manifest["repo"]).resolve()
@@ -44,72 +38,36 @@ def main() -> int:
         raise RuntimeError("IRIS must own the model and Mavis must be unloaded")
     candidate = installed_candidate_fingerprint()
     result: dict[str, object] = {"candidate": candidate, "manifest": str(manifest_path)}
-    lease_id: str | None = None
-    reservation = None
+    shared: dict[str, object] | None = None
     try:
-        reservation = park_mavis_server(config)
-        lease_id = acquire_iris_model_drain(config, owner="mavis-observe_small_repository")
-        result["drain_lease_id"] = lease_id
-        wait_iris_model_drain(config, lease_id)
-        require_idle_iris_handoff(config)
-        request_json(config.iris_endpoint, model_path + "/unload", method="POST",
-                     timeout=180, headers=iris_drain_headers(lease_id))
-        if loaded(config.iris_endpoint):
-            raise RuntimeError("IRIS model did not unload")
-        reservation.close()
-        reservation = None
-        ensure_runtime(config, load=False)
-        load_model(config)
-        prompt = (
-            "Fix the failing discount test in this repository. You may edit only "
-            "package/pricing.py. Preserve the already dirty user-notes.txt exactly. "
-            "Run python3 -m unittest discover -s tests -q, inspect the result, "
-            "and report the actual outcome. Do not commit the fixture."
-        )
-        command = [str(home / "Desktop" / "Mavis.command"), "exec", "--json",
-                   "-C", str(repo), "-s", "workspace-write", prompt]
-        lease_fd = handoff_lease_fd()
-        with (task / "installed-mavis-repair.jsonl").open("wb") as log:
-            run = subprocess.run(command, cwd=repo, stdin=subprocess.DEVNULL,
-                                 stdout=log, stderr=subprocess.STDOUT,
-                                 env={**os.environ, "MAVIS_PROJECT_DIR": str(repo),
-                                      "PYTHONDONTWRITEBYTECODE": "1",
-                                      "MAVIS_GENERATION_LEASE_FD": str(lease_fd)},
-                                 pass_fds=(lease_fd,), timeout=900)
-        result["mavis_exit"] = run.returncode
+        with shared_mavis_model(config, "installed Mavis small repair canary") as shared:
+            prompt = (
+                "Fix the failing discount test in this repository. You may edit only "
+                "package/pricing.py. Preserve the already dirty user-notes.txt exactly. "
+                "Run python3 -m unittest discover -s tests -q, inspect the result, "
+                "and report the actual outcome. Do not commit the fixture."
+            )
+            command = [str(home / "Desktop" / "Mavis.command"), "exec", "--json",
+                       "-C", str(repo), "-s", "workspace-write", prompt]
+            lease_fd = handoff_lease_fd()
+            with (task / "installed-mavis-repair.jsonl").open("wb") as log:
+                run = subprocess.run(command, cwd=repo, stdin=subprocess.DEVNULL,
+                                     stdout=log, stderr=subprocess.STDOUT,
+                                     env={**os.environ, "MAVIS_PROJECT_DIR": str(repo),
+                                          "PYTHONDONTWRITEBYTECODE": "1",
+                                          "MAVIS_GENERATION_LEASE_FD": str(lease_fd)},
+                                     pass_fds=(lease_fd,), timeout=900)
+            result["mavis_exit"] = run.returncode
     except BaseException as exc:
         result["mavis_error"] = repr(exc)
     finally:
-        try:
-            if reservation is None:
-                if loaded_generation_models(config.endpoint):
-                    request_json(config.endpoint, model_path + "/unload", method="POST", timeout=180)
-                if loaded_generation_models(config.endpoint):
-                    raise RuntimeError("Mavis model remained loaded")
-                reservation = park_mavis_server(config)
-        except BaseException as exc:
-            result["mavis_unload_error"] = repr(exc)
-        try:
-            if reservation is None or endpoint_alive(config.endpoint):
-                raise RuntimeError("cannot restore IRIS without an exclusive Mavis port reservation")
-            if lease_id is None and not loaded(config.iris_endpoint):
-                raise RuntimeError("IRIS cannot be restored without a drain lease")
-            if not loaded(config.iris_endpoint):
-                request_json(config.iris_endpoint, model_path + "/load", method="POST",
-                             timeout=900, headers=iris_drain_headers(lease_id))
-            result["iris_loaded"] = loaded(config.iris_endpoint)
-            result["mavis_loaded"] = False
-            if lease_id is not None and result["iris_loaded"] and not result["mavis_loaded"]:
-                release_iris_model_drain(config, lease_id)
-                result["drain_released"] = True
-        except BaseException as exc:
-            result["iris_restore_error"] = repr(exc)
-        if reservation is not None:
-            reservation.close()
+        if shared is not None:
+            result.update(shared)
+            result["iris_loaded"] = shared.get("iris_stayed_loaded")
         write_json(task / "handoff-summary.json", result)
     if not (result.get("mavis_exit") == 0 and result.get("iris_loaded") is True
             and result.get("mavis_loaded") is False
-            and result.get("drain_released") is True):
+            and result.get("gpu_lease_released") is True):
         print(task / "handoff-summary.json")
         return 1
 

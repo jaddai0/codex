@@ -1,28 +1,21 @@
 #!/usr/bin/env python3
-"""Run the installed E0 gate with a reversible IRIS/Mavis model handoff."""
+"""Run installed E0 while IRIS stays loaded and Mavis uses the shared GPU lease."""
 
 from __future__ import annotations
 
-import json
 import inspect
+import json
 import os
 from pathlib import Path
 import subprocess
 import sys
 import time
 import uuid
-from urllib.parse import quote
 
 from mavis.evaluations import E0_CASES, E0Evaluator, installed_candidate_fingerprint
-from mavis.runtime import (RuntimeConfig, acquire_iris_model_drain,
-                           endpoint_alive, ensure_runtime, inventory,
-                           iris_drain_headers,
-                           load_model, loaded_generation_models, park_mavis_server,
-                           request_json, require_idle_iris_handoff,
-                           require_installed_selected_model, release_iris_model_drain,
-                           wait_iris_model_drain,
-                           with_mavis_handoff_lease)
+from mavis.runtime import RuntimeConfig, park_mavis_server, require_installed_selected_model, with_mavis_handoff_lease
 from mavis.storage import sha256_file, write_json
+from shared_gpu_observation import shared_mavis_model
 
 
 @with_mavis_handoff_lease("final-e0")
@@ -30,15 +23,10 @@ def main() -> int:
     home = Path.home()
     service = home / ".local-codex" / "mavis-service"
     share = home / ".local" / "share" / "local-codex"
-    output = service / "evaluations" / "e0" / "final-installed-handoff.json"
+    output = service / "evaluations" / "e0" / "final-installed-shared.json"
     log = output.with_suffix(".log")
     live_log = output.with_name("tool-roundtrip-live.log")
-    config = RuntimeConfig(home=service)
-    model_path = f"/v1/models/{quote(config.model, safe='')}"
-
-    def loaded(endpoint: str) -> bool:
-        return any(row.get("id") == config.model and row.get("loaded") is True
-                   for row in inventory(endpoint))
+    config = RuntimeConfig(home=service, allow_concurrent_local=True)
 
     require_installed_selected_model(config)
     installed_package = share / "mavis"
@@ -47,10 +35,6 @@ def main() -> int:
             or not all(token in inspect.getsource(E0Evaluator.run)
                        for token in ("MAVIS_E0_RUN_ID", "case_receipts", "installed_candidate"))):
         raise RuntimeError("final E0 requires the complete installed Mavis package")
-    if not endpoint_alive(config.iris_endpoint) or not loaded(config.iris_endpoint):
-        raise RuntimeError("IRIS must own the original model before E0")
-    if endpoint_alive(config.endpoint) and loaded_generation_models(config.endpoint):
-        raise RuntimeError("Mavis generation models must be unloaded before handoff")
     before = installed_candidate_fingerprint()
     run_id = uuid.uuid4().hex
     started_at_epoch = time.time()
@@ -65,61 +49,30 @@ def main() -> int:
     env["PYTHONDONTWRITEBYTECODE"] = "1"
     env["CODEX_HOME"] = str(home / ".local-codex")
     env["MAVIS_E0_RUN_ID"] = run_id
-    lease_id: str | None = None
-    reservation = None
+    shared: dict[str, object] | None = None
     try:
-        reservation = park_mavis_server(config)
-        lease_id = acquire_iris_model_drain(config, owner="mavis-final-e0")
-        result["drain_lease_id"] = lease_id
-        wait_iris_model_drain(config, lease_id)
-        require_idle_iris_handoff(config)
-        request_json(config.iris_endpoint, model_path + "/unload", method="POST",
-                     timeout=180, headers=iris_drain_headers(lease_id))
-        if loaded(config.iris_endpoint):
-            raise RuntimeError("IRIS model did not unload")
-        reservation.close()
-        reservation = None
-        ensure_runtime(config, load=False)
-        load_model(config)
-        with live_log.open("wb") as stream:
-            run = subprocess.run([sys.executable, "-m", "mavis", "eval", "e0",
-                                  "--case", "tool-roundtrip"],
-                                 cwd=home, env=env, stdin=subprocess.DEVNULL,
-                                 stdout=stream, stderr=subprocess.STDOUT, timeout=1800)
-        result["tool_roundtrip_exit"] = run.returncode
+        with shared_mavis_model(config, "installed Mavis E0 tool roundtrip") as shared:
+            with live_log.open("wb") as stream:
+                run = subprocess.run([sys.executable, "-m", "mavis", "eval", "e0",
+                                      "--case", "tool-roundtrip"],
+                                     cwd=home, env=env, stdin=subprocess.DEVNULL,
+                                     stdout=stream, stderr=subprocess.STDOUT, timeout=1800)
+            result["tool_roundtrip_exit"] = run.returncode
     except BaseException as error:
         result["error"] = repr(error)
     finally:
-        try:
-            if reservation is None:
-                if loaded_generation_models(config.endpoint):
-                    request_json(config.endpoint, model_path + "/unload", method="POST", timeout=180)
-                if loaded_generation_models(config.endpoint):
-                    raise RuntimeError("Mavis model remained loaded")
-                reservation = park_mavis_server(config)
-        except BaseException as error:
-            result["mavis_unload_error"] = repr(error)
-        try:
-            if reservation is None or endpoint_alive(config.endpoint):
-                raise RuntimeError("cannot restore IRIS without an exclusive Mavis port reservation")
-            if lease_id is None and not loaded(config.iris_endpoint):
-                raise RuntimeError("IRIS cannot be restored without a drain lease")
-            if not loaded(config.iris_endpoint):
-                request_json(config.iris_endpoint, model_path + "/load", method="POST",
-                             timeout=900, headers=iris_drain_headers(lease_id))
-            result["iris_loaded"] = loaded(config.iris_endpoint)
-            result["mavis_loaded"] = False
-            if lease_id is not None and result["iris_loaded"] and not result["mavis_loaded"]:
-                release_iris_model_drain(config, lease_id)
-                result["drain_released"] = True
-            result["candidate_after"] = installed_candidate_fingerprint()
-        except BaseException as error:
-            result["iris_restore_error"] = repr(error)
+        if shared is not None:
+            result.update(shared)
+        result["candidate_after"] = installed_candidate_fingerprint()
         write_json(output, result)
-    if (result.get("tool_roundtrip_exit") == 0 and result.get("iris_loaded") is True
+    if (result.get("tool_roundtrip_exit") == 0
+            and result.get("iris_stayed_loaded") is True
             and result.get("mavis_loaded") is False
-            and result.get("drain_released") is True):
+            and result.get("gpu_lease_released") is True
+            and result.get("candidate_after") == before):
+        reservation = None
         try:
+            reservation = park_mavis_server(config)
             with log.open("wb") as stream:
                 env["MAVIS_E0_PARK_OWNER_PID"] = str(os.getpid())
                 run = subprocess.run([sys.executable, "-m", "mavis", "eval", "e0"],
@@ -137,13 +90,15 @@ def main() -> int:
                 result["summary_error"] = "E0 did not write a fresh run summary"
         except BaseException as error:
             result["e0_error"] = repr(error)
-        write_json(output, result)
-    if reservation is not None:
-        reservation.close()
+        finally:
+            if reservation is not None:
+                reservation.close()
+            write_json(output, result)
     print(output)
-    return 0 if (result.get("e0_exit") == 0 and result.get("iris_loaded") is True
+    return 0 if (result.get("e0_exit") == 0
+                 and result.get("iris_stayed_loaded") is True
                  and result.get("mavis_loaded") is False
-                 and result.get("drain_released") is True
+                 and result.get("gpu_lease_released") is True
                  and result.get("candidate_after") == before
                  and isinstance(result.get("summary"), dict)
                  and result["summary"].get("status") == "pass"

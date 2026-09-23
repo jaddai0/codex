@@ -55,7 +55,7 @@ class E0EvaluationTests(unittest.TestCase):
                 "iris_process": iris_process,
                 "mavis_recovered_process": {"pid": 21,
                     "package_sha256": runtime["package_sha256"]},
-                "recovery_under_iris_drain": True,
+                "recovery_while_iris_loaded": True,
                 "before": {"iris_pids": [10], "iris_model_loaded": True,
                            "mavis_pids": [20]},
                 "after": {"iris_pids": [10], "iris_model_loaded": True,

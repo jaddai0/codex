@@ -665,7 +665,7 @@ class E0Evaluator:
             return self._receipt("buried-failure", "pass", [
                 f"Installed Mavis command ran once and reported exit 1 in {rollout}",
                 f"Complete {len(content)}-byte raw output at {raw} contained the buried marker; final answer matched",
-                f"IRIS restored and Mavis unloaded in {result_path}",
+                f"IRIS remained loaded and Mavis unloaded in {result_path}",
             ], installed_candidate=result["candidate"], raw_sha256=sha256_file(raw))
         return self._receipt("buried-failure", "blocked", [
             "No candidate-matched installed harness run retained the full raw output and identified its buried failure."
@@ -731,7 +731,7 @@ class E0Evaluator:
             return self._receipt("compaction-restart", "pass", [
                 f"Installed TUI rollout {rollout} compacted and resumed the same session",
                 f"Handoff {handoffs[0]} linked an archive containing the fact; resumed answer matched",
-                f"IRIS restored and Mavis unloaded in {result_path}",
+                f"IRIS remained loaded and Mavis unloaded in {result_path}",
             ], installed_candidate=result["candidate"])
         return self._receipt("compaction-restart", "blocked", [
             "No candidate-matched installed TUI compaction, handoff, and exact-session resume passed inspection."
@@ -773,8 +773,8 @@ class E0Evaluator:
         runtime = omlx_runtime_fingerprint(self.config)
         if proof.get("omlx_runtime") != runtime:
             return self._receipt("isolation-recovery", "blocked", ["oMLX runtime or model metadata changed since service recovery was observed"])
-        if proof.get("recovery_under_iris_drain") is not True:
-            return self._receipt("isolation-recovery", "blocked", ["Mavis recovery was not observed under the IRIS drain"])
+        if proof.get("recovery_while_iris_loaded") is not True:
+            return self._receipt("isolation-recovery", "blocked", ["Mavis recovery was not observed while IRIS kept its model"])
         before = proof.get("before") or {}
         after = proof.get("after") or {}
         iris_alive = endpoint_alive(self.config.iris_endpoint)
