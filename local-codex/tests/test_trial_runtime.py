@@ -339,7 +339,7 @@ class TrialRuntimeTests(unittest.TestCase):
         with generation_lease(self.fixture.home, purpose="e1-trial"):
             pass
 
-    def test_contended_trial_stops_before_runtime_load(self):
+    def _installed_trial_environment(self):
         gateway = self.fixture.root / "gateway"
         (gateway / "bin").mkdir(parents=True)
         script = gateway / "bin/mcp-server.sh"
@@ -358,13 +358,29 @@ class TrialRuntimeTests(unittest.TestCase):
                 "launcher_sha256": sha256_file(ROOT / "bin/local-codex"),
             },
         )
-        environment = {
+        return {
             "MAVIS_HOME": str(self.fixture.home),
             "LOCAL_CODEX_SHARE_DIR": str(self.share),
             "LOCAL_CODEX_BIN": str(self.core),
             "MAVIS_GATEWAY_ROOT": str(gateway),
             "MAVIS_GATEWAY_ENV_FILE": str(env_file),
         }
+
+    def test_contended_trial_stops_before_runtime_load(self):
+        environment = self._installed_trial_environment()
+        active_home = self.fixture.home / "e1/repair/runtime/candidate/regression"
+        active_home.mkdir(parents=True)
+        write_json(
+            active_home / ".e1-preparing.json",
+            {
+                "schema_version": "mavis.e1-preparing/v1",
+                "experiment_id": "repair",
+                "arm": "candidate",
+                "case_id": "regression",
+            },
+        )
+        active_marker = active_home / "config.toml"
+        active_marker.write_text("owned by first trial")
         with (
             patch.dict(os.environ, environment),
             patch.object(
@@ -376,6 +392,84 @@ class TrialRuntimeTests(unittest.TestCase):
             with self.assertRaisesRegex(RuntimeError, "owns the host lease"):
                 trial_runtime.run_trial("repair", "candidate", "regression", "task")
         ensure.assert_not_called()
+        self.assertEqual(active_marker.read_text(), "owned by first trial")
+
+    def test_second_process_cannot_recover_first_process_home(self):
+        environment = self._installed_trial_environment()
+        active_home = self.fixture.home / "e1/repair/runtime/candidate/regression"
+        ready = self.fixture.root / "first-ready"
+        release = self.fixture.root / "first-release"
+        holder_code = """
+import json
+import sys
+import time
+from pathlib import Path
+from generation_lease import generation_lease
+home, active, ready, release = map(Path, sys.argv[1:])
+with generation_lease(home, purpose='first-trial'):
+    active.mkdir(parents=True)
+    (active / '.e1-preparing.json').write_text(json.dumps({
+        'schema_version': 'mavis.e1-preparing/v1',
+        'experiment_id': 'repair', 'arm': 'candidate', 'case_id': 'regression'}))
+    (active / 'config.toml').write_text('live first trial')
+    ready.write_text('ready')
+    while not release.exists():
+        time.sleep(0.05)
+"""
+        child_env = os.environ.copy()
+        child_env["PYTHONPATH"] = str(ROOT)
+        holder = subprocess.Popen(
+            [
+                sys.executable,
+                "-c",
+                holder_code,
+                str(self.fixture.home),
+                str(active_home),
+                str(ready),
+                str(release),
+            ],
+            env=child_env,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+        )
+        try:
+            deadline = time.monotonic() + 10
+            while (
+                not ready.exists()
+                and holder.poll() is None
+                and time.monotonic() < deadline
+            ):
+                time.sleep(0.05)
+            self.assertTrue(
+                ready.exists(),
+                holder.stderr.read().decode() if holder.poll() is not None else "",
+            )
+            with self.assertRaisesRegex(RuntimeError, "owns the host lease"):
+                trial_runtime.prepare_trial(
+                    self._binding("candidate"),
+                    mavis_home=self.fixture.home,
+                    share=self.share,
+                    core_binary=self.core,
+                    base_url="http://127.0.0.1:8001/v1",
+                    records=self.records,
+                )
+            with (
+                patch.dict(os.environ, environment),
+                patch.object(
+                    trial_runtime, "accepted_main_profile", return_value=self.profile
+                ),
+                patch.object(trial_runtime, "ensure_runtime") as ensure,
+            ):
+                with self.assertRaisesRegex(RuntimeError, "owns the host lease"):
+                    trial_runtime.run_trial("repair", "candidate", "regression", "task")
+            ensure.assert_not_called()
+            self.assertEqual(
+                (active_home / "config.toml").read_text(), "live first trial"
+            )
+            self.assertTrue((active_home / ".e1-preparing.json").is_file())
+        finally:
+            release.write_text("done")
+            holder.communicate(timeout=10)
 
     def test_transcript_must_belong_to_observed_session_and_home(self):
         home = self.fixture.root / "trial-home"
@@ -393,7 +487,7 @@ class TrialRuntimeTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "outside disposable home"):
             matching_trial_transcript(outside, home, "session-a")
 
-    def test_terminated_wrapper_reaps_core_and_finalizes_receipt(self):
+    def test_term_between_spawn_and_receipt_write_reaps_core(self):
         self.core.write_text(
             '#!/bin/sh\nprintf "%s" "$$" > "$CODEX_HOME/core.pid"\nexec sleep 30\n'
         )
@@ -407,11 +501,22 @@ class TrialRuntimeTests(unittest.TestCase):
             records=self.records,
         )
         argv = read_json(path)["core_argv"]
-        script = (
-            "import sys; from unittest.mock import patch; import trial_runtime, launch_core; "
-            "patch.object(trial_runtime, 'validate_trial_receipt').start(); "
-            "sys.exit(launch_core.launch_trial(__import__('pathlib').Path(sys.argv[1]), sys.argv[2:]))"
-        )
+        script = """
+import sys
+import time
+from pathlib import Path
+from unittest.mock import patch
+import trial_runtime
+import launch_core
+patch.object(trial_runtime, 'validate_trial_receipt').start()
+original = launch_core.subprocess.Popen
+def delayed_spawn(*args, **kwargs):
+    child = original(*args, **kwargs)
+    time.sleep(1)
+    return child
+launch_core.subprocess.Popen = delayed_spawn
+sys.exit(launch_core.launch_trial(Path(sys.argv[1]), sys.argv[2:]))
+"""
         environment = os.environ.copy()
         environment["PYTHONPATH"] = os.pathsep.join((str(ROOT), str(ROOT / "mavis")))
         wrapper = subprocess.Popen(
@@ -433,6 +538,7 @@ class TrialRuntimeTests(unittest.TestCase):
                 pid_path.is_file(),
                 wrapper.stderr.read().decode() if wrapper.poll() is not None else "",
             )
+            self.assertEqual(read_json(path)["state"], "prepared")
             child_pid = int(pid_path.read_text())
             wrapper.terminate()
             wrapper.communicate(timeout=10)
