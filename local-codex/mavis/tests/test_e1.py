@@ -253,6 +253,74 @@ class E1RunnerTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "separate"):
             self._freeze()
 
+    def test_native_candidate_dispatch_and_compare_use_gateway_report(self):
+        self._freeze()
+        self.runner.prepare("repair", "baseline")
+        self.runner.prepare("repair", "candidate")
+        job_dir = self.root / "gateway-job"
+        job_dir.mkdir()
+        report = job_dir / "report.md"
+        report.write_text("Native worker report\n")
+        assignments = []
+
+        def start(arguments):
+            assignments.append(arguments)
+            write_json(job_dir / "assignment.json", {key: value for key, value in arguments.items() if key != "job_id"})
+            return {"success": True, "started": True, "accepted": False,
+                    "job_id": arguments["job_id"], "job_dir": str(job_dir),
+                    "report_path": str(report), "assignment_path": str(job_dir / "assignment.json")}
+
+        self.runner.gateway_assignment_starter = start
+        dispatch = self.runner.dispatch_candidate(
+            "repair", "regression", job_id="candidate-native", lane="minimax",
+            model="minimax/MiniMax-M3", task="Repair the frozen case")
+        self.assertEqual(assignments[0]["mavis_requirements"],
+                         candidate_assignment_requirements(self.runner.store.load("repair")))
+        self.assertEqual(assignments[0]["cwd"], dispatch["checkout"])
+        self.assertEqual(assignments[0]["mavis_owner"],
+                         {"provider": "minimax", "model": "minimax/MiniMax-M3", "harness": "opencode"})
+        for case in ("regression", "held-a", "held-b"):
+            self.runner.check("repair", "baseline", case)
+            checkout = self.home / "e1" / "repair" / "checkouts" / "candidate" / case
+            (checkout / "result.txt").write_text("pass\n")
+            self.runner.check("repair", "candidate", case)
+        binding = {"objective_id": "repair", "starting_revision": dispatch["starting_revision"],
+                   "cwd": dispatch["checkout"], "requirements": assignments[0]["mavis_requirements"],
+                   "report_sha256": sha256_file(report),
+                   "assignment_sha256": dispatch["assignment_sha256"],
+                   "changed_revision": dispatch["starting_revision"],
+                   "owned_paths": [dispatch["checkout"]],
+                   "owner": assignments[0]["mavis_owner"],
+                   "required_checks": ["accept"]}
+        self.runner.store.gateway_status_reader = lambda job_id: {
+            "job_id": job_id, "state": "completed", "exit_code": 0,
+            "accepted": True, "mavis_binding": binding,
+            "receipt": {"job_id": job_id, "exit_code": 0},
+            "acceptance": {"accepted": True, "job_id": job_id, "verifier": "terra",
+                           "verifier_job_id": "terra-job", "target_sha256": "a" * 64,
+                           "evidence_sha256": "b" * 64, "report_sha256_on_disk": "c" * 64,
+                           "verifier_verdict_sha256": "d" * 64}}
+        binding["report_sha256"] = "0" * 64
+        with self.assertRaisesRegex(ValueError, "receipt or report"):
+            self.runner.compare_native("repair", "regression")
+        binding["report_sha256"] = sha256_file(report)
+        compared = self.runner.compare_native("repair", "regression")
+        self.assertEqual(compared["comparison"]["candidate"]["candidate_job_id"], "candidate-native")
+        self.assertEqual((self.home / "e1" / "repair" / "candidate-worker-report.json").read_text(),
+                         report.read_text())
+
+    def test_native_dispatch_rejects_unbound_start_receipt(self):
+        self._freeze()
+        self.runner.prepare("repair", "candidate")
+        self.runner.gateway_assignment_starter = lambda arguments: {
+            "success": True, "started": True, "accepted": False,
+            "job_id": "different-job", "job_dir": str(self.root / "job"),
+            "report_path": str(self.root / "job" / "report.md"),
+            "assignment_path": str(self.root / "job" / "assignment.json")}
+        with self.assertRaisesRegex(ValueError, "exact Mavis candidate job"):
+            self.runner.dispatch_candidate("repair", "regression", job_id="expected-job",
+                                           lane="minimax", model="minimax/MiniMax-M3", task="Fix")
+
 
 if __name__ == "__main__":
     unittest.main()

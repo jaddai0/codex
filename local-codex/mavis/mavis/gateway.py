@@ -73,8 +73,8 @@ def _send(process: subprocess.Popen[str], payload: dict[str, Any]) -> None:
     process.stdin.flush()
 
 
-def harness_job_status(job_id: str, timeout: float = 10.0) -> dict[str, Any]:
-    """Return a status only from the Mavis-configured gateway, or fail closed."""
+def _gateway_tool(name: str, arguments: dict[str, Any], timeout: float) -> dict[str, Any]:
+    """Call one tool on the trusted Mavis gateway without a provider fallback."""
     command, configured_env = _configured_gateway()
     environment = os.environ.copy()
     environment.update(configured_env)
@@ -112,7 +112,7 @@ def harness_job_status(job_id: str, timeout: float = 10.0) -> dict[str, Any]:
                 "jsonrpc": "2.0",
                 "id": 2,
                 "method": "tools/call",
-                "params": {"name": "harness_job_status", "arguments": {"job_id": job_id}},
+                "params": {"name": name, "arguments": arguments},
             },
         )
         result = _read_response(process, 2, deadline)
@@ -135,6 +135,19 @@ def harness_job_status(job_id: str, timeout: float = 10.0) -> dict[str, Any]:
             payload = json.loads(text) if isinstance(text, str) else None
         except json.JSONDecodeError as error:
             raise GatewayUnavailable("configured model gateway returned malformed status") from error
-    if not isinstance(payload, dict) or payload.get("success") is not True or not isinstance(payload.get("status"), dict):
-        raise GatewayUnavailable("configured model gateway returned unsuccessful status")
+    if not isinstance(payload, dict) or payload.get("success") is not True:
+        raise GatewayUnavailable(f"configured model gateway returned unsuccessful {name}")
+    return payload
+
+
+def harness_job_status(job_id: str, timeout: float = 10.0) -> dict[str, Any]:
+    """Return a status only from the Mavis-configured gateway, or fail closed."""
+    payload = _gateway_tool("harness_job_status", {"job_id": job_id}, timeout)
+    if not isinstance(payload.get("status"), dict):
+        raise GatewayUnavailable("configured model gateway returned malformed status")
     return payload["status"]
+
+
+def harness_assignment_start(assignment: dict[str, Any], timeout: float = 15.0) -> dict[str, Any]:
+    """Start a Mavis-bound native assignment through the configured gateway."""
+    return _gateway_tool("harness_assignment_start", assignment, timeout)
