@@ -1,6 +1,6 @@
 # Phase 2 embedding comparison — 2026-09-23
 
-Status: **partial**. Both local model arms completed on a fixed Mavis code corpus. Installed Mavis, full-project indexing, model-backed stale-source canaries, and the Phase 2 end-to-end work gate remain open.
+Status: **partial**. Both local model arms completed on a fixed Mavis code corpus, and the small model passed source-freshness canaries. Installed Mavis, full-project indexing, and the Phase 2 end-to-end work gate remain open.
 
 ## Frozen task and observations
 
@@ -8,6 +8,7 @@ Status: **partial**. Both local model arms completed on a fixed Mavis code corpu
 - Corpus: 70 tracked `local-codex` text/code files, 305 passages of up to 48 lines / 8192 characters, copied without changing source bytes. Sixteen natural-language coding questions each name an expected source file. The corpus and cases are retained under `~/.local-codex/mavis-service/diagnostics/phase2-embedding/` with file hashes.
 - Both MLX arms used model batch size one. A direct Qwen 0.6B canary with batch size two produced all-NaN values for a padded input; each passage was finite alone. This is recorded in `qwen-0.6b-probe.*`. The installed 8B adapter used existing local Torch/Torchvision dependencies and cleared incompatible cached text positions between calls; the processor and 16-passage canaries passed without editing the shared oMLX runtime.
 - The IRIS bot and its two models were temporarily unloaded for each run and restored. The final handoff receipt reports both original IRIS models loaded, Mavis unloaded, and no restoration errors.
+- A separate real-model run verified that vectors stay on their branch, changed-file exact lookup works before reindexing, stale vectors disappear, and rename/deletion update the vector index. Its six steps and independent IRIS restoration receipt are retained as `freshness.json` and `freshness-handoff.json`.
 
 | Arm | Expected file in top 5 | Warm query median | Initial passage index | Peak MLX memory |
 | --- | ---: | ---: | ---: | ---: |
@@ -31,4 +32,4 @@ The bandwidth monitor reported other GPU activity from WindowServer and a virtua
 - Complete results: `exact-baseline.json`, `exact-fixture-baseline.json`, `qwen-0.6b.json`, `installed-8b.json`, `answer_spans.json`, arm stdout/stderr logs, and `handoff-result.json` in the same directory.
 - MLX constraint record: `constraint_record.json` in the same directory. Its task closeout remains partial until live integration and freshness work has evidence.
 - Independent source review accepted hash-bound passage citations and exact fallback at commit `50e7f68da`; source tests passed 148/148. This is not installed acceptance.
-- Next gates: verify model-backed changed/deleted/renamed/branch-switched source behavior; run integrated installed retrieval with embeddings enabled and disabled; prove the helper/librarian work and Phase 2 completed-task benefit.
+- Next gates: run integrated installed retrieval with embeddings enabled and disabled; prove the helper/librarian work and Phase 2 completed-task benefit.
