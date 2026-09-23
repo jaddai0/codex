@@ -15,6 +15,7 @@ from .e0_tasks import prepare_small_repository
 from .evaluations import E0_CASES, E0Evaluator
 from .maintenance import MaintenanceQueue
 from .objectives import ObjectiveStore
+from .project_memory import ProjectMemory, KINDS
 from .retrieval import ProjectIndex
 from .runtime import (
     RuntimeConfig,
@@ -127,6 +128,15 @@ def build_parser() -> argparse.ArgumentParser:
     index_dependency.add_argument("name")
     index_dependency.add_argument("--limit", type=int, default=20)
     index_dependency.add_argument("--offset", type=int, default=0)
+
+    memory = subcommands.add_parser("project-memory")
+    memory.add_argument("--project", type=Path, required=True)
+    memory_sub = memory.add_subparsers(dest="memory_command", required=True)
+    memory_add = memory_sub.add_parser("add")
+    memory_add.add_argument("record_id")
+    memory_add.add_argument("kind", choices=sorted(KINDS))
+    memory_add.add_argument("claim")
+    memory_add.add_argument("--source", action="append", required=True)
 
     evaluate = subcommands.add_parser("eval")
     evaluate_sub = evaluate.add_subparsers(dest="eval_suite", required=True)
@@ -418,6 +428,13 @@ def main(argv: list[str] | None = None) -> int:
             print_json(index.symbol(args.name, args.limit, args.offset))
         else:
             print_json(index.dependency(args.name, args.limit, args.offset))
+        return 0
+    if args.command == "project-memory":
+        print_json(
+            ProjectMemory(args.project).add(
+                args.record_id, args.kind, args.claim, args.source
+            )
+        )
         return 0
     if args.command == "maintenance":
         queue = MaintenanceQueue(home)
