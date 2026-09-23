@@ -196,6 +196,8 @@ def _run_stage(command: list[str], *, workspace: Path, env: dict[str, str],
         os.close(slave)
         slave = -1
         stage = "answer"
+        trust_sent = False
+        terminal_tail = b""
         deadline = time.monotonic() + stage_timeout
         with log.open("wb") as output:
             while True:
@@ -204,8 +206,14 @@ def _run_stage(command: list[str], *, workspace: Path, env: dict[str, str],
                 readable, _, _ = select.select([master], [], [], 0.25)
                 if readable:
                     try:
-                        output.write(os.read(master, 65536))
+                        chunk = os.read(master, 65536)
+                        output.write(chunk)
                         output.flush()
+                        terminal_tail = (terminal_tail + chunk)[-16384:]
+                        if (not trust_sent and b"folder?" in terminal_tail
+                                and b"Trust and continue" in terminal_tail):
+                            os.write(master, b"\r")
+                            trust_sent = True
                     except OSError:
                         pass
                 if rollout is None:

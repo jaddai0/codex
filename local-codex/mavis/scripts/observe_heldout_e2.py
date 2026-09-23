@@ -85,6 +85,8 @@ def _run_tui(command: list[str], *, repo: Path, env: dict[str, str],
         slave = -1
         started = time.time()
         stage = "answer"
+        trust_sent = False
+        terminal_tail = b""
         deadline = time.monotonic() + 1800
         completed_at: int | None = None
         with log_path.open("wb") as log:
@@ -94,8 +96,14 @@ def _run_tui(command: list[str], *, repo: Path, env: dict[str, str],
                 readable, _, _ = select.select([master], [], [], 0.25)
                 if readable:
                     try:
-                        log.write(os.read(master, 65536))
+                        chunk = os.read(master, 65536)
+                        log.write(chunk)
                         log.flush()
+                        terminal_tail = (terminal_tail + chunk)[-16384:]
+                        if (not trust_sent and b"folder?" in terminal_tail
+                                and b"Trust and continue" in terminal_tail):
+                            os.write(master, b"\r")
+                            trust_sent = True
                     except OSError:
                         pass
                 if rollout is None:
