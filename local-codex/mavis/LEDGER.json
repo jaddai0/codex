@@ -10,7 +10,7 @@
   },
   "status": "partial",
   "uncertainty": [
-    "Installed E0 passed all ten mandatory cases on the current candidate; a distinct maintenance task passed, but Phase 1 still needs a completed multi-file Mavis task with independent verification.",
+    "Installed E0 passed all ten mandatory cases on service SHA-256 15710e90443d08fb0aa03196d7197dc428ec97094d831f61274a450225bbf957; Phase 1 still needs a completed multi-file Mavis task with independent verification.",
     "Phase 2 memory and helper interfaces pass source tests; live embedding and helper comparisons, repeated-compaction quality, helper isolation, and net-benefit acceptance remain open.",
     "Phase 3 E1 has native assignment plumbing and strict source gates, but candidate activation, a real paired comparison, independent promotion, and rollback remain open.",
     "Hosted Jev returned one typed answer under the local capped ledger; external invoice reconciliation and a local Jev candidate remain open."
@@ -41,7 +41,9 @@
         "Installed E0 summary at /Users/dustinpainter/.local-codex/mavis-service/evaluations/e0/summary.json passed all ten mandatory cases on core SHA-256 969723b0eb97773fca6814d21ef89091cfcad32eaa9a845b0dc079a1bf92f618 and service SHA-256 c616a39a30a219877614bf7c6382003241eefec81b827ea6debbae76512e7a61. The candidate fingerprint also binds the Desktop and shell launchers, profile preparation, launch wrapper, and prompt templates.",
         "The current-candidate installed repair passed host tests and independent native ZCode review in /Users/dustinpainter/.local-codex/mavis-service/evaluations/e0/tasks/23ed392907934a6e81204f8e6b7c9cad. The current buried-failure, compaction/restart, and isolation-recovery receipts are under buried-live-81f17adeb8a74357b72a97cd97062b60, compaction-live-7275dddac9ae4999859a1ab2141136ea, and isolation-recovery-live.json; final model state was IRIS loaded and Mavis unloaded.",
         "A distinct real maintenance task completed: installed Mavis fixed Boolean citation validation in an isolated checkout, exited 0 after seven focused tests, and independent review accepted the two-file patch; /Users/dustinpainter/.Codex/reports/mavis-librarian-fix-independent-review-2026-09-22.md.",
-        "Two installed Mavis archive-paging multi-file attempts stalled without an edit and were stopped with IRIS restored. MiniMax M2.7 completed the consulted implementation in its native OpenCode harness; independent review accepted the repaired bounded paging and 104 source tests, but that is not a completed Mavis multi-file assignment. A separate Mavis completion remains required."
+        "Two installed Mavis archive-paging multi-file attempts stalled without an edit and were stopped with IRIS restored. MiniMax M2.7 completed the consulted implementation in its native OpenCode harness; independent review accepted the repaired bounded paging and 104 source tests, but that is not a completed Mavis multi-file assignment. A separate Mavis completion remains required.",
+        "Fresh installed E0 summary at /Users/dustinpainter/.local-codex/mavis-service/evaluations/e0/summary.json passed all ten mandatory cases on service SHA-256 15710e90443d08fb0aa03196d7197dc428ec97094d831f61274a450225bbf957 and core SHA-256 969723b0eb97773fca6814d21ef89091cfcad32eaa9a845b0dc079a1bf92f618. The installed result at segment-boundary-installed/result.json records e0_exit=0, matching candidate fingerprints, IRIS restored, and Mavis unloaded. Current-candidate small-repository, buried-failure, real TUI compaction/restart, and isolation-recovery receipts passed after the service update.",
+        "Archive segment-boundary source repair is independently accepted with 116 tests, but Mavis needed coordinator completion after its repair timed out. A fresh multi-file maintenance task is running in local-codex-mavis-maintenance-control; it has no acceptance receipt yet."
       ]
     },
     {
