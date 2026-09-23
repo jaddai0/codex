@@ -5,6 +5,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from contextlib import contextmanager
 from contextvars import ContextVar
+from datetime import datetime
 import fcntl
 from functools import wraps
 import hashlib
@@ -155,6 +156,15 @@ def omlx_runtime_fingerprint(config: RuntimeConfig) -> dict[str, Any]:
             raise RuntimeError("oMLX runtime source path changed unexpectedly")
         sources[name] = {"path": str(path),
                          "sha256": hashlib.sha256(path.read_bytes()).hexdigest()}
+    package = Path(paths["omlx.server"]).resolve(strict=True).parent
+    package_files = sorted(path for path in package.rglob("*.py")
+                           if "__pycache__" not in path.parts)
+    if len(package_files) < 20:
+        raise RuntimeError("oMLX runtime package inventory is incomplete")
+    package_digest = hashlib.sha256()
+    for path in package_files:
+        package_digest.update(str(path.relative_to(package)).encode())
+        package_digest.update(bytes.fromhex(hashlib.sha256(path.read_bytes()).hexdigest()))
     model_path = (config.model_dir / config.model).resolve(strict=True)
     metadata = {}
     for name in ("config.json", "tokenizer_config.json", "model.safetensors.index.json",
@@ -170,9 +180,37 @@ def omlx_runtime_fingerprint(config: RuntimeConfig) -> dict[str, Any]:
         raise RuntimeError("selected oMLX model has no weight shards")
     shard_signature = hashlib.sha256(json.dumps(shards, separators=(",", ":")).encode()).hexdigest()
     return {"binary_sha256": hashlib.sha256(config.omlx_binary.read_bytes()).hexdigest(),
-            "sources": sources, "model_id": config.model, "model_path": str(model_path),
+            "sources": sources, "package_path": str(package),
+            "package_files": len(package_files), "package_sha256": package_digest.hexdigest(),
+            "model_id": config.model, "model_path": str(model_path),
             "model_metadata_sha256": metadata,
             "weight_file_signature_sha256": shard_signature}
+
+
+def omlx_live_process_binding(config: RuntimeConfig, endpoint: str,
+                              runtime: dict[str, Any]) -> dict[str, Any]:
+    """Require one live oMLX process launched after the fingerprinted code."""
+    pids = _listener_pids(_port(endpoint))
+    if len(pids) != 1:
+        raise RuntimeError("oMLX listener does not have one process")
+    pid = next(iter(pids))
+    base_path = (config.base_path if endpoint == config.endpoint
+                 else Path.home() / ".omlx").resolve(strict=True)
+    if not any(path == base_path or base_path in path.parents
+               for path in _process_open_paths(pid)):
+        raise RuntimeError("oMLX process is not bound to the expected base path")
+    result = subprocess.run(["ps", "-p", str(pid), "-o", "lstart="],
+                            text=True, capture_output=True, check=True, timeout=5,
+                            env={**os.environ, "LC_ALL": "C"})
+    started = datetime.strptime(result.stdout.strip(), "%a %b %d %H:%M:%S %Y").timestamp()
+    package = Path(runtime["package_path"])
+    latest_source = max(path.stat().st_mtime for path in package.rglob("*.py")
+                        if "__pycache__" not in path.parts)
+    latest_source = max(latest_source, config.omlx_binary.stat().st_mtime)
+    if started + 1 < latest_source:
+        raise RuntimeError("oMLX process started before its current source was installed")
+    return {"pid": pid, "started_at_epoch": started, "base_path": str(base_path),
+            "package_sha256": runtime["package_sha256"]}
 
 
 def _iris_drain_token() -> str:

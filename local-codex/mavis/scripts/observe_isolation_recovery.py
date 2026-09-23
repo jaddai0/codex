@@ -12,7 +12,8 @@ from mavis.evaluations import installed_candidate_fingerprint
 from mavis.runtime import (
     RuntimeConfig, _listener_pids, acquire_iris_model_drain, endpoint_alive,
     ensure_runtime, inventory, iris_drain_headers, loaded_generation_models,
-    omlx_runtime_fingerprint, owns_running_server, park_mavis_server,
+    omlx_live_process_binding, omlx_runtime_fingerprint, owns_running_server,
+    park_mavis_server,
     release_iris_model_drain, request_json, require_idle_iris_handoff,
     require_installed_selected_model, wait_iris_model_drain,
     with_mavis_handoff_lease,
@@ -42,11 +43,13 @@ def main() -> int:
     iris_pids = sorted(_listener_pids(8000))
     if not iris_pids:
         raise RuntimeError("IRIS listener process is missing")
+    iris_process = omlx_live_process_binding(config, config.iris_endpoint, runtime)
 
     reservation = None
     lease_id: str | None = None
     before_mavis: list[int] = []
     after_mavis: list[int] = []
+    mavis_recovered_process: dict[str, object] | None = None
     outage_observed = False
     result: dict[str, object] = {"candidate": candidate, "omlx_runtime": runtime,
                                  "iris_pids": iris_pids}
@@ -84,6 +87,7 @@ def main() -> int:
                 or loaded_generation_models(config.endpoint)
                 or iris_loaded() or sorted(_listener_pids(8000)) != iris_pids):
             raise RuntimeError("Mavis did not recover under the IRIS drain")
+        mavis_recovered_process = omlx_live_process_binding(config, config.endpoint, runtime)
     except BaseException as error:
         result["observation_error"] = repr(error)
     finally:
@@ -97,7 +101,9 @@ def main() -> int:
             if not iris_loaded():
                 request_json(config.iris_endpoint, model_path + "/load", method="POST",
                              timeout=900, headers=iris_drain_headers(lease_id))
-            if not iris_loaded() or sorted(_listener_pids(8000)) != iris_pids:
+            if (not iris_loaded() or sorted(_listener_pids(8000)) != iris_pids
+                    or omlx_live_process_binding(config, config.iris_endpoint, runtime)
+                    != iris_process):
                 raise RuntimeError("IRIS model or listener was not restored")
             if lease_id is not None:
                 release_iris_model_drain(config, lease_id)
@@ -121,6 +127,8 @@ def main() -> int:
         "schema_version": "mavis.e0-isolation-recovery/v1",
         "candidate": candidate,
         "omlx_runtime": runtime,
+        "iris_process": iris_process,
+        "mavis_recovered_process": mavis_recovered_process,
         "recovery_under_iris_drain": True,
         "before": {"iris_pids": iris_pids, "iris_model_loaded": True,
                    "mavis_pids": before_mavis},

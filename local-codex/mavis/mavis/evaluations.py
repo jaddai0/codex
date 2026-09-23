@@ -25,7 +25,7 @@ from urllib.request import Request, urlopen
 
 from .evidence import run_command
 from .objectives import ObjectiveStore
-from .runtime import RuntimeConfig, _listener_pids, admission, endpoint_alive, inventory, loaded_generation_models, omlx_runtime_fingerprint
+from .runtime import RuntimeConfig, _listener_pids, admission, endpoint_alive, inventory, loaded_generation_models, omlx_live_process_binding, omlx_runtime_fingerprint
 from .storage import sha256_file, write_json
 
 
@@ -746,7 +746,8 @@ class E0Evaluator:
         proof = json.loads(proof_path.read_text())
         if proof.get("schema_version") != "mavis.e0-isolation-recovery/v1" or proof.get("candidate") != installed_candidate_fingerprint():
             return self._receipt("isolation-recovery", "blocked", ["The installed candidate changed since service recovery was observed"])
-        if proof.get("omlx_runtime") != omlx_runtime_fingerprint(self.config):
+        runtime = omlx_runtime_fingerprint(self.config)
+        if proof.get("omlx_runtime") != runtime:
             return self._receipt("isolation-recovery", "blocked", ["oMLX runtime or model metadata changed since service recovery was observed"])
         if proof.get("recovery_under_iris_drain") is not True:
             return self._receipt("isolation-recovery", "blocked", ["Mavis recovery was not observed under the IRIS drain"])
@@ -756,6 +757,12 @@ class E0Evaluator:
         mavis_alive = endpoint_alive(self.config.endpoint)
         iris_pids = _listener_pids(8000)
         mavis_pids = _listener_pids(8001)
+        try:
+            iris_process = (omlx_live_process_binding(self.config,
+                            self.config.iris_endpoint, runtime) if iris_alive else None)
+        except (OSError, RuntimeError, ValueError):
+            iris_process = None
+        recovered_process = proof.get("mavis_recovered_process") or {}
         park_pid = os.environ.get("MAVIS_E0_PARK_OWNER_PID")
         parked = (park_pid is not None and park_pid.isdecimal()
                   and mavis_pids == {int(park_pid)} and not mavis_alive)
@@ -766,6 +773,9 @@ class E0Evaluator:
             and before.get("mavis_pids") != after.get("mavis_pids")
             and after.get("mavis_pids")
             and proof.get("outage_observed") is True
+            and proof.get("iris_process") == iris_process
+            and recovered_process.get("pid") in after.get("mavis_pids", [])
+            and recovered_process.get("package_sha256") == runtime["package_sha256"]
         )
         iris_loaded = (loaded_generation_models(self.config.iris_endpoint) ==
                        [self.config.model]) if iris_alive else False

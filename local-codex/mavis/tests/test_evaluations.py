@@ -20,11 +20,16 @@ class E0EvaluationTests(unittest.TestCase):
             evaluator = E0Evaluator(Path(directory), RuntimeConfig(home=Path(directory)))
             evaluator.root.mkdir(parents=True)
             candidate = {"core_sha256": "a" * 64}
-            runtime = {"binary_sha256": "b" * 64, "model_id": evaluator.config.model}
+            runtime = {"binary_sha256": "b" * 64, "model_id": evaluator.config.model,
+                       "package_sha256": "c" * 64}
+            iris_process = {"pid": 10, "package_sha256": runtime["package_sha256"]}
             write_json(evaluator.root / "isolation-recovery-live.json", {
                 "schema_version": "mavis.e0-isolation-recovery/v1",
                 "candidate": candidate,
                 "omlx_runtime": runtime,
+                "iris_process": iris_process,
+                "mavis_recovered_process": {"pid": 21,
+                    "package_sha256": runtime["package_sha256"]},
                 "recovery_under_iris_drain": True,
                 "before": {"iris_pids": [10], "iris_model_loaded": True,
                            "mavis_pids": [20]},
@@ -37,6 +42,8 @@ class E0EvaluationTests(unittest.TestCase):
                           return_value=candidate), \
                     patch("mavis.evaluations.omlx_runtime_fingerprint",
                           return_value=runtime), \
+                    patch("mavis.evaluations.omlx_live_process_binding",
+                          return_value=iris_process), \
                     patch("mavis.evaluations.endpoint_alive",
                           side_effect=[True, False]), \
                     patch("mavis.evaluations._listener_pids",
