@@ -541,7 +541,7 @@ def run_trial(experiment_id: str, arm: str, case_id: str, task: str) -> Path:
         os.environ.get(
             "MAVIS_GATEWAY_ROOT",
             Path.home()
-            / "Dev-Projects/ai-skills-dev-mavis-gateway/marketplace/plugins/model-gateway",
+            / "Dev-Projects/Mavis/checkouts/gateway/marketplace/plugins/model-gateway",
         )
     ).resolve()
     gateway_launcher = gateway_root / "bin/mcp-server.sh"

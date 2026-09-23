@@ -133,7 +133,7 @@ exec python3 "$share_dir/launch_core.py" --managed \
   --iris-endpoint "${IRIS_OMLX_BASE_URL:-http://127.0.0.1:8000/v1}" \
   --model-dir "${MAVIS_MODEL_DIR:-${HOME}/models/vlms}" \
   --omlx-binary "${MAVIS_OMLX_BIN:-${HOME}/.venvs/omlx-dev/bin/omlx}" \
-  --gateway-root "${MAVIS_GATEWAY_ROOT:-${HOME}/Dev-Projects/ai-skills-dev-mavis-gateway/marketplace/plugins/model-gateway}" \
+  --gateway-root "${MAVIS_GATEWAY_ROOT:-${HOME}/Dev-Projects/Mavis/checkouts/gateway/marketplace/plugins/model-gateway}" \
   "${gateway_env_args[@]}" \
   "${model_args[@]}" \
   -- "$core_binary" "$@"
