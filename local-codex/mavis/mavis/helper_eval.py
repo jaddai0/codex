@@ -151,6 +151,14 @@ def _librarian_case(home: Path, case: dict[str, Any], ask: Callable[..., dict[st
     if case.get("followup") is not True:
         session.clear()
     prior = session.followup_context() if case.get("followup") is True else None
+    if prior is not None and any(
+        not isinstance(citation, dict)
+        or not isinstance(citation.get("path"), str)
+        or Path(citation["path"]).parent != archive.root / "segments"
+        for citation in prior.get("citations", [])
+    ):
+        session.clear()
+        prior = None
     user = {"question": question, "verified_lines": packet,
             "followup": prior if prior is not None else None}
     answer = ask(base_url, model_id, [
@@ -184,13 +192,13 @@ def _output_case(home: Path, case: dict[str, Any], ask: Callable[..., dict[str, 
     if expected != envelope["verdict"]:
         raise ValueError("host verdict differs from the frozen case expectation")
     lines = _raw_lines(envelope["raw_output"])
-    raw_text = "\n".join(lines)
-    if len(raw_text.encode("utf-8")) > MAX_LOG_BYTES:
-        raise ValueError("raw log exceeds bounded model context; split the case before evaluation")
     known = bool(envelope["failure_lines"] or envelope["count_lines"])
     if known and not case.get("force_model"):
         return {"accepted": True, "model_called": False, "host": envelope,
                 "reason": "known test format parsed by host"}
+    raw_text = "\n".join(lines)
+    if len(raw_text.encode("utf-8")) > MAX_LOG_BYTES:
+        raise ValueError("raw log exceeds bounded model context; split the case before evaluation")
     user = {"host_verdict": envelope["verdict"], "exit_status": envelope["exit_status"],
             "timed_out": envelope["timed_out"], "raw_output": envelope["raw_output"],
             "lines": [{"line": number, "text": line} for number, line in enumerate(lines, 1)]}
@@ -242,16 +250,23 @@ def evaluate(home: Path, suite: dict[str, Any], model_id: str, base_url: str,
     for case in cases:
         started = time.monotonic()
         case_id = require_safe_id(case["id"], "case id")
+        proposed: list[dict[str, Any]] = []
+
+        def record_ask(*args: Any) -> dict[str, Any]:
+            response = ask(*args)
+            proposed.append(response)
+            return response
+
         try:
             if role == "librarian":
-                result = _librarian_case(home, case, ask, base_url, model_id, timeout)
+                result = _librarian_case(home, case, record_ask, base_url, model_id, timeout)
             else:
-                result = _output_case(home, case, ask, base_url, model_id, timeout)
+                result = _output_case(home, case, record_ask, base_url, model_id, timeout)
             results.append({"id": case_id, "status": "pass", "elapsed_seconds": time.monotonic() - started,
                             "result": result})
         except (ValueError, KeyError, OSError, TypeError) as exc:
             results.append({"id": case_id, "status": "fail", "elapsed_seconds": time.monotonic() - started,
-                            "error": str(exc)})
+                            "error": str(exc), "proposed": proposed[-1] if proposed else None})
     if binding is not None:
         try:
             if _model_binding(base_url, model_id, model_path, inventory_reader) != binding:
@@ -283,8 +298,19 @@ def main(argv: list[str] | None = None) -> int:
     args = parser.parse_args(argv)
     suite_file_sha256 = sha256_file(args.suite)
     suite = read_json(args.suite)
-    result = evaluate(args.home, suite, args.model_id, args.base_url, timeout=args.timeout,
-                      model_path=args.model_path)
+    try:
+        result = evaluate(args.home, suite, args.model_id, args.base_url, timeout=args.timeout,
+                          model_path=args.model_path)
+    except (ValueError, OSError, RuntimeError) as exc:
+        role = suite.get("role")
+        if role not in {"librarian", "output-reader"}:
+            raise
+        result = {"schema_version": RESULT_VERSION, "role": role, "model_id": args.model_id,
+                  "model_binding": None, "endpoint": args.base_url,
+                  "recorded_at": datetime.now(timezone.utc).isoformat(),
+                  "model_called": False, "status": "fail",
+                  "cases": [{"id": "preflight", "status": "fail", "elapsed_seconds": 0,
+                             "error": str(exc)}]}
     result["suite_file"] = str(args.suite.resolve())
     result["suite_file_sha256"] = suite_file_sha256
     if sha256_file(args.suite) != suite_file_sha256:
