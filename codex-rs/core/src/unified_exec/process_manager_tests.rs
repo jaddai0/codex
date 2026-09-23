@@ -13,9 +13,21 @@ async fn mavis_exited_burst_finishes_raw_capture_for_exec_and_stdin() {
     let temp = tempfile::tempdir().unwrap();
     let prior_required = std::env::var_os("MAVIS_RAW_OUTPUT_REQUIRED");
     let prior_home = std::env::var_os("MAVIS_HOME");
+    let prior_project_root = std::env::var_os("MAVIS_PROJECT_ROOT");
+    let project = temp.path().join("project");
+    std::fs::create_dir(&project).unwrap();
+    assert!(
+        std::process::Command::new("git")
+            .args(["init", "-q"])
+            .current_dir(&project)
+            .status()
+            .unwrap()
+            .success()
+    );
     unsafe {
         std::env::set_var("MAVIS_RAW_OUTPUT_REQUIRED", "1");
         std::env::set_var("MAVIS_HOME", temp.path());
+        std::env::set_var("MAVIS_PROJECT_ROOT", &project);
     }
 
     let (session, turn) = crate::session::tests::make_session_and_context().await;
@@ -89,6 +101,16 @@ async fn mavis_exited_burst_finishes_raw_capture_for_exec_and_stdin() {
     assert_eq!(first.exit_code, Some(1));
     let first_ref = first.raw_output_reference.unwrap();
     assert!(first_ref.complete);
+    assert_eq!(
+        first_ref.path.parent(),
+        Some(
+            project
+                .canonicalize()
+                .unwrap()
+                .join(".mavis/tool-output")
+                .as_path()
+        )
+    );
     let expected = format!(
         "{}\nMAVIS_E0_FAILURE\n{}\n",
         "A".repeat(800_000),
@@ -151,6 +173,7 @@ async fn mavis_exited_burst_finishes_raw_capture_for_exec_and_stdin() {
     assert_eq!(second.exit_code, Some(1));
     let second_ref = second.raw_output_reference.unwrap();
     assert!(second_ref.complete);
+    assert_eq!(second_ref.path.parent(), first_ref.path.parent());
     let raw = std::fs::read(&second_ref.path).unwrap();
     let normalized = raw
         .iter()
@@ -180,6 +203,27 @@ async fn mavis_exited_burst_finishes_raw_capture_for_exec_and_stdin() {
         Some(value) => unsafe { std::env::set_var("MAVIS_HOME", value) },
         None => unsafe { std::env::remove_var("MAVIS_HOME") },
     }
+    match prior_project_root {
+        Some(value) => unsafe { std::env::set_var("MAVIS_PROJECT_ROOT", value) },
+        None => unsafe { std::env::remove_var("MAVIS_PROJECT_ROOT") },
+    }
+    assert!(
+        std::process::Command::new("git")
+            .args(["check-ignore", "-q", "--", ".mavis/tool-output/probe.raw"])
+            .current_dir(&project)
+            .status()
+            .unwrap()
+            .success()
+    );
+    assert!(
+        std::process::Command::new("git")
+            .args(["status", "--porcelain", "--untracked-files=all"])
+            .current_dir(&project)
+            .output()
+            .unwrap()
+            .stdout
+            .is_empty()
+    );
 }
 
 #[test]

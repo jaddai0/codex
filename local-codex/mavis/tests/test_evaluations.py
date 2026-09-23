@@ -7,6 +7,7 @@ import unittest
 from unittest.mock import patch
 
 from mavis.evaluations import (E0_CASES, E0Evaluator, _safe_buried_inspection,
+                               _trusted_raw_output_path,
                                installed_candidate_fingerprint, native_review_completed)
 from mavis.e0_tasks import prepare_small_repository, small_repository_review_prompt
 from mavis.e2_tasks import terra_review_command
@@ -15,6 +16,30 @@ from mavis.storage import sha256_file, write_json
 
 
 class E0EvaluationTests(unittest.TestCase):
+    @unittest.skipUnless(os.name == "posix", "private raw output requires Unix")
+    def test_buried_failure_accepts_private_project_spool_and_legacy_reference(self):
+        with tempfile.TemporaryDirectory() as directory:
+            base = Path(directory)
+            repo = base / "project"
+            repo.mkdir()
+            subprocess.run(["git", "init", "-q", str(repo)], check=True)
+            service = base / "service"
+            legacy = service / "tool-output" / "old.raw"
+            legacy.parent.mkdir(parents=True)
+            legacy.write_bytes(b"old output")
+            self.assertTrue(_trusted_raw_output_path(legacy, repo, service))
+
+            state = repo / ".mavis"
+            raw = state / "tool-output" / "new.raw"
+            raw.parent.mkdir(parents=True)
+            raw.write_bytes(b"new output")
+            self.assertFalse(_trusted_raw_output_path(raw, repo, service))
+            (state / ".gitignore").write_text("*\n")
+            self.assertTrue(_trusted_raw_output_path(raw, repo, service))
+            raw.unlink()
+            raw.symlink_to(legacy)
+            self.assertFalse(_trusted_raw_output_path(raw, repo, service))
+
     def test_isolation_recovery_requires_parked_mavis_and_live_iris(self):
         with tempfile.TemporaryDirectory() as directory:
             evaluator = E0Evaluator(Path(directory), RuntimeConfig(home=Path(directory)))
