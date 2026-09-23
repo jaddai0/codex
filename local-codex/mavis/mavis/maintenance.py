@@ -94,6 +94,10 @@ class MaintenanceQueue:
     def claim_next(self, *, foreground_active: bool) -> dict[str, Any] | None:
         if foreground_active:
             return None
+        # This is the existing idle maintenance boundary. A failed archive
+        # validation is recorded by the sweep and cannot claim a queue job.
+        from .archive_hygiene import ArchiveRetention
+        ArchiveRetention(self.root.parent).sweep_due()
         connection = self._connect()
         try:
             connection.execute("BEGIN IMMEDIATE")

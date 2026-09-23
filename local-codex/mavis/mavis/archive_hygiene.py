@@ -3,16 +3,21 @@
 from __future__ import annotations
 
 from datetime import datetime, timedelta, timezone
+from contextlib import contextmanager
+import fcntl
 import gzip
 import hashlib
+import json
 import os
 from pathlib import Path
 import shutil
 import tempfile
+import time
 from typing import Any
 import warnings
 
 from .storage import read_json, require_safe_id, sha256_file, write_json
+from .helpers import HelperSession
 from .transcripts import TranscriptArchive
 
 
@@ -58,7 +63,45 @@ class ArchiveRetention:
             raise ValueError("archive project record is a symlink")
         return path
 
+    @contextmanager
+    def _registry_lock(self):
+        if self.root.is_symlink():
+            raise ValueError("archive project registry is a symlink")
+        self.root.mkdir(parents=True, exist_ok=True, mode=0o700)
+        directory_fd = os.open(self.root, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+        try:
+            try:
+                descriptor = os.open("registry.lock", os.O_CREAT | os.O_EXCL | os.O_RDWR | os.O_NOFOLLOW,
+                                     0o600, dir_fd=directory_fd)
+            except FileExistsError:
+                descriptor = os.open("registry.lock", os.O_RDWR | os.O_NOFOLLOW,
+                                     dir_fd=directory_fd)
+            with os.fdopen(descriptor, "rb") as lock:
+                fcntl.flock(lock.fileno(), fcntl.LOCK_EX)
+                yield
+        finally:
+            os.close(directory_fd)
+
+    def _check_exclusive(self, record: dict[str, Any]) -> None:
+        owned = set(record["conversation_ids"])
+        for path in self.root.glob("*.json"):
+            if path.is_symlink():
+                raise ValueError("archive project record is a symlink")
+            other = read_json(path)
+            if other.get("schema_version") != "mavis.archive-project/v1":
+                raise ValueError("archive project registry contains an invalid record")
+            if other.get("project_id") == record["project_id"]:
+                continue
+            if owned.intersection(other.get("conversation_ids", [])):
+                raise ValueError("conversation belongs to another archive project")
+
     def register(
+        self, project_id: str, conversation_ids: list[str], objective_ids: list[str]
+    ) -> dict[str, Any]:
+        with self._registry_lock():
+            return self._register_locked(project_id, conversation_ids, objective_ids)
+
+    def _register_locked(
         self, project_id: str, conversation_ids: list[str], objective_ids: list[str]
     ) -> dict[str, Any]:
         if not conversation_ids or len(set(conversation_ids)) != len(conversation_ids):
@@ -80,6 +123,7 @@ class ArchiveRetention:
             "protected_paths": [],
             "segments_at_close": {},
         }
+        self._check_exclusive(record)
         write_json(path, record)
         return record
 
@@ -87,7 +131,15 @@ class ArchiveRetention:
         self, project_id: str, *, protected_paths: list[str] | None = None,
         now: datetime | None = None,
     ) -> dict[str, Any]:
+        with self._registry_lock():
+            return self._close_locked(project_id, protected_paths=protected_paths, now=now)
+
+    def _close_locked(
+        self, project_id: str, *, protected_paths: list[str] | None = None,
+        now: datetime | None = None,
+    ) -> dict[str, Any]:
         record = read_json(self._path(project_id))
+        self._check_exclusive(record)
         if record.get("state") != "open":
             raise ValueError("project is already closed")
         self._check_objectives(record)
@@ -173,6 +225,14 @@ class ArchiveRetention:
             if path.is_symlink():
                 raise ValueError("handoff symlink is unsafe")
             references.update(_strings(read_json(path).get("evidence_links", [])))
+        helper_context = self.home / "helpers" / "librarian" / "query-context.json"
+        if helper_context.is_symlink():
+            raise ValueError("librarian citation cache is a symlink")
+        if helper_context.is_file():
+            payload = read_json(helper_context)
+            if (payload.get("role") == "librarian"
+                and float(payload.get("expires_at_epoch", 0)) > time.time()):
+                references.update(_strings(payload.get("citations", [])))
         # A file touched after closure means the archive is no longer idle.
         if any(datetime.fromtimestamp(path.stat().st_mtime, timezone.utc) > closed_at
                for path in files):
@@ -180,8 +240,14 @@ class ArchiveRetention:
         return {str(Path(value).resolve()) for value in references if Path(value).is_absolute()}
 
     def compact(self, project_id: str, *, now: datetime | None = None) -> dict[str, Any]:
+        with self._registry_lock():
+            with HelperSession(self.home, "librarian")._locked():
+                return self._compact_locked(project_id, now=now)
+
+    def _compact_locked(self, project_id: str, *, now: datetime | None = None) -> dict[str, Any]:
         now = now or datetime.now(timezone.utc)
         record = read_json(self._path(project_id))
+        self._check_exclusive(record)
         if record.get("state") != "closed":
             raise ValueError("only closed projects can be compressed")
         closed_at = _parse(record["closed_at"])
@@ -192,7 +258,7 @@ class ArchiveRetention:
         for conversation_id in record["conversation_ids"]:
             self._check_binding(conversation_id, record)
             archive = TranscriptArchive(self.home, conversation_id)
-            with archive._locked():
+            with archive._locked() as root_fd:
                 manifest = self._safe_manifest(archive)
                 if {item["segment_id"]: item["sha256"] for item in manifest["segments"]} != record["segments_at_close"].get(conversation_id):
                     raise ValueError("archive segment set changed after project closure")
@@ -245,7 +311,7 @@ class ArchiveRetention:
                                     "compressed_sha256": sha256_file(compressed)})
                     try:
                         archive.verify_segment(segment)
-                        write_json(archive.manifest_path, manifest)
+                        archive._write_manifest_locked(root_fd, manifest)
                     except BaseException:
                         segment.clear()
                         segment.update(prior)
@@ -264,7 +330,7 @@ class ArchiveRetention:
         restored = []
         for conversation_id in record["conversation_ids"]:
             archive = TranscriptArchive(self.home, conversation_id)
-            with archive._locked():
+            with archive._locked() as root_fd:
                 manifest = self._safe_manifest(archive)
                 for segment in manifest["segments"]:
                     if segment.get("compression") != "gzip":
@@ -295,7 +361,7 @@ class ArchiveRetention:
                     segment.pop("compressed_sha256")
                     try:
                         archive.verify_segment(segment)
-                        write_json(archive.manifest_path, manifest)
+                        archive._write_manifest_locked(root_fd, manifest)
                     except BaseException:
                         segment.clear()
                         segment.update(prior)
@@ -313,6 +379,42 @@ class ArchiveRetention:
         write_json(self._path(project_id), record)
         return record
 
+    def sweep_due(self, *, now: datetime | None = None) -> dict[str, Any]:
+        """At an idle maintenance claim, attempt each due closed project once daily."""
+        now = now or datetime.now(timezone.utc)
+        results = []
+        if not self.root.is_dir():
+            return {"checked_at": _stamp(now), "projects": results}
+        for path in sorted(self.root.glob("*.json")):
+            try:
+                if path.is_symlink():
+                    raise ValueError("archive project record is a symlink")
+                record = read_json(path)
+                if record.get("state") != "closed":
+                    continue
+                if now - _parse(record["closed_at"]) < timedelta(days=RETENTION_DAYS):
+                    continue
+                last = record.get("last_sweep_at")
+                if last and _parse(last).date() >= now.date():
+                    continue
+                outcome = self.compact(record["project_id"], now=now)
+                with self._registry_lock():
+                    current = read_json(self._path(record["project_id"]))
+                    current["last_sweep_at"] = _stamp(now)
+                    write_json(self._path(record["project_id"]), current)
+                results.append({"project_id": record["project_id"], "status": "checked",
+                                "segments": outcome["segments"]})
+            except (OSError, ValueError, KeyError, TypeError) as exc:
+                results.append({"project_record": str(path), "status": "failed", "error": str(exc)})
+        report = {"schema_version": "mavis.archive-sweep/v1", "checked_at": _stamp(now),
+                  "projects": results}
+        if results:
+            try:
+                write_json(self.home / "maintenance" / "archive-sweep-last.json", report)
+            except OSError as exc:
+                report["report_write_error"] = str(exc)
+        return report
+
 
 def storage_pressure(home: Path, *, prune: bool = False) -> dict[str, Any]:
     """Report capacity; prune only cache files with registered retained sources."""
@@ -324,48 +426,64 @@ def storage_pressure(home: Path, *, prune: bool = False) -> dict[str, Any]:
     cache = home / "cache" / "reproducible"
     freed = 0
     candidates = []
-    if cache.exists():
-        if cache.parent.is_symlink() or cache.is_symlink() or not cache.is_dir():
-            raise ValueError("reproducible cache directory is unsafe")
-        for path in cache.rglob("*"):
-            if path.is_symlink():
-                raise ValueError("reproducible cache symlink is unsafe")
-        registry_path = cache / "manifest.json"
-        if registry_path.is_symlink():
-            raise ValueError("reproducible cache registry is unsafe")
-        registry = read_json(registry_path) if registry_path.is_file() else {"entries": []}
-        if not isinstance(registry.get("entries"), list):
-            raise ValueError("reproducible cache registry is unsafe")
-        for entry in registry["entries"]:
-            declared = cache / entry["path"]
-            source_declared = Path(entry["source"])
-            path = declared.resolve()
-            source = source_declared.resolve()
-            if (declared.is_symlink() or source_declared.is_symlink()
-                or not path.is_relative_to(cache.resolve()) or path == registry_path
-                or source.is_relative_to(cache.resolve())
-                or not source.is_file()
-                or sha256_file(source) != entry["source_sha256"]):
-                continue
-            if path.is_file():
-                if path.is_symlink() or path.stat().st_nlink != 1:
-                    raise ValueError("registered cache file is unsafe")
-                candidates.append(path)
-        if prune and pressure:
-            for path in candidates:
-                freed += path.stat().st_size
-                path.unlink()
-            for path in sorted(cache.rglob("*"), reverse=True):
-                if path.is_dir() and path != cache:
-                    try:
-                        path.rmdir()
-                    except OSError:
-                        pass
+    cache_warning = None
+    if cache.exists() or cache.is_symlink() or cache.parent.is_symlink():
+        try:
+            if cache.parent.is_symlink() or cache.is_symlink() or not cache.is_dir():
+                raise ValueError("reproducible cache directory is unsafe")
+            for path in cache.rglob("*"):
+                if path.is_symlink():
+                    raise ValueError("reproducible cache symlink is unsafe")
+            registry_path = cache / "manifest.json"
+            if registry_path.is_symlink():
+                raise ValueError("reproducible cache registry is unsafe")
+            registry = read_json(registry_path) if registry_path.is_file() else {"entries": []}
+            if (registry.get("schema_version") not in (None, "mavis.reproducible-cache/v1")
+                or not isinstance(registry.get("entries"), list)):
+                raise ValueError("reproducible cache registry has invalid shape")
+            for entry in registry["entries"]:
+                if (not isinstance(entry, dict)
+                    or any(not isinstance(entry.get(key), str) for key in ("path", "source", "source_sha256"))):
+                    raise ValueError("reproducible cache registry has invalid entry")
+                declared = cache / entry["path"]
+                source_declared = Path(entry["source"])
+                path = declared.resolve()
+                source = source_declared.resolve()
+                if (declared.is_symlink() or source_declared.is_symlink()
+                    or not path.is_relative_to(cache.resolve()) or path == registry_path
+                    or source.is_relative_to(cache.resolve())
+                    or not source.is_file()
+                    or sha256_file(source) != entry["source_sha256"]):
+                    continue
+                if path.is_file():
+                    if path.is_symlink() or path.stat().st_nlink != 1:
+                        raise ValueError("registered cache file is unsafe")
+                    candidates.append(path)
+        except (OSError, ValueError, KeyError, TypeError, UnicodeError, json.JSONDecodeError) as exc:
+            candidates = []
+            cache_warning = f"registered cache skipped: {exc}"
+        eligible_bytes = sum(path.stat().st_size for path in candidates if path.exists())
+        if prune and pressure and candidates:
+            try:
+                for path in candidates:
+                    freed += path.stat().st_size
+                    path.unlink()
+                for path in sorted(cache.rglob("*"), reverse=True):
+                    if path.is_dir() and path != cache:
+                        try:
+                            path.rmdir()
+                        except OSError:
+                            pass
+            except OSError as exc:
+                cache_warning = f"registered cache pruning stopped: {exc}"
+    else:
+        eligible_bytes = 0
     return {"free_bytes": usage.free, "total_bytes": usage.total,
             "pressure": pressure, "threshold_free_bytes": threshold,
-            "reproducible_cache_bytes": sum(path.stat().st_size for path in candidates if path.exists()),
+            "reproducible_cache_bytes": eligible_bytes,
             "freed_cache_bytes": freed,
-            "action": "cache-first" if pressure else "none",
+            "action": "registered-cache-pruned" if freed else "capacity-warning" if pressure else "none",
+            "cache_warning": cache_warning,
             "evidence_removed": False}
 
 
@@ -396,11 +514,17 @@ def register_reproducible_cache(home: Path, cache_file: Path, source_file: Path)
 def prepare_evidence_write(home: Path) -> dict[str, Any]:
     """Reclaim safe cache space and persist an early capacity warning."""
     report = storage_pressure(home, prune=True)
-    if report["pressure"]:
-        write_json(Path(home) / "storage-pressure.json", {
-            "schema_version": "mavis.storage-pressure/v1",
-            "observed_at": _stamp(datetime.now(timezone.utc)),
-            **report,
-        })
-        warnings.warn("Mavis storage pressure: reproducible caches pruned; evidence capacity needs attention", RuntimeWarning)
+    if report["pressure"] or report["cache_warning"]:
+        try:
+            write_json(Path(home) / "storage-pressure.json", {
+                "schema_version": "mavis.storage-pressure/v1",
+                "observed_at": _stamp(datetime.now(timezone.utc)),
+                **report,
+            })
+        except OSError:
+            pass  # The optional warning must not block the evidence write.
+        if report["pressure"]:
+            warnings.warn("Mavis storage pressure: evidence capacity needs attention", RuntimeWarning)
+        if report["cache_warning"]:
+            warnings.warn(report["cache_warning"], RuntimeWarning)
     return report
