@@ -5,7 +5,7 @@ import shutil
 import subprocess
 from typing import Any
 
-from .evidence import run_command
+from .evidence import parse_test_output, run_command
 from .experiments import ExperimentStore, _digest, candidate_assignment_requirements
 from .storage import read_json, require_safe_id, sha256_file, write_json
 
@@ -15,6 +15,46 @@ def _git(path: Path, *args: str) -> str:
         ["git", *args], cwd=path, text=True, capture_output=True, check=True
     )
     return result.stdout.strip()
+
+
+def _verify_host_receipt(
+    path: Path, *, command: list[str], cwd: Path, check_id: str, revision: str
+) -> dict[str, Any]:
+    receipt = read_json(path)
+    raw = receipt.get("raw_output")
+    if (
+        not isinstance(raw, dict)
+        or Path(raw.get("path", "")).resolve() != path.resolve().parent
+    ):
+        raise ValueError("host receipt raw output path is invalid")
+    stdout = (path.parent / "stdout.log").read_bytes()
+    stderr = (path.parent / "stderr.log").read_bytes()
+    text = (
+        stdout.decode("utf-8", errors="replace")
+        + "\n"
+        + stderr.decode("utf-8", errors="replace")
+    )
+    status = receipt.get("exit_status")
+    timed_out = receipt.get("timed_out")
+    if (
+        receipt.get("schema_version") != "mavis.evidence-receipt/v1"
+        or receipt.get("producer") != "mavis-host-command/v1"
+        or receipt.get("command") != command
+        or Path(receipt.get("cwd", "")).resolve() != cwd.resolve()
+        or receipt.get("acceptance_check_ids") != [check_id]
+        or receipt.get("changed_revision") != revision
+        or isinstance(status, bool)
+        or not isinstance(status, int)
+        or not isinstance(timed_out, bool)
+        or raw.get("sha256")
+        != sha256_file(path.parent / "stdout.log")
+        + ":"
+        + sha256_file(path.parent / "stderr.log")
+        or raw.get("bytes") != len(stdout) + len(stderr)
+        or receipt.get("verdict") != parse_test_output(text, status, timed_out)
+    ):
+        raise ValueError("host receipt is inconsistent with raw output or frozen check")
+    return receipt
 
 
 def _manifest(path: Path) -> dict[str, Any]:
@@ -81,20 +121,22 @@ def _manifest(path: Path) -> dict[str, Any]:
     if sha256_file(failure_path) != failure["sha256"]:
         raise ValueError("original failure receipt changed")
     original = read_json(failure_path)
-    output = Path(original.get("raw_output", {}).get("path", ""))
-    if (
-        original.get("schema_version") != "mavis.evidence-receipt/v1"
-        or original.get("producer") != "mavis-host-command/v1"
-        or original.get("verdict") != "fail"
-            or original.get("changed_revision") != regression["revision"]
-            or not any(
-                original.get("acceptance_check_ids") == [check["id"]]
-                and original.get("command") == check["argv"]
-                for check in regression["checks"]
-            )
-        or sha256_file(output / "stdout.log") + ":" + sha256_file(output / "stderr.log")
-        != original["raw_output"]["sha256"]
-    ):
+    matching = [
+        check
+        for check in regression["checks"]
+        if original.get("command") == check["argv"]
+        and original.get("acceptance_check_ids") == [check["id"]]
+    ]
+    if not matching:
+        raise ValueError("original failure does not match the regression check")
+    original = _verify_host_receipt(
+        failure_path,
+        command=matching[0]["argv"],
+        cwd=Path(regression["source"]),
+        check_id=matching[0]["id"],
+        revision=regression["revision"],
+    )
+    if original["verdict"] != "fail" or original["timed_out"]:
         raise ValueError("original failure lacks matched raw host evidence")
     held_out = value.get("held_out")
     if (
@@ -112,6 +154,96 @@ def _manifest(path: Path) -> dict[str, Any]:
     ):
         raise ValueError("minimum gain must be between zero and one")
     return value
+
+
+def validate_e1_bundle(home: Path, record: dict[str, Any]) -> str:
+    """Recheck every frozen E1 source and return its content digest."""
+    root = Path(home) / "e1" / require_safe_id(record["experiment_id"], "experiment id")
+    manifest_path = root / "cases.json"
+    if sha256_file(manifest_path) != record["workload"]["manifest_sha256"]:
+        raise ValueError("frozen E1 manifest changed")
+    manifest = _manifest(manifest_path)
+    if manifest["held_out"] != record["evaluation_split"]["held_out"]:
+        raise ValueError("frozen E1 split changed")
+    failure_path = Path(manifest["failure_receipt"]["path"])
+    bundle = {
+        "manifest": sha256_file(manifest_path),
+        "failure_receipt": sha256_file(failure_path),
+        "failure_stdout": sha256_file(failure_path.parent / "stdout.log"),
+        "failure_stderr": sha256_file(failure_path.parent / "stderr.log"),
+        "cases": {},
+    }
+    scores = {}
+    for arm in ("baseline", "candidate"):
+        bundle["cases"][arm] = {}
+        passes = {}
+        for case in manifest["cases"]:
+            case_id = case["id"]
+            result_path = root / "results" / arm / f"{case_id}.json"
+            result = read_json(result_path)
+            if (
+                result.get("schema_version") != "mavis.e1-case-result/v1"
+                or result.get("experiment_id") != record["experiment_id"]
+                or result.get("arm") != arm
+                or result.get("case_id") != case_id
+                or result.get("starting_revision") != case["revision"]
+                or result.get("configuration_sha256") != record[arm]["sha256"]
+                or not isinstance(result.get("checked_revision"), str)
+                or len(result.get("checks", [])) != len(case["checks"])
+            ):
+                raise ValueError("E1 case result lost its frozen binding")
+            check_hashes = []
+            for expected, check in zip(case["checks"], result["checks"], strict=True):
+                receipt_path = Path(check["receipt"])
+                checkout = root / "checkouts" / arm / case_id
+                if check.get("id") != expected["id"] or sha256_file(
+                    receipt_path
+                ) != check.get("sha256"):
+                    raise ValueError("E1 check receipt changed")
+                receipt = _verify_host_receipt(
+                    receipt_path,
+                    command=expected["argv"],
+                    cwd=checkout,
+                    check_id=expected["id"],
+                    revision=result["checked_revision"],
+                )
+                if (
+                    receipt["objective_id"] != record["experiment_id"]
+                    or receipt["verdict"] != check["verdict"]
+                    or receipt["timed_out"]
+                ):
+                    raise ValueError("E1 check receipt is incomplete")
+                check_hashes.append(
+                    {
+                        "receipt": sha256_file(receipt_path),
+                        "stdout": sha256_file(receipt_path.parent / "stdout.log"),
+                        "stderr": sha256_file(receipt_path.parent / "stderr.log"),
+                    }
+                )
+            passed = all(check["verdict"] == "pass" for check in result["checks"])
+            if result.get("passed") is not passed:
+                raise ValueError("E1 case pass claim changed")
+            passes[case_id] = passed
+            bundle["cases"][arm][case_id] = {
+                "result": sha256_file(result_path),
+                "checks": check_hashes,
+            }
+        scores[arm] = sum(passes[case_id] for case_id in manifest["held_out"]) / len(
+            manifest["held_out"]
+        )
+        if (
+            record.get("comparison")
+            and record["comparison"][arm]["target_score"] != scores[arm]
+        ):
+            raise ValueError("E1 score no longer matches case results")
+        if arm == "baseline" and passes[manifest["regression"]]:
+            raise ValueError("E1 baseline no longer fails regression")
+        if arm == "candidate" and (
+            not passes[manifest["regression"]]
+            or not all(passes[case_id] for case_id in manifest["held_out"])
+        ):
+            raise ValueError("E1 candidate no longer passes mandatory cases")
+    return _digest(bundle)
 
 
 class E1Runner:
@@ -395,6 +527,7 @@ class E1Runner:
             or scores["candidate"] - scores["baseline"] < manifest["minimum_gain"]
         ):
             raise ValueError("candidate failed mandatory checks or minimum gain")
+        bundle_digest = validate_e1_bundle(self.home, record)
         report = Path(candidate_report).resolve(strict=True)
         require_safe_id(candidate_job_id, "candidate job id")
         candidate_evidence = self._root(experiment_id) / "candidate-worker-report.json"
@@ -423,6 +556,7 @@ class E1Runner:
                     results[arm][case_id]["passed"] for case_id in held
                 ),
                 "target_score": scores[arm],
+                "e1_bundle_digest": bundle_digest,
                 "evidence": {"path": str(evidence), "sha256": sha256_file(evidence)},
             }
         paired["candidate"]["candidate_job_id"] = candidate_job_id

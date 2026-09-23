@@ -4,6 +4,10 @@ import tempfile
 import unittest
 
 from mavis.e1 import E1Runner
+from mavis.experiments import (
+    candidate_assignment_requirements,
+    review_assignment_requirements,
+)
 from mavis.evidence import run_command
 from mavis.storage import read_json, sha256_file, write_json
 
@@ -139,8 +143,108 @@ class E1RunnerTests(unittest.TestCase):
         failure = read_json(self.manifest)["failure_receipt"]
         receipt = read_json(Path(failure["path"]))
         (Path(receipt["raw_output"]["path"]) / "stdout.log").write_text("changed")
-        with self.assertRaisesRegex(ValueError, "original failure"):
+        with self.assertRaisesRegex(ValueError, "host receipt"):
             self._freeze()
+
+    def test_original_failure_must_be_from_case_source(self):
+        manifest = read_json(self.manifest)
+        path = Path(manifest["failure_receipt"]["path"])
+        receipt = read_json(path)
+        receipt["cwd"] = str(self.root)
+        write_json(path, receipt)
+        manifest["failure_receipt"]["sha256"] = sha256_file(path)
+        write_json(self.manifest, manifest)
+        with self.assertRaisesRegex(ValueError, "host receipt"):
+            self._freeze()
+
+    def test_review_stage_and_promotion_recheck_underlying_raw_output(self):
+        self._freeze()
+        self.runner.prepare("repair", "baseline")
+        self.runner.prepare("repair", "candidate")
+        for case in ("regression", "held-a", "held-b"):
+            self.runner.check("repair", "baseline", case)
+            (
+                self.home
+                / "e1"
+                / "repair"
+                / "checkouts"
+                / "candidate"
+                / case
+                / "result.txt"
+            ).write_text("pass\n")
+            self.runner.check("repair", "candidate", case)
+        report = self.root / "native-report.json"
+        report.write_text('{"report":"native fixture"}')
+        record = self.runner.compare("repair", "candidate-job", report)
+        receipt_path = self.home / "verifications" / "experiments" / "repair.json"
+        write_json(
+            receipt_path,
+            {
+                "schema_version": "mavis.experiment-review/v1",
+                "experiment_id": "repair",
+                "comparison_digest": record["comparison"]["comparison_digest"],
+                "baseline_sha256": record["baseline"]["sha256"],
+                "candidate_sha256": record["candidate"]["sha256"],
+                "candidate_job_id": "candidate-job",
+                "gateway_worker_job_id": "review-job",
+                "verifier_job_id": "terra-review",
+                "verdict": "accepted",
+            },
+        )
+
+        def gateway_status(job_id):
+            candidate = job_id == "candidate-job"
+            return {
+                "job_id": job_id,
+                "state": "completed",
+                "exit_code": 0,
+                "accepted": True,
+                "receipt": {"job_id": job_id, "exit_code": 0},
+                "acceptance": {
+                    "accepted": True,
+                    "job_id": job_id,
+                    "verifier": "terra",
+                    "verifier_job_id": "terra-candidate"
+                    if candidate
+                    else "terra-review",
+                    "target_sha256": "a" * 64,
+                    "evidence_sha256": "b" * 64,
+                    "report_sha256_on_disk": "c" * 64,
+                    "verifier_verdict_sha256": "d" * 64,
+                },
+                "mavis_binding": {
+                    "objective_id": "repair",
+                    "requirements": candidate_assignment_requirements(record)
+                    if candidate
+                    else review_assignment_requirements(record),
+                    "report_sha256": record["comparison"]["candidate"]["evidence"][
+                        "sha256"
+                    ]
+                    if candidate
+                    else sha256_file(receipt_path),
+                },
+            }
+
+        self.runner.store.gateway_status_reader = gateway_status
+        self.runner.store.review("repair", receipt_path)
+        case_result = read_json(
+            self.home / "e1" / "repair" / "results" / "baseline" / "held-a.json"
+        )
+        host_receipt = Path(case_result["checks"][0]["receipt"])
+        stdout = host_receipt.parent / "stdout.log"
+        original = stdout.read_bytes()
+        stdout.write_bytes(b"tampered after review")
+        with self.assertRaisesRegex(
+            ValueError, "host receipt|underlying E1|raw output"
+        ):
+            self.runner.store.stage("repair")
+        stdout.write_bytes(original)
+        self.runner.store.stage("repair")
+        stdout.write_bytes(b"tampered after staging")
+        with self.assertRaisesRegex(
+            ValueError, "host receipt|underlying E1|raw output"
+        ):
+            self.runner.store.promote("repair", between_objectives=True)
 
     def test_manifest_rejects_overlapping_split(self):
         manifest = read_json(self.manifest)

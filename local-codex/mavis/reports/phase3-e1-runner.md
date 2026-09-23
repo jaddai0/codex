@@ -2,6 +2,8 @@
 
 The E1 CLI freezes a versioned case manifest and prompt/tool/retrieval snapshot, prepares disposable clones at each exact starting commit, runs the same acceptance commands on both arms, retains complete host receipts and raw output, and computes a held-out pass fraction. The regression is separate from held-out work and must refer to an earlier failed Mavis host receipt whose raw output still hashes correctly. A missing case or changed receipt blocks comparison. The candidate must repair the regression, pass every held-out case, and beat the baseline by the frozen minimum gain.
 
+The original failure receipt must name the regression case's source checkout, revision, command, and check ID. Its exit status, timeout flag, verdict, raw hashes, and raw byte count are checked against the retained output. A content digest covers the frozen manifest, original failure, both arms' case results, host receipts, and raw logs. Review, staging, promotion, and promoted-profile assertions recheck that digest and the underlying host evidence, so changing a raw log after comparison blocks later gates. Source tests include altered original working directories and tampering after review and staging.
+
 The case manifest is `mavis.e1-cases/v1`:
 
 ```json
@@ -30,3 +32,5 @@ Run from the Mavis package with `PYTHONPATH=local-codex/mavis python3 -m mavis .
 6. Copy the native review worker's unchanged JSON report to `$MAVIS_HOME/verifications/experiments/`, then `e1 review ID RECEIPT.json` and `e1 stage ID`. The existing store validates both gateway jobs and Terra acceptance on review and staging.
 
 `e1 compare` records a provisional comparison. The candidate job ID and report are not accepted until `e1 review` verifies their native gateway bindings. This slice does not dispatch gateway assignments, apply the active profile in the installed runtime, assert an idle objective boundary, promote, or prove rollback. Those gates remain open for the real Phase 3 canary.
+
+The case result records the intended configuration hash. It does not observe the worker's applied configuration or bind the worker to each checkout; the score is therefore a host-check comparison until the live assignment and installed profile path supply that evidence.

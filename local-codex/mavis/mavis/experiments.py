@@ -227,6 +227,12 @@ class ExperimentStore:
             evidence = comparison[arm]["evidence"]
             if sha256_file(Path(evidence["path"])) != evidence["sha256"]:
                 raise ValueError("comparison evidence changed")
+        if record["workload"].get("manifest_sha256") is not None:
+            from .e1 import validate_e1_bundle
+
+            digest = validate_e1_bundle(self.home, record)
+            if any(comparison[arm].get("e1_bundle_digest") != digest for arm in ("baseline", "candidate")):
+                raise ValueError("underlying E1 evidence changed")
 
     def review(self, experiment_id: str, receipt_path: Path) -> dict[str, Any]:
         """Import a separate host receipt; a reviewer string alone cannot pass."""
