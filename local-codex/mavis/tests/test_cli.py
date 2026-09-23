@@ -222,6 +222,20 @@ class ObjectiveCliTests(unittest.TestCase):
 
 
 class MaintenanceCliTests(unittest.TestCase):
+    def test_tick_cli_calls_host_runner_and_returns_receipt(self):
+        with tempfile.TemporaryDirectory() as directory:
+            home = Path(directory)
+            output = io.StringIO()
+            with (patch.dict(os.environ, {"MAVIS_HOME": str(home)}),
+                  patch("mavis.cli.maintenance_tick", return_value={
+                      "schema_version": "mavis.maintenance-tick/v1",
+                      "status": "deferred", "receipt_path": str(home / "receipt.json"),
+                  }) as runner,
+                  contextlib.redirect_stdout(output)):
+                self.assertEqual(main(["maintenance", "tick"]), 0)
+            runner.assert_called_once_with(home)
+            self.assertEqual(json.loads(output.getvalue())["status"], "deferred")
+
     def test_cancel_cli_returns_cancelled_job(self):
         with tempfile.TemporaryDirectory() as directory:
             home = Path(directory)
@@ -321,6 +335,8 @@ class LauncherRoutingTests(unittest.TestCase):
                                          env=env, text=True, capture_output=True, timeout=15)
                     self.assertEqual(run.returncode, 0, run.stderr)
                     self.assertIn("usage: mavis-service", run.stdout)
+                    if command == "maintenance":
+                        self.assertIn("tick", run.stdout)
 
 
 if __name__ == "__main__":

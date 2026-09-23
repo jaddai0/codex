@@ -13,7 +13,7 @@ from pathlib import Path
 import shutil
 import stat
 import time
-from typing import Any
+from typing import Any, Callable
 import warnings
 
 from .storage import read_json, require_safe_id, sha256_file, write_json
@@ -24,6 +24,12 @@ from .transcripts import TranscriptArchive
 RETENTION_DAYS = 30
 PRESSURE_FREE_BYTES = 20 * 1024**3
 PRESSURE_FREE_FRACTION = 0.10
+MAX_TICK_PROJECT_SEGMENTS = 64
+MAX_TICK_PROJECT_BYTES = 64 * 1024 * 1024
+
+
+class ForegroundYield(RuntimeError):
+    """A host admission probe saw foreground work at a safe archive boundary."""
 
 
 def _stamp(instant: datetime) -> str:
@@ -395,7 +401,19 @@ class ArchiveRetention:
             with HelperSession(self.home, "librarian")._locked():
                 return self._compact_locked(project_id, now=now)
 
-    def _compact_locked(self, project_id: str, *, now: datetime | None = None) -> dict[str, Any]:
+    def compact_one(self, project_id: str, *, now: datetime,
+                    cursor: tuple[str, str] | None = None,
+                    admit: Callable[[], bool]) -> dict[str, Any]:
+        """Process at most one segment, yielding only at verified safe boundaries."""
+        with self._registry_lock():
+            with HelperSession(self.home, "librarian")._locked():
+                return self._compact_locked(project_id, now=now, cursor=cursor,
+                                            limit_one=True, admit=admit)
+
+    def _compact_locked(self, project_id: str, *, now: datetime | None = None,
+                        cursor: tuple[str, str] | None = None,
+                        limit_one: bool = False,
+                        admit: Callable[[], bool] | None = None) -> dict[str, Any]:
         now = now or datetime.now(timezone.utc)
         record = read_json(self._path(project_id))
         self._check_exclusive(record)
@@ -406,6 +424,23 @@ class ArchiveRetention:
             raise ValueError("closed project has not been idle for 30 days")
         self._check_objectives(record)
         outcomes: list[dict[str, Any]] = []
+        past_cursor = cursor is None
+        if limit_one:
+            if len(record["conversation_ids"]) > MAX_TICK_PROJECT_SEGMENTS:
+                raise ValueError("archive project exceeds bounded maintenance tick budget")
+            segment_count = 0
+            stored_bytes = 0
+            for conversation_id in record["conversation_ids"]:
+                archive = TranscriptArchive(self.home, conversation_id)
+                if archive.manifest_path.is_symlink():
+                    raise ValueError("archive manifest escapes the archive")
+                preview = read_json(archive.manifest_path)
+                for segment in preview["segments"]:
+                    segment_count += 1
+                    stored_bytes += archive.resolve_segment_file(segment["path"]).stat().st_size
+                    if (segment_count > MAX_TICK_PROJECT_SEGMENTS
+                            or stored_bytes > MAX_TICK_PROJECT_BYTES):
+                        raise ValueError("archive project exceeds bounded maintenance tick budget")
         for conversation_id in record["conversation_ids"]:
             self._check_binding(conversation_id, record)
             archive = TranscriptArchive(self.home, conversation_id)
@@ -416,6 +451,13 @@ class ArchiveRetention:
                 references = self._activity_and_references(record, archive, manifest, closed_at)
                 with _PinnedSegments(archive, root_fd) as pinned:
                     for segment in manifest["segments"]:
+                        key = (conversation_id, segment["segment_id"])
+                        if not past_cursor:
+                            if key == cursor:
+                                past_cursor = True
+                            continue
+                        if admit is not None and not admit():
+                            raise ForegroundYield("foreground work began before archive shard")
                         pinned.assert_attached()
                         name = pinned.segment_name(segment)
                         source_path = Path(segment["path"])
@@ -432,12 +474,20 @@ class ArchiveRetention:
                                 raw_sha, raw_identity = pinned.digest(raw_name)
                                 if raw_sha != segment["sha256"]:
                                     raise ValueError("unverified raw duplicate remains")
+                                if admit is not None and not admit():
+                                    raise ForegroundYield("foreground work began before duplicate removal")
                                 pinned.unlink_verified(raw_name, raw_sha, raw_identity)
                                 pinned.assert_attached()
                             outcomes.append({"segment_id": segment["segment_id"], "status": "already-compressed"})
+                            if limit_one:
+                                return {"project_id": project_id, "segments": outcomes,
+                                        "cursor": list(key), "complete": False}
                             continue
                         if str(source_path) in references:
                             outcomes.append({"segment_id": segment["segment_id"], "status": "referenced"})
+                            if limit_one:
+                                return {"project_id": project_id, "segments": outcomes,
+                                        "cursor": list(key), "complete": False}
                             continue
                         raw_sha, raw_identity = pinned.digest(name)
                         if raw_sha != segment["sha256"]:
@@ -455,9 +505,13 @@ class ArchiveRetention:
                         removed = False
                         try:
                             pinned.assert_attached()
+                            if admit is not None and not admit():
+                                raise ForegroundYield("foreground work began before archive publication")
                             published = True  # A write may publish before raising.
                             archive._write_manifest_locked(root_fd, manifest)
                             pinned.assert_attached()
+                            if admit is not None and not admit():
+                                raise ForegroundYield("foreground work began before raw removal")
                             pinned.unlink_verified(name, raw_sha, raw_identity)
                             removed = True
                             pinned.assert_attached()
@@ -471,6 +525,14 @@ class ArchiveRetention:
                         outcomes.append({"segment_id": segment["segment_id"], "status": "compressed",
                                          "original_sha256": raw_sha,
                                          "compressed_sha256": compressed_sha})
+                        if limit_one:
+                            return {"project_id": project_id, "segments": outcomes,
+                                    "cursor": list(key), "complete": False}
+        if limit_one and not past_cursor:
+            raise ValueError("archive shard cursor is absent from the pinned project")
+        if limit_one:
+            return {"project_id": project_id, "segments": outcomes,
+                    "cursor": list(cursor) if cursor else None, "complete": True}
         return {"project_id": project_id, "segments": outcomes}
 
     def restore(self, project_id: str) -> dict[str, Any]:
