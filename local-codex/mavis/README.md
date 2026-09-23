@@ -10,6 +10,33 @@ directories. IRIS remains on its existing oMLX service. The Mavis service uses
 an isolated base path and endpoint and refuses to replace a process it does not
 own.
 
+## Optional project embeddings
+
+`project-index search` stays exact by default. To use vectors, first load an
+embedding model through the separately admitted Mavis runtime, then explicitly
+refresh its index. The route checks that Mavis owns port 8001, the selected
+embedding model is already loaded, its revision matches the oMLX model path,
+and shared compute admission allows each request. It never starts a server or
+loads a model. The revision can be the 40-character Hugging Face snapshot name.
+
+```sh
+PYTHONPATH=local-codex/mavis python3 -m mavis project-index --project /path/to/project \
+  refresh-embeddings --embedding-model Qwen3-Embedding-0.6B \
+  --embedding-revision SNAPSHOT_REVISION --embedding-dimensions 1024
+PYTHONPATH=local-codex/mavis python3 -m mavis project-index --project /path/to/project \
+  search 'describe the needed code' --embeddings \
+  --embedding-model Qwen3-Embedding-0.6B \
+  --embedding-revision SNAPSHOT_REVISION --embedding-dimensions 1024
+```
+
+`refresh-embeddings --rebuild` is required to change model, revision, index
+version, or dimensions. `status` reports the bound identity and whether saved
+passages still match live files. Search keeps current-file exact results and
+returns `embedding_error` when the optional provider fails. A failed vector
+refresh exits 2 and leaves prior vectors intact. The Qwen 0.6B route sends one
+text per request because padded batches produced non-finite values in the
+Phase 2 source comparison; installed service behavior still needs acceptance.
+
 The first live dual-load canary rejected concurrent use of the 111.55 GB Qwen
 profile: the Mavis load timed out and IRIS stopped answering until the Mavis
 process was removed. Runtime admission now blocks any second local generation

@@ -163,6 +163,36 @@ class EmbeddingIndex:
             )
         return documents
 
+    def status(self) -> dict[str, Any]:
+        """Report the bound branch identity and whether every vector matches live source."""
+        branch = self.source.branch()
+        connection = self._connect()
+        try:
+            identity = connection.execute(
+                "SELECT model,revision,version,dimensions FROM embedding_versions WHERE scope=?",
+                (f"project:{branch}",),
+            ).fetchone()
+            rows: dict[str, list[Any]] = {}
+            for row in connection.execute(
+                "SELECT * FROM embedding_passages WHERE branch=? ORDER BY path,passage_index",
+                (branch,),
+            ):
+                rows.setdefault(row["path"], []).append(row)
+            documents = self._documents() if identity is not None else {}
+            current = identity is not None and set(rows) == set(documents) and all(
+                self._matches(rows[path], digest, passages)
+                and all(self._row_identity(row) == self._row_identity(identity)
+                        for row in rows[path])
+                for path, (digest, passages) in documents.items()
+            )
+            return {
+                "identity": dict(identity) if identity is not None else None,
+                "passages": sum(len(group) for group in rows.values()),
+                "snapshot_current": current,
+            }
+        finally:
+            connection.close()
+
     def refresh(
         self, provider: EmbeddingProvider, *, rebuild: bool = False
     ) -> dict[str, Any]:
