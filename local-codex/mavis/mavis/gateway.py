@@ -151,3 +151,27 @@ def harness_job_status(job_id: str, timeout: float = 10.0) -> dict[str, Any]:
 def harness_assignment_start(assignment: dict[str, Any], timeout: float = 15.0) -> dict[str, Any]:
     """Start a Mavis-bound native assignment through the configured gateway."""
     return _gateway_tool("harness_assignment_start", assignment, timeout)
+
+
+def harness_job_complete(job_id: str, check_results: dict[str, Any], timeout: float = 15.0) -> dict[str, Any]:
+    """Record a worker's terminal receipt and exact host check output."""
+    return _gateway_tool("harness_job_complete", {
+        "job_id": job_id, "summary": "E1 bootstrap evidence review complete",
+        "check_results": check_results,
+    }, timeout)
+
+
+def harness_verifier_start(job_id: str, verifier_job_id: str, timeout: float = 15.0) -> dict[str, Any]:
+    """Start the gateway's independent Terra verifier for one worker."""
+    return _gateway_tool("harness_verifier_start", {
+        "job_id": job_id, "verifier_job_id": verifier_job_id,
+    }, timeout)
+
+
+def harness_job_verify(job_id: str, verifier_job_id: str, report_sha256: str,
+                       timeout: float = 15.0) -> dict[str, Any]:
+    """Ask the gateway to bind Terra's verdict to the exact worker report."""
+    return _gateway_tool("harness_job_verify", {
+        "job_id": job_id, "verifier": "terra", "verdict": "accepted",
+        "evidence_sha256": report_sha256, "verifier_job_id": verifier_job_id,
+    }, timeout)

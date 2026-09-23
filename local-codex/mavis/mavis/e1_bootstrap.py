@@ -247,8 +247,8 @@ def _assignment(home: Path) -> tuple[Path, dict[str, Any], dict[str, Any]]:
     if (not isinstance(owner, dict) or set(owner) != {"provider", "model", "harness"}
             or any(not isinstance(value, str) or not value for value in owner.values())):
         raise ValueError("E1 bootstrap review assignment has no exact owner")
-    if (owner["provider"], owner["harness"]) not in {("zai", "zcode"), ("minimax", "opencode")}:
-        raise ValueError("E1 bootstrap review owner has no native gateway lane")
+    if (owner["provider"], owner["harness"]) != ("minimax", "opencode"):
+        raise ValueError("E1 bootstrap review requires a model-selected MiniMax harness")
     _checked_ref(assignment.get("e0_summary"), summary_path, "E0 summary")
     _checked_ref(assignment.get("baseline"), baseline_path, "baseline")
     _checked_ref(assignment.get("package_manifest"), package_path, "package manifest")
@@ -286,8 +286,8 @@ def prepare_bootstrap_review(
     if (not isinstance(owner, dict) or set(owner) != {"provider", "model", "harness"}
             or any(not isinstance(value, str) or not value for value in owner.values())):
         raise ValueError("E1 bootstrap review assignment has no exact owner")
-    if (owner["provider"], owner["harness"]) not in {("zai", "zcode"), ("minimax", "opencode")}:
-        raise ValueError("E1 bootstrap review owner has no native gateway lane")
+    if (owner["provider"], owner["harness"]) != ("minimax", "opencode"):
+        raise ValueError("E1 bootstrap review requires a model-selected MiniMax harness")
     summary_path, summary = _summary(home)
     baseline_path, _ = _baseline(home)
     package_path = _package_manifest_path()
@@ -320,11 +320,8 @@ def _gateway_arguments(
     require_safe_id(job_id, "bootstrap review job id")
     require_safe_id(f"{job_id}-terra", "bootstrap verifier job id")
     owner = packet["owner"]
-    lane = {("zai", "zcode"): "zcode", ("minimax", "opencode"): "minimax"}.get(
-        (owner["provider"], owner["harness"])
-    )
-    if lane is None:
-        raise ValueError("E1 bootstrap reviewer needs an independent native harness")
+    if (owner["provider"], owner["harness"]) != ("minimax", "opencode"):
+        raise ValueError("E1 bootstrap reviewer requires a model-selected MiniMax harness")
     return {
         "job_id": job_id,
         "task": (
@@ -337,7 +334,7 @@ def _gateway_arguments(
             "This names the planned separate verifier; it does not claim that verifier ran. "
             "Use the frozen packet's exact hashes. Return raw JSON without code fences."
         ),
-        "lane": lane,
+        "lane": "minimax",
         "model": owner["model"],
         "cwd": packet["cwd"],
         "starting_revision": packet["starting_revision"],
