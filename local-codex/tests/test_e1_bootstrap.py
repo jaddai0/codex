@@ -4,6 +4,7 @@
 import json
 from pathlib import Path
 import shutil
+import subprocess
 import sys
 import tempfile
 import unittest
@@ -45,6 +46,16 @@ class E1BootstrapTests(unittest.TestCase):
             shutil.copyfile(ROOT / name, self.share / name)
         shutil.copytree(ROOT / "mavis/mavis", self.share / "mavis",
                         ignore=shutil.ignore_patterns("__pycache__", "*.pyc"))
+        source = fixture.root / "installed-source"
+        shutil.copytree(self.share / "mavis", source / "local-codex/mavis/mavis")
+        subprocess.run(["git", "init", "-q", str(source)], check=True)
+        subprocess.run(["git", "-C", str(source), "config", "user.name", "Mavis Test"], check=True)
+        subprocess.run(["git", "-C", str(source), "config", "user.email", "test@example.invalid"], check=True)
+        subprocess.run(["git", "-C", str(source), "add", "local-codex/mavis/mavis"], check=True)
+        subprocess.run(["git", "-C", str(source), "commit", "-qm", "installed source"], check=True)
+        source_revision = subprocess.check_output(
+            ["git", "-C", str(source), "rev-parse", "HEAD"], text=True
+        ).strip()
         self.core = self.share / "local-codex-core"
         self.core.write_text("#!/bin/sh\nexit 0\n")
         self.core.chmod(0o755)
@@ -63,6 +74,8 @@ class E1BootstrapTests(unittest.TestCase):
             "base_instructions_sha256": sha256_file(self.share / "base-instructions.md"),
             "persona_sha256": sha256_file(self.share / "persona.toml"),
             "mavis_package_sha256": package_tree_sha256(self.share / "mavis"),
+            "source_repository": str(source.resolve()),
+            "source_revision": source_revision,
         })
         e0 = self.home / "evaluations/e0"
         cases = {}
@@ -90,7 +103,7 @@ class E1BootstrapTests(unittest.TestCase):
         (self.model_path / "model-00002.safetensors").write_bytes(b"weights-two")
         self.records = [{"id": "model-a", "model_type": "llm", "loaded": True,
                          "model_path": str(self.model_path.resolve())}]
-        self.owner = {"provider": "zcode", "model": "zcode-reviewer", "harness": "zcode"}
+        self.owner = {"provider": "minimax", "model": "minimax/MiniMax-M3", "harness": "opencode"}
         self.patches = [
             patch.object(e1_bootstrap, "installed_candidate_fingerprint", return_value=self.fingerprint),
             patch.object(e1_bootstrap, "_package_manifest_path", return_value=self.package),
@@ -108,6 +121,22 @@ class E1BootstrapTests(unittest.TestCase):
         self.identity = self.assignment["model_identity"]
         baseline = fixture.runner.store.active("main")["configuration"]
         self.review = self.home / "verifications/e1-bootstrap/main.json"
+        self.gateway_job_dir = fixture.root / "gateway-job"
+        self.gateway_report = self.gateway_job_dir / "review.json"
+        self.gateway_assignment = self.gateway_job_dir / "assignment.json"
+
+        def start_review(arguments):
+            write_json(self.gateway_assignment, arguments)
+            return {
+                "success": True, "started": True, "accepted": False,
+                "job_id": "review-job", "job_dir": str(self.gateway_job_dir),
+                "report_path": str(self.gateway_report),
+                "assignment_path": str(self.gateway_assignment),
+            }
+
+        e1_bootstrap.dispatch_bootstrap_review(
+            self.home, "review-job", starter=start_review
+        )
         write_json(self.review, {
             "schema_version": "mavis.e1-bootstrap-review/v1", "verdict": "accepted",
             "e0_summary_sha256": sha256_file(self.summary),
@@ -116,27 +145,28 @@ class E1BootstrapTests(unittest.TestCase):
             "installed_candidate_digest": e1_bootstrap._digest(self.fingerprint),
             "model_identity_digest": e1_bootstrap._digest(self.identity),
             "assignment_sha256": sha256_file(self.assignment_path),
-            "gateway_worker_job_id": "review-job", "verifier_job_id": "terra-job",
+            "gateway_worker_job_id": "review-job", "verifier_job_id": "review-job-terra",
         })
+        shutil.copyfile(self.review, self.gateway_report)
 
     def _status(self, job_id):
         return {
             "job_id": job_id, "state": "completed", "exit_code": 0, "accepted": True,
             "receipt": {"job_id": job_id, "exit_code": 0},
             "acceptance": {"accepted": True, "job_id": job_id, "verifier": "terra",
-                           "verifier_job_id": "terra-job", "target_sha256": sha256_file(self.assignment_path),
+                           "verifier_job_id": "review-job-terra", "target_sha256": sha256_file(self.assignment_path),
                            "evidence_sha256": "b" * 64, "report_sha256_on_disk": sha256_file(self.review),
                            "verifier_verdict_sha256": "d" * 64},
             "mavis_binding": {
-                "schema_version": "mavis.e1-bootstrap-gateway-binding/v1",
-                "objective_id": "e1-bootstrap-main", "scope": "main",
+                "schema_version": "model-gateway-mavis-objective-binding/v1",
+                "objective_id": "e1-bootstrap-main",
                 "cwd": self.assignment["cwd"], "owner": self.owner,
                 "starting_revision": self.assignment["starting_revision"],
                 "changed_revision": self.assignment["starting_revision"],
                 "owned_paths": self.assignment["owned_paths"],
                 "requirements": self.assignment["requirements"],
                 "required_checks": self.assignment["required_checks"],
-                "assignment_sha256": sha256_file(self.assignment_path),
+                "assignment_sha256": sha256_file(self.gateway_assignment),
                 "report_sha256": sha256_file(self.review),
                 "target_sha256": sha256_file(self.assignment_path),
             },
@@ -225,7 +255,7 @@ class E1BootstrapTests(unittest.TestCase):
         review = read_json(self.review)
         review["verifier_job_id"] = "wrong"
         write_json(self.review, review)
-        with self.assertRaisesRegex(ValueError, "independent gateway acceptance"):
+        with self.assertRaisesRegex(ValueError, "differs from gateway report bytes"):
             self._create()
 
     def test_same_model_id_with_changed_weight_bytes_rejected(self):
