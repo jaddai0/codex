@@ -98,13 +98,15 @@ def _safe_buried_inspection(command: str) -> bool:
     normalized = command.replace("2>&1", "")
     if "<" in normalized or ">" in normalized:
         return False
-    allowed = {"ls", "echo", "rg", "grep", "head", "tail", "cut", "cat", "wc", "pwd", "stat"}
+    allowed = {"ls", "echo", "rg", "grep", "head", "tail", "cut", "cat", "wc", "pwd", "stat", "sort"}
     for part in re.split(r"[;|]", normalized):
         try:
             args = shlex.split(part)
         except ValueError:
             return False
         if not args or args[0] not in allowed:
+            return False
+        if args[0] == "sort" and args not in (["sort"], ["sort", "-u"], ["sort", "--unique"]):
             return False
         if args[0] == "rg" and any(arg.startswith("--pre") for arg in args[1:]):
             return False

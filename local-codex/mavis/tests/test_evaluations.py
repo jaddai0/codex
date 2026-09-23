@@ -6,7 +6,7 @@ import tempfile
 import unittest
 from unittest.mock import patch
 
-from mavis.evaluations import (E0_CASES, E0Evaluator,
+from mavis.evaluations import (E0_CASES, E0Evaluator, _safe_buried_inspection,
                                installed_candidate_fingerprint, native_review_completed)
 from mavis.e0_tasks import prepare_small_repository
 from mavis.runtime import RuntimeConfig
@@ -14,6 +14,11 @@ from mavis.storage import sha256_file
 
 
 class E0EvaluationTests(unittest.TestCase):
+    def test_buried_inspection_allows_stdin_sort_unique_without_file_output(self):
+        self.assertTrue(_safe_buried_inspection("grep -o MAVIS_E0_FAILURE_ output.raw | sort -u | head"))
+        self.assertFalse(_safe_buried_inspection("grep -o MAVIS_E0_FAILURE_ output.raw | sort -o stolen.log"))
+        self.assertFalse(_safe_buried_inspection("grep -o MAVIS_E0_FAILURE_ output.raw | sort private.txt"))
+
     def test_installed_candidate_tracks_launcher_and_profile_code(self):
         with tempfile.TemporaryDirectory() as directory:
             home = Path(directory)
