@@ -112,12 +112,117 @@ def check_profile_cli_arguments(arguments: list[str]) -> None:
             raise ValueError(f"{argument} can override an accepted main profile")
 
 
-def launch(receipt_path: Path | None, argv: list[str]) -> int:
+def launch(
+    receipt_path: Path | None, argv: list[str], *, mavis_home: Path | None = None
+) -> int:
     if receipt_path is not None:
         receipt = json.loads(receipt_path.read_text(encoding="utf-8"))
         with generation_lease(Path(receipt["mavis_home"]), purpose="accepted-main"):
             return _launch_unlocked(receipt_path, argv)
-    return _launch_unlocked(receipt_path, argv)
+    home = mavis_home or os.environ.get("MAVIS_HOME")
+    if home is None:
+        raise ValueError("MAVIS_HOME is required for a core launch without a profile")
+    with generation_lease(Path(home), purpose="main"):
+        return _launch_unlocked(None, argv)
+
+
+def _preparation_command(
+    command: list[str], *, capture_output: bool
+) -> subprocess.CompletedProcess[str]:
+    """Stop a preparation child before releasing the launcher lease on interrupt."""
+    with TrialSignalGuard() as guard:
+        child = subprocess.Popen(
+            command,
+            stdout=subprocess.PIPE if capture_output else subprocess.DEVNULL,
+            stderr=subprocess.PIPE if capture_output else None,
+            text=True,
+            start_new_session=True,
+        )
+        guard.register(child)
+        while True:
+            try:
+                stdout, stderr = child.communicate(timeout=0.2)
+                break
+            except subprocess.TimeoutExpired:
+                if guard.signal is not None and time.monotonic() - guard.at >= 5:
+                    try:
+                        os.killpg(child.pid, signal.SIGKILL)
+                    except ProcessLookupError:
+                        pass
+        if guard.signal is not None:
+            raise RuntimeError("launcher was interrupted during model preparation")
+        return subprocess.CompletedProcess(command, child.returncode, stdout, stderr)
+
+
+def _prepared_output(command: list[str]) -> str:
+    result = _preparation_command(command, capture_output=True)
+    if result.returncode != 0:
+        raise RuntimeError(
+            (result.stderr or "").strip() or f"preparation exited {result.returncode}"
+        )
+    return (result.stdout or "").strip()
+
+
+def managed_launch(args: argparse.Namespace, argv: list[str]) -> int:
+    """Hold the host lease through model preparation and the whole core session."""
+    if not argv:
+        raise ValueError("core binary is required")
+    needed = (
+        "share_dir", "home", "mavis_home", "base_url", "iris_endpoint",
+        "model_dir", "omlx_binary", "gateway_root",
+    )
+    if any(getattr(args, name) is None for name in needed):
+        raise ValueError("managed launch is missing its runtime paths")
+    share = args.share_dir.resolve()
+    home = args.mavis_home.resolve()
+    runtime_home = args.home.resolve()
+    prepare = share / "prepare_runtime.py"
+    with generation_lease(home, purpose="main-launch"):
+        model_command = [
+            sys.executable, str(prepare), "--mavis-home", str(home), "--resolve-model",
+        ]
+        if args.model:
+            model_command += ["--model", args.model]
+        model = _prepared_output(model_command)
+        if not model:
+            raise ValueError("model resolution returned no model")
+        if (home / "profiles" / "main" / "active.json").exists():
+            check_profile_cli_arguments(argv[1:])
+        ensure = [
+            sys.executable, "-m", "mavis", "runtime", "ensure",
+            "--endpoint", args.base_url,
+            "--iris-endpoint", args.iris_endpoint,
+            "--model", model,
+            "--model-dir", str(args.model_dir),
+            "--omlx-binary", str(args.omlx_binary),
+        ]
+        result = _preparation_command(ensure, capture_output=False)
+        if result.returncode != 0:
+            return result.returncode
+        receipt_command = [
+            sys.executable, str(prepare),
+            "--home", str(runtime_home),
+            "--mavis-home", str(home),
+            "--print-receipt",
+            "--base-url", args.base_url,
+            "--persona-template", str(share / "persona.toml"),
+            "--instructions-template", str(share / "base-instructions.md"),
+            "--gateway-root", str(args.gateway_root),
+            "--model", model,
+        ]
+        if args.gateway_env_file is not None:
+            receipt_command += ["--gateway-env-file", str(args.gateway_env_file)]
+        receipt = _prepared_output(receipt_command)
+        if receipt:
+            check_profile_cli_arguments(argv[1:])
+        os.environ.update(
+            CODEX_HOME=str(runtime_home),
+            MAVIS_HOME=str(home),
+            LOCAL_CODEX_SHARE_DIR=str(share),
+            MAVIS_PRECOMPACT_REQUIRED="1",
+            MAVIS_RAW_OUTPUT_REQUIRED="1",
+        )
+        return _launch_unlocked(Path(receipt) if receipt else None, argv)
 
 
 def _launch_unlocked(receipt_path: Path | None, argv: list[str]) -> int:
@@ -399,18 +504,31 @@ def main() -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument("--receipt", type=Path)
     parser.add_argument("--check-args", action="store_true")
+    parser.add_argument("--managed", action="store_true")
+    parser.add_argument("--share-dir", type=Path)
+    parser.add_argument("--home", type=Path)
+    parser.add_argument("--mavis-home", type=Path)
+    parser.add_argument("--base-url")
+    parser.add_argument("--iris-endpoint")
+    parser.add_argument("--model-dir", type=Path)
+    parser.add_argument("--omlx-binary", type=Path)
+    parser.add_argument("--gateway-root", type=Path)
+    parser.add_argument("--gateway-env-file", type=Path)
+    parser.add_argument("--model")
     parser.add_argument("command", nargs=argparse.REMAINDER)
     args = parser.parse_args()
     command = args.command[1:] if args.command[:1] == ["--"] else args.command
     if args.check_args:
         check_profile_cli_arguments(command)
         return 0
-    return launch(args.receipt, command)
+    if args.managed:
+        return managed_launch(args, command)
+    return launch(args.receipt, command, mavis_home=args.mavis_home)
 
 
 if __name__ == "__main__":
     try:
         raise SystemExit(main())
-    except (OSError, ValueError, json.JSONDecodeError) as error:
+    except (OSError, RuntimeError, ValueError, json.JSONDecodeError) as error:
         print(f"mavis: {error}", file=sys.stderr)
         raise SystemExit(2) from None
