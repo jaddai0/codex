@@ -1,4 +1,6 @@
 from pathlib import Path
+import hashlib
+import json
 import subprocess
 import tempfile
 import unittest
@@ -16,7 +18,7 @@ class E1RunnerTests(unittest.TestCase):
     def setUp(self):
         self.temp = tempfile.TemporaryDirectory()
         self.addCleanup(self.temp.cleanup)
-        self.root = Path(self.temp.name)
+        self.root = Path(self.temp.name).resolve()
         self.repo = self.root / "source"
         self.repo.mkdir()
         subprocess.run(["git", "init", "-q", str(self.repo)], check=True)
@@ -64,6 +66,7 @@ class E1RunnerTests(unittest.TestCase):
                 "id": id_,
                 "source": str(self.repo),
                 "revision": revision,
+                "task": f"Repair {id_}",
                 "checks": [check],
             }
             for id_ in ("regression", "held-a", "held-b")
@@ -109,6 +112,97 @@ class E1RunnerTests(unittest.TestCase):
         subprocess.run(["git", "-C", str(checkout), "-c", "user.name=Test",
                         "-c", "user.email=test@example.invalid", "commit", "-qm", "repair"], check=True)
         return checkout
+
+    def _trial_fixture(self, arm, case_id):
+        """Construct a host-shaped receipt without invoking a core or model."""
+        record = self.runner.store.load("repair")
+        case = next(case for case in read_json(self.manifest)["cases"] if case["id"] == case_id)
+        root = self.home / "e1" / "repair"
+        checkout = root / "checkouts" / arm / case_id
+        result = read_json(root / "results" / arm / f"{case_id}.json")
+        runtime = root / "runtime" / arm / case_id
+        runtime.mkdir(parents=True, exist_ok=True)
+        share = self.root / "installed-share"
+        share.mkdir(exist_ok=True)
+        core = share / "local-codex-core"
+        core.write_text("fixture core")
+        template = share / "base-instructions.md"
+        template.write_text("Base instructions\n")
+        trial_source = share / "trial_runtime.py"
+        trial_source.write_text("fixture runtime")
+        launcher = share / "mavis"
+        launcher.write_text("fixture launcher")
+        package_path = share / "install-manifest.json"
+        write_json(package_path, {
+            "schema_version": "mavis.installed-core/v1",
+            "core_binary": str(core), "core_sha256": sha256_file(core),
+            "launcher": str(launcher), "launcher_sha256": sha256_file(launcher),
+            "trial_runtime_sha256": sha256_file(trial_source),
+        })
+        profile = self.home / "profiles" / "main" / "v1.json"
+        write_json(profile, {"profile_id": "accepted", "role": "main", "status": "active",
+                             "model_identity": {"model_id": "exact-model"}})
+        write_json(profile.parent / "active.json", {"version": 1, "path": str(profile)})
+        prompt = read_json(Path(record[arm]["path"]))["prompts"]["system"]
+        instructions = runtime / "accepted-model-instructions.md"
+        instructions.write_text("Base instructions\n\n" + prompt + "\n")
+        catalog = runtime / "omlx-models.json"
+        catalog.write_text("{}\n")
+        config = runtime / "config.toml"
+        config.write_text('model = "exact-model"\n')
+        stdout = runtime / "stdout.log"
+        stderr = runtime / "stderr.log"
+        stdout.write_text("ran\n")
+        stderr.write_text("")
+        transcript = runtime / "rollout.jsonl"
+        session = f"session-{arm}-{case_id}"
+        transcript.write_text(json.dumps({"type": "session_meta", "payload": {"id": session}}) + "\n")
+        trial_id = f"repair-{arm}-{case_id}"
+        observation = runtime / "effective-config.json"
+        write_json(observation, {
+            "schema_version": "mavis.e1-effective-config/v1", "trial_id": trial_id,
+            "model": "exact-model", "model_provider": "omlx",
+            "catalog_sha256": sha256_file(catalog),
+            "base_instructions_sha256": sha256_file(instructions),
+            "session_id": session, "rollout_path": str(transcript),
+        })
+        argv = [str(core), "exec", "-C", str(checkout.resolve()), "--", case["task"]]
+        overrides = [f"{key}={json.dumps(value)}" for key, value in {
+            "model": "exact-model", "model_provider": "omlx",
+            "model_catalog_json": str(catalog), "model_instructions_file": str(instructions),
+        }.items()]
+        effective_argv = [argv[0], *(item for override in overrides for item in ("-c", override)), *argv[1:]]
+        digest_argv = lambda args: hashlib.sha256(json.dumps(args, separators=(",", ":")).encode()).hexdigest()
+        receipt = {
+            "schema_version": "mavis.e1-trial-launch/v1", "state": "exited", "core_exit_code": 0,
+            "termination_signal": None, "observation_status": "matched_startup_config",
+            "experiment_id": "repair", "arm": arm, "case_id": case_id, "trial_id": trial_id,
+            "task": case["task"], "task_sha256": hashlib.sha256(case["task"].encode()).hexdigest(),
+            "core_argv": argv, "core_argv_sha256": digest_argv(argv),
+            "binding_overrides": overrides, "effective_argv": effective_argv,
+            "effective_argv_sha256": digest_argv(effective_argv),
+            "manifest_sha256": record["workload"]["manifest_sha256"],
+            "snapshot_path": record[arm]["path"], "snapshot_sha256": record[arm]["sha256"],
+            "accepted_profile_id": "accepted", "accepted_profile_path": str(profile),
+            "accepted_profile_sha256": sha256_file(profile),
+            "checkout": str(checkout.resolve()), "starting_revision": case["revision"],
+            "resulting_revision": result["checked_revision"], "checkout_dirty": False,
+            "runtime_home": str(runtime.resolve()), "mavis_home": str(self.home.resolve()),
+            "core_binary": str(core), "core_sha256": sha256_file(core),
+            "package_manifest": str(package_path), "package_manifest_sha256": sha256_file(package_path),
+            "core_provenance": "installed-package", "selected_model": "exact-model", "model_provider": "omlx",
+            "config_path": str(config), "config_sha256": sha256_file(config),
+            "catalog_path": str(catalog), "catalog_sha256": sha256_file(catalog),
+            "instructions_path": str(instructions), "instructions_sha256": sha256_file(instructions),
+            "effective_system_prompt_sha256": sha256_file(instructions),
+            "observation_path": str(observation), "observation_sha256": sha256_file(observation),
+            "stdout_path": str(stdout), "stdout_sha256": sha256_file(stdout),
+            "stderr_path": str(stderr), "stderr_sha256": sha256_file(stderr),
+            "transcript_path": str(transcript), "transcript_sha256": sha256_file(transcript),
+        }
+        path = root / "trials" / arm / f"{case_id}.json"
+        write_json(path, receipt)
+        return path
 
     def test_complete_comparison_retains_raw_receipts_and_coverage(self):
         frozen = self._freeze()
@@ -296,10 +390,93 @@ class E1RunnerTests(unittest.TestCase):
                            "verifier_job_id": "terra-job", "target_sha256": "a" * 64,
                            "evidence_sha256": "b" * 64, "report_sha256_on_disk": "c" * 64,
                            "verifier_verdict_sha256": "d" * 64}}
-        with self.assertRaisesRegex(ValueError, "installed Mavis runtime profile activation receipt"):
+        with self.assertRaises(FileNotFoundError):
             self.runner.compare_native("repair", "regression")
         self.assertEqual(self.runner.store.load("repair")["state"], "candidate")
         self.assertFalse((self.home / "e1" / "repair" / "candidate-worker-report.json").exists())
+
+    def _paired_trials(self):
+        self._freeze()
+        self.runner.prepare("repair", "baseline")
+        self.runner.prepare("repair", "candidate")
+        for case in ("regression", "held-a", "held-b"):
+            self.runner.check("repair", "baseline", case)
+            self._pass_candidate(case)
+            self.runner.check("repair", "candidate", case)
+            self._trial_fixture("baseline", case)
+            self._trial_fixture("candidate", case)
+
+    def test_native_trials_compare_from_host_checks_but_cannot_promote(self):
+        self._paired_trials()
+        record = self.runner.compare_native("repair", "regression")
+        self.assertEqual(record["state"], "compared")
+        self.assertEqual(record["comparison"]["baseline"]["target_score"], 0)
+        self.assertEqual(record["comparison"]["candidate"]["target_score"], 1)
+        self.assertTrue(record["comparison"]["candidate"]["e1_native_trial"])
+        self.assertEqual(self.runner.store.active("main")["configuration"], record["baseline"])
+        review = self.home / "verifications" / "experiments" / "repair.json"
+        write_json(review, {"schema_version": "mavis.experiment-review/v1"})
+        with self.assertRaisesRegex(ValueError, "separate installed-trial review adapter"):
+            self.runner.store.review("repair", review)
+        self.assertEqual(self.runner.store.load("repair")["state"], "compared")
+
+    def test_native_trial_missing_or_swapped_receipt_fails_closed(self):
+        self._paired_trials()
+        path = self.home / "e1" / "repair" / "trials" / "candidate" / "held-a.json"
+        path.unlink()
+        with self.assertRaises(FileNotFoundError):
+            self.runner.compare_native("repair", "regression")
+        self._trial_fixture("candidate", "held-a")
+        receipt = read_json(path)
+        receipt["case_id"] = "held-b"
+        write_json(path, receipt)
+        with self.assertRaisesRegex(ValueError, "frozen command or checkout"):
+            self.runner.compare_native("repair", "regression")
+        self.assertEqual(self.runner.store.load("repair")["state"], "candidate")
+
+    def test_native_trial_prompt_command_and_raw_tampering_fail_closed(self):
+        self._paired_trials()
+        for field, value, expected in (
+            ("selected_model", "other-model", "frozen command or checkout"),
+            ("core_argv", ["wrong"], "frozen command or checkout"),
+            ("observation_status", "inconclusive", "frozen command or checkout"),
+        ):
+            with self.subTest(field=field):
+                path = self.home / "e1" / "repair" / "trials" / "candidate" / "held-a.json"
+                original = read_json(path)
+                receipt = dict(original)
+                receipt[field] = value
+                write_json(path, receipt)
+                with self.assertRaisesRegex(ValueError, expected):
+                    self.runner.compare_native("repair", "regression")
+                write_json(path, original)
+        runtime = self.home / "e1" / "repair" / "runtime" / "candidate" / "held-a"
+        instructions = runtime / "accepted-model-instructions.md"
+        original_instructions = instructions.read_text()
+        instructions.write_text("wrong prompt")
+        with self.assertRaisesRegex(ValueError, "instructions hash changed"):
+            self.runner.compare_native("repair", "regression")
+        instructions.write_text(original_instructions)
+        (runtime / "stdout.log").write_text("changed")
+        with self.assertRaisesRegex(ValueError, "stdout hash changed"):
+            self.runner.compare_native("repair", "regression")
+        self.assertEqual(self.runner.store.load("repair")["state"], "candidate")
+
+    def test_native_trial_bundle_rechecks_transcript_after_compare(self):
+        self._paired_trials()
+        self.runner.compare_native("repair", "regression")
+        transcript = self.home / "e1" / "repair" / "runtime" / "candidate" / "held-a" / "rollout.jsonl"
+        transcript.write_text("changed")
+        with self.assertRaisesRegex(ValueError, "transcript identity changed"):
+            self.runner.store._check_comparison(self.runner.store.load("repair"))
+
+    def test_native_trial_rejects_changed_active_profile_pointer(self):
+        self._paired_trials()
+        pointer = self.home / "profiles" / "main" / "active.json"
+        write_json(pointer, {"version": 2, "path": str(pointer.parent / "v2.json")})
+        with self.assertRaisesRegex(ValueError, "accepted main profile pointer changed"):
+            self.runner.compare_native("repair", "regression")
+        self.assertEqual(self.runner.store.load("repair")["state"], "candidate")
 
     def test_native_dispatch_rejects_unbound_start_receipt(self):
         self._freeze()

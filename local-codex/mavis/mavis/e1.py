@@ -1,6 +1,9 @@
 """Frozen E1 cases, native candidate dispatch, and host-recorded paired checks."""
 
 from pathlib import Path
+import fcntl
+import hashlib
+import json
 import shutil
 import subprocess
 from typing import Any
@@ -166,7 +169,157 @@ def _manifest(path: Path) -> dict[str, Any]:
     return value
 
 
-def validate_e1_bundle(home: Path, record: dict[str, Any]) -> str:
+def _argv_hash(argv: list[str]) -> str:
+    return hashlib.sha256(json.dumps(argv, separators=(",", ":")).encode()).hexdigest()
+
+
+def _trial_hashes(root: Path, home: Path, record: dict[str, Any], case: dict[str, Any],
+                  arm: str, result: dict[str, Any]) -> dict[str, str]:
+    """Recheck the installed host's launch and core observation for one checked case.
+
+    This proves startup identity and the source of the checked checkout. The
+    acceptance verdict still comes exclusively from host command receipts.
+    """
+    case_id = case["id"]
+    trial_path = root / "trials" / arm / f"{case_id}.json"
+    trial = read_json(trial_path)
+    runtime = root / "runtime" / arm / case_id
+    checkout = root / "checkouts" / arm / case_id
+    task = case.get("task")
+    if not isinstance(task, str) or not task.strip():
+        raise ValueError("native E1 case needs a frozen task")
+    core = Path(trial.get("core_binary", ""))
+    expected_argv = [str(core.resolve()), "exec", "-C", str(checkout.resolve()), "--", task]
+    bindings = {
+        "model": trial.get("selected_model"),
+        "model_provider": "omlx",
+        "model_catalog_json": str((runtime / "omlx-models.json").resolve()),
+        "model_instructions_file": str((runtime / "accepted-model-instructions.md").resolve()),
+    }
+    overrides = [f"{key}={json.dumps(value)}" for key, value in bindings.items()]
+    effective_argv = [expected_argv[0], *(item for override in overrides for item in ("-c", override)), *expected_argv[1:]]
+    expected = {
+        "schema_version": "mavis.e1-trial-launch/v1",
+        "state": "exited", "core_exit_code": 0, "termination_signal": None,
+        "observation_status": "matched_startup_config",
+        "experiment_id": record["experiment_id"], "arm": arm, "case_id": case_id,
+        "trial_id": f"{record['experiment_id']}-{arm}-{case_id}",
+        "task": task, "task_sha256": hashlib.sha256(task.encode()).hexdigest(),
+        "core_argv": expected_argv, "core_argv_sha256": _argv_hash(expected_argv),
+        "binding_overrides": overrides, "effective_argv": effective_argv,
+        "effective_argv_sha256": _argv_hash(effective_argv),
+        "manifest_sha256": record["workload"]["manifest_sha256"],
+        "snapshot_path": record[arm]["path"], "snapshot_sha256": record[arm]["sha256"],
+        "checkout": str(checkout.resolve()), "starting_revision": case["revision"],
+        "resulting_revision": result["checked_revision"], "checkout_dirty": False,
+        "runtime_home": str(runtime.resolve()), "mavis_home": str(Path(home).resolve()),
+        "core_binary": str(core.resolve()), "core_provenance": "installed-package",
+        "model_provider": "omlx",
+        "config_path": str((runtime / "config.toml").resolve()),
+        "catalog_path": str((runtime / "omlx-models.json").resolve()),
+        "instructions_path": str((runtime / "accepted-model-instructions.md").resolve()),
+        "observation_path": str((runtime / "effective-config.json").resolve()),
+        "stdout_path": str((runtime / "stdout.log").resolve()),
+        "stderr_path": str((runtime / "stderr.log").resolve()),
+    }
+    mismatched = [key for key, value in expected.items() if trial.get(key) != value]
+    if mismatched:
+        raise ValueError(f"native E1 trial lost its frozen command or checkout binding: {mismatched}")
+    if type(trial.get("core_exit_code")) is not int or type(trial.get("checkout_dirty")) is not bool:
+        raise ValueError("native E1 trial has invalid exit or checkout observation")
+    if any(key in trial for key in ("checkout_observation_error", "observation_error")):
+        raise ValueError("native E1 trial has an inconclusive observation")
+    if not isinstance(trial.get("selected_model"), str) or not trial["selected_model"]:
+        raise ValueError("native E1 trial lacks an exact model identity")
+    paths = {
+        "core": core,
+        "config": runtime / "config.toml",
+        "catalog": runtime / "omlx-models.json",
+        "instructions": runtime / "accepted-model-instructions.md",
+        "stdout": runtime / "stdout.log", "stderr": runtime / "stderr.log",
+        "observation": runtime / "effective-config.json",
+    }
+    for name, path in paths.items():
+        if sha256_file(path) != trial.get(f"{name}_sha256"):
+            raise ValueError(f"native E1 trial {name} hash changed")
+    if trial.get("instructions_sha256") != trial.get("effective_system_prompt_sha256"):
+        raise ValueError("native E1 effective prompt changed")
+    snapshot_path = Path(record[arm]["path"])
+    if sha256_file(snapshot_path) != record[arm]["sha256"]:
+        raise ValueError("native E1 frozen snapshot changed")
+    snapshot = read_json(snapshot_path)
+    prompt = snapshot.get("prompts", {}).get("system")
+    template_path = core.parent / "base-instructions.md"
+    if (not isinstance(prompt, str) or snapshot.get("tool_settings") != {}
+            or snapshot.get("retrieval") != {} or not template_path.is_file()):
+        raise ValueError("native E1 prompt configuration cannot be applied")
+    effective = template_path.read_text(encoding="utf-8").rstrip() + "\n\n" + prompt + "\n"
+    if (not effective.strip() or paths["instructions"].read_text(encoding="utf-8") != effective):
+        raise ValueError("native E1 instruction bytes differ from frozen prompt")
+    package_path = Path(trial.get("package_manifest") or "")
+    package = read_json(package_path)
+    launcher = Path(package.get("launcher", ""))
+    runtime_source = package_path.parent / "trial_runtime.py"
+    if (trial.get("package_manifest_sha256") != sha256_file(package_path)
+            or package.get("schema_version") != "mavis.installed-core/v1"
+            or package.get("core_binary") != str(core.resolve())
+            or package.get("core_sha256") != trial["core_sha256"]
+            or package.get("trial_runtime_sha256") != sha256_file(runtime_source)
+            or not launcher.is_file()
+            or package.get("launcher_sha256") != sha256_file(launcher)):
+        raise ValueError("native E1 installed core provenance changed")
+    profile_path = Path(trial.get("accepted_profile_path") or "")
+    if (not trial.get("accepted_profile_id")
+            or trial.get("accepted_profile_sha256") != sha256_file(profile_path)):
+        raise ValueError("native E1 accepted profile changed")
+    profile = read_json(profile_path)
+    if (profile.get("profile_id") != trial["accepted_profile_id"]
+            or profile.get("model_identity", {}).get("model_id") != trial["selected_model"]):
+        raise ValueError("native E1 model differs from accepted profile")
+    pointer = read_json(Path(home) / "profiles" / "main" / "active.json")
+    version = pointer.get("version")
+    if (type(version) is not int or version < 1
+            or profile_path.resolve() != (Path(home) / "profiles" / "main" / f"v{version}.json").resolve()
+            or pointer.get("path") != str(profile_path.resolve())
+            or profile.get("status") != "active" or profile.get("role") != "main"):
+        raise ValueError("native E1 accepted main profile pointer changed")
+    event = read_json(paths["observation"])
+    event_expected = {
+        "schema_version": "mavis.e1-effective-config/v1", "trial_id": trial["trial_id"],
+        "model": trial["selected_model"], "model_provider": "omlx",
+        "catalog_sha256": trial["catalog_sha256"],
+        "base_instructions_sha256": trial["instructions_sha256"],
+    }
+    if any(event.get(key) != value for key, value in event_expected.items()):
+        raise ValueError("native E1 core effective configuration changed")
+    session_id = event.get("session_id")
+    transcript_path = Path(trial.get("transcript_path") or "")
+    if (not isinstance(session_id, str) or not session_id
+            or not transcript_path.is_file()
+            or runtime.resolve() not in transcript_path.resolve().parents
+            or trial.get("transcript_sha256") != sha256_file(transcript_path)
+            or Path(event.get("rollout_path", "")).resolve() != transcript_path.resolve()):
+        raise ValueError("native E1 transcript identity changed")
+    with transcript_path.open(encoding="utf-8") as stream:
+        first = json.loads(stream.readline())
+    if (first.get("type") != "session_meta"
+            or str(first.get("payload", {}).get("id")) != session_id):
+        raise ValueError("native E1 transcript session changed")
+    for key, digest_key, path in (
+        ("gateway_root", "gateway_launcher_sha256", "bin/mcp-server.sh"),
+        ("gateway_env_file", "gateway_env_sha256", None),
+    ):
+        if trial.get(key):
+            target = Path(trial[key]) / path if path else Path(trial[key])
+            if sha256_file(target) != trial.get(digest_key):
+                raise ValueError("native E1 gateway source changed")
+    return {"receipt": sha256_file(trial_path), "transcript": sha256_file(transcript_path),
+            "package": sha256_file(package_path), "profile": sha256_file(profile_path),
+            "base_instructions": sha256_file(template_path), "snapshot": sha256_file(snapshot_path),
+            **{name: sha256_file(path) for name, path in paths.items()}}
+
+
+def validate_e1_bundle(home: Path, record: dict[str, Any], *, require_trials: bool = False) -> str:
     """Recheck every frozen E1 source and return its content digest."""
     root = Path(home) / "e1" / require_safe_id(record["experiment_id"], "experiment id")
     manifest_path = root / "cases.json"
@@ -241,6 +394,8 @@ def validate_e1_bundle(home: Path, record: dict[str, Any]) -> str:
                 "result": sha256_file(result_path),
                 "checks": check_hashes,
             }
+            if require_trials or (record.get("comparison") and record["comparison"][arm].get("e1_native_trial")):
+                bundle["cases"][arm][case_id]["trial"] = _trial_hashes(root, home, record, case, arm, result)
         scores[arm] = sum(passes[case_id] for case_id in manifest["held_out"]) / len(
             manifest["held_out"]
         )
@@ -438,17 +593,121 @@ class E1Runner:
         return receipt
 
     def compare_native(self, experiment_id: str, case_id: str) -> dict[str, Any]:
-        """Gate native comparison on installed-runtime profile evidence.
+        """Compare paired installed trials using host checks, never launch status."""
+        root = self._root(experiment_id)
+        with (root / ".native-compare.lock").open("a") as handle:
+            fcntl.flock(handle.fileno(), fcntl.LOCK_EX)
+            try:
+                return self._compare_native_locked(experiment_id, case_id)
+            finally:
+                fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
 
-        Native gateway acceptance proves the worker's code task, not that Mavis
-        selected the frozen profile for E1. The selector has no host receipt yet.
-        """
-        self._frozen(experiment_id)
-        require_safe_id(case_id, "case id")
-        raise ValueError(
-            "native E1 comparison requires a host-produced installed Mavis runtime "
-            "profile activation receipt; the selector does not expose one yet"
-        )
+    def _compare_native_locked(self, experiment_id: str, case_id: str) -> dict[str, Any]:
+        record, manifest = self._frozen(experiment_id)
+        if record["state"] != "candidate":
+            raise ValueError("experiment is no longer a candidate")
+        if case_id not in {case["id"] for case in manifest["cases"]}:
+            raise ValueError("unknown E1 case")
+        if (record["scope"], record["kind"]) != ("main", "prompts"):
+            raise ValueError("native E1 trials support main prompt experiments only")
+        if self.store.active("main")["configuration"] != record["baseline"]:
+            raise ValueError("native E1 active baseline changed")
+        root = self._root(experiment_id)
+        coverage = self.coverage(experiment_id)
+        if coverage["state"] != "complete":
+            raise ValueError("native E1 coverage is incomplete")
+        # This replays every raw host verdict, checkout revision, installed
+        # package hash, launch command, core event, prompt, and transcript.
+        bundle_digest = validate_e1_bundle(self.home, record, require_trials=True)
+        results = {
+            arm: {case["id"]: read_json(root / "results" / arm / f"{case['id']}.json")
+                  for case in manifest["cases"]}
+            for arm in ("baseline", "candidate")
+        }
+        trials = {
+            arm: {case["id"]: read_json(root / "trials" / arm / f"{case['id']}.json")
+                  for case in manifest["cases"]}
+            for arm in ("baseline", "candidate")
+        }
+        common_identity = None
+        for case in manifest["cases"]:
+            baseline = trials["baseline"][case["id"]]
+            candidate = trials["candidate"][case["id"]]
+            if any(baseline.get(key) != candidate.get(key) for key in (
+                "selected_model", "model_provider", "core_binary", "core_sha256",
+                "package_manifest_sha256", "accepted_profile_id", "accepted_profile_sha256",
+                "gateway_launcher_sha256", "gateway_env_sha256",
+            )):
+                raise ValueError("native E1 arms did not use the same installed model and core")
+            if baseline["instructions_sha256"] == candidate["instructions_sha256"]:
+                raise ValueError("native E1 arms used the same effective prompt")
+            identity = tuple(baseline.get(key) for key in (
+                "selected_model", "model_provider", "core_binary", "core_sha256",
+                "package_manifest_sha256", "accepted_profile_id", "accepted_profile_sha256",
+            ))
+            if common_identity is None:
+                common_identity = identity
+            elif identity != common_identity:
+                raise ValueError("native E1 cases did not use one installed model and core")
+            if (results["candidate"][case["id"]]["passed"]
+                    and results["candidate"][case["id"]]["checked_revision"] == case["revision"]):
+                raise ValueError("native E1 candidate passed without a committed trial change")
+        regression = manifest["regression"]
+        if results["baseline"][regression]["passed"] or not results["candidate"][regression]["passed"]:
+            raise ValueError("native E1 regression must fail baseline and pass candidate")
+        held = manifest["held_out"]
+        scores = {arm: sum(results[arm][case]["passed"] for case in held) / len(held)
+                  for arm in ("baseline", "candidate")}
+        if (not all(results["candidate"][case]["passed"] for case in held)
+                or scores["candidate"] - scores["baseline"] < manifest["minimum_gain"]):
+            raise ValueError("native E1 candidate failed mandatory checks or minimum gain")
+        summaries = {arm: root / f"native-{arm}-trial-summary.json"
+                     for arm in ("baseline", "candidate")}
+        for evidence in summaries.values():
+            if evidence.exists():
+                raise FileExistsError(evidence)
+        created = []
+        try:
+            for arm, evidence in summaries.items():
+                write_json(evidence, {
+                    "schema_version": "mavis.e1-native-trial-summary/v1",
+                    "experiment_id": experiment_id, "arm": arm,
+                    "manifest_sha256": record["workload"]["manifest_sha256"],
+                    "snapshot_sha256": record[arm]["sha256"],
+                    "bundle_digest": bundle_digest,
+                    "case_ids": [case["id"] for case in manifest["cases"]],
+                    "trial_receipts": {case["id"]: {
+                        "path": str(root / "trials" / arm / f"{case['id']}.json"),
+                        "sha256": sha256_file(root / "trials" / arm / f"{case['id']}.json"),
+                    } for case in manifest["cases"]},
+                    "case_results": {case["id"]: {
+                        "path": str(root / "results" / arm / f"{case['id']}.json"),
+                        "sha256": sha256_file(root / "results" / arm / f"{case['id']}.json"),
+                    } for case in manifest["cases"]},
+                    "held_out_score": scores[arm],
+                })
+                created.append(evidence)
+            write_json(root / "coverage.json", coverage)
+            paired = {}
+            for arm in ("baseline", "candidate"):
+                paired[arm] = {
+                    "configuration_sha256": record[arm]["sha256"],
+                    "workload_digest": _digest(record["workload"]),
+                    "case_ids": held,
+                    "mandatory_passed": all(results[arm][case]["passed"] for case in held),
+                    "target_score": scores[arm], "e1_bundle_digest": bundle_digest,
+                    "e1_native_trial": True,
+                    "evidence": {"path": str(summaries[arm]), "sha256": sha256_file(summaries[arm])},
+                }
+            # A trial is not a gateway worker. The reserved ID keeps the current
+            # review/stage gateway gate closed pending native trial review wiring.
+            paired["candidate"]["candidate_job_id"] = f"e1trial-{experiment_id}"
+            return self.store.compare(experiment_id, baseline_result=paired["baseline"],
+                                      candidate_result=paired["candidate"])
+        except BaseException:
+            for evidence in created:
+                evidence.unlink(missing_ok=True)
+            raise
 
     def check(self, experiment_id: str, arm: str, case_id: str) -> dict[str, Any]:
         record, manifest = self._frozen(experiment_id)
