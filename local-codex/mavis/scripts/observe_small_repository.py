@@ -101,7 +101,9 @@ def main() -> int:
         review = subprocess.run(["zcode", "--json", "--mode", "yolo",
                                  "--disallowed-tools", "Edit,Write", "--cwd", str(repo),
                                  "--prompt", review_prompt], cwd=repo,
-                                stdout=log, stderr=subprocess.STDOUT, timeout=900)
+                                stdout=log, stderr=subprocess.STDOUT,
+                                env={**os.environ, "PYTHONDONTWRITEBYTECODE": "1"},
+                                timeout=900)
     review_log = (task / "terra-review.jsonl").read_text()
     start = review_log.find("{")
     try:
