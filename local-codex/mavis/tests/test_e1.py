@@ -112,6 +112,13 @@ class E1RunnerTests(unittest.TestCase):
             "Fix a real omission",
         )
 
+    def test_e1_candidate_rejects_model_unselected_zcode_lane(self):
+        self._freeze()
+        with self.assertRaisesRegex(ValueError, "model-selected MiniMax"):
+            self.runner.dispatch_candidate(
+                "repair", "regression", job_id="unselected-glm", lane="zcode",
+                model="claimed-glm-model", task="Repair regression")
+
     def _pass_candidate(self, case_id):
         checkout = self.home / "e1" / "repair" / "checkouts" / "candidate" / case_id
         (checkout / "result.txt").write_text("pass\n")
@@ -709,7 +716,7 @@ class E1RunnerTests(unittest.TestCase):
         else:
             self._paired_trials()
         record = self.runner.compare_native("repair", "regression")
-        owner = {"provider": "zai", "model": "review-model", "harness": "zcode"}
+        owner = {"provider": "minimax", "model": "minimax/MiniMax-M3", "harness": "opencode"}
         prepared = self.runner.prepare_review("repair", owner)
         assignment_path = Path(prepared["assignment_path"])
         assignment = read_json(assignment_path)
@@ -787,8 +794,11 @@ class E1RunnerTests(unittest.TestCase):
     def test_native_reviewer_cannot_match_recorded_candidate_worker(self):
         self._paired_trials()
         record = self.runner.compare_native("repair", "regression")
+        with self.assertRaisesRegex(ValueError, "model-selected MiniMax"):
+            self.runner.prepare_review("repair", {
+                "provider": "zai", "model": "claimed-glm-model", "harness": "zcode"})
         root = self.home / "e1" / "repair"
-        owner = {"provider": "zai", "model": "review-model", "harness": "zcode"}
+        owner = {"provider": "minimax", "model": "minimax/MiniMax-M3", "harness": "opencode"}
         checkout = root / "checkouts" / "candidate" / "regression"
         assignment = self.root / "candidate-assignment.json"
         write_json(assignment, {

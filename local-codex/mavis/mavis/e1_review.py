@@ -45,6 +45,7 @@ def _candidate_workers(root: Path, record: dict[str, Any], case_ids: list[str]) 
         assignment = read_json(assignment_path)
         owner = assignment.get("mavis_owner")
         if (not isinstance(owner, dict) or set(owner) != {"provider", "model", "harness"}
+                or (owner.get("provider"), owner.get("harness")) != ("minimax", "opencode")
                 or assignment.get("mavis_objective_id") != record["experiment_id"]
                 or f"experiment-candidate-snapshot:{record['candidate']['sha256']}"
                 not in assignment.get("mavis_requirements", [])
@@ -58,11 +59,8 @@ def _candidate_workers(root: Path, record: dict[str, Any], case_ids: list[str]) 
 def _gateway_arguments(packet: dict[str, Any], assignment_path: Path, job_id: str) -> dict[str, Any]:
     require_safe_id(job_id, "review job id")
     owner = packet["owner"]
-    lane = {("zai", "zcode"): "zcode", ("minimax", "opencode"): "minimax"}.get(
-        (owner["provider"], owner["harness"])
-    )
-    if lane is None:
-        raise ValueError("E1 review owner has no independent native harness")
+    if (owner["provider"], owner["harness"]) != ("minimax", "opencode"):
+        raise ValueError("E1 review requires a model-selected MiniMax harness")
     return {
         "job_id": job_id,
         "task": ("Independently inspect the paired installed E1 trial evidence in the review packet. "
@@ -73,7 +71,7 @@ def _gateway_arguments(packet: dict[str, Any], assignment_path: Path, job_id: st
                  "case_evidence entry. Inspect the case results, trial receipts, and raw check logs. "
                  "Use the facts_digest in the packet and assignment hash in the context packet. "
                  "Return raw JSON without code fences. The host will import the exact report bytes."),
-        "lane": lane, "model": owner["model"], "cwd": packet["cwd"],
+        "lane": "minimax", "model": owner["model"], "cwd": packet["cwd"],
         "starting_revision": packet["starting_revision"],
         "owned_paths": packet["owned_paths"],
         "allowed_effects": ["review evidence and report verdict"],
@@ -160,8 +158,8 @@ def prepare_review(home: Path, record: dict[str, Any], owner: dict[str, str]) ->
         not isinstance(value, str) or not value.strip() for value in owner.values()
     ):
         raise ValueError("E1 review needs one exact independent owner")
-    if (owner["provider"], owner["harness"]) not in {("zai", "zcode"), ("minimax", "opencode")}:
-        raise ValueError("E1 review owner needs an independent native harness")
+    if (owner["provider"], owner["harness"]) != ("minimax", "opencode"):
+        raise ValueError("E1 review requires a model-selected MiniMax harness")
     assignment_path, receipt_path = _paths(home, record["experiment_id"])
     if assignment_path.exists():
         raise FileExistsError("E1 review assignment already exists")

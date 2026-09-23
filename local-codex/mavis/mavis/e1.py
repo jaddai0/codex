@@ -623,8 +623,8 @@ class E1Runner:
         if case is None:
             raise ValueError("unknown E1 case")
         require_safe_id(job_id, "candidate job id")
-        if lane not in {"minimax", "zcode"} or not isinstance(model, str) or not model.strip():
-            raise ValueError("candidate requires a named native coding lane and model")
+        if lane != "minimax" or not isinstance(model, str) or not model.strip():
+            raise ValueError("E1 candidate requires a model-selected MiniMax harness")
         if not isinstance(task, str) or not task.strip():
             raise ValueError("candidate task is required")
         root = self._root(experiment_id)
@@ -639,8 +639,7 @@ class E1Runner:
                 or _git(checkout, "rev-parse", "HEAD") != case["revision"]
                 or _git(checkout, "status", "--porcelain")):
             raise ValueError("candidate checkout is not clean at its frozen revision")
-        provider, harness = {"minimax": ("minimax", "opencode"),
-                             "zcode": ("zai", "zcode")}[lane]
+        provider, harness = "minimax", "opencode"
         requirements = candidate_assignment_requirements(record)
         arguments = {
             "job_id": job_id, "task": task, "lane": lane, "model": model,
