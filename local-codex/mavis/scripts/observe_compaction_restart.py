@@ -23,6 +23,37 @@ from mavis.runtime import (RuntimeConfig, endpoint_alive, ensure_runtime, invent
 from mavis.storage import write_json
 
 
+def events(path: Path) -> list[dict]:
+    """Parse a rollout JSONL file, tolerating only an incomplete trailing line.
+
+    A live rollout can end in a partially written record while its writer is
+    still running. That single trailing fragment is dropped. Any malformed
+    newline-terminated line is a real integrity failure and is reported
+    clearly rather than surfacing a bare JSONDecodeError.
+    """
+    records: list[dict] = []
+    data = path.read_bytes()
+    lines = data.split(b"\n")
+    for line_number, raw_line in enumerate(lines, 1):
+        if not raw_line.strip():
+            continue
+        trailing = line_number == len(lines) and not data.endswith(b"\n")
+        try:
+            parsed = json.loads(raw_line.decode("utf-8"))
+        except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+            if trailing:
+                break
+            raise ValueError(
+                f"malformed JSONL record at line {line_number} of {path}"
+            ) from exc
+        if not isinstance(parsed, dict):
+            raise ValueError(
+                f"non-object JSONL record at line {line_number} of {path}"
+            )
+        records.append(parsed)
+    return records
+
+
 def main() -> int:
     home = Path.home()
     service = home / ".local-codex" / "mavis-service"
@@ -41,9 +72,6 @@ def main() -> int:
         return any(item.get("id") == config.model and item.get("loaded")
                    for item in inventory(endpoint))
 
-    def events(path: Path) -> list[dict]:
-        return [json.loads(line) for line in path.read_text().splitlines() if line.strip()]
-
     def on_signal(number: int, _frame: object) -> None:
         raise KeyboardInterrupt(f"signal {number}")
 
@@ -52,7 +80,8 @@ def main() -> int:
     if not loaded(config.iris_endpoint) or loaded(config.endpoint):
         raise RuntimeError("IRIS must own the model and Mavis must be unloaded")
     candidate = installed_candidate_fingerprint()
-    result: dict[str, object] = {"candidate": candidate, "workspace": str(workspace),
+    result: dict[str, object] = {"candidate": candidate,
+                                 "workspace": str(workspace),
                                  "fact": fact, "task_root": str(task)}
     try:
         request_json(config.iris_endpoint, model_path + "/unload", method="POST", timeout=180)
@@ -69,15 +98,20 @@ def main() -> int:
                                cwd=workspace, env=env, timeout=900)
         result["first_exit"] = first.returncode
         session_root = home / ".local-codex" / "sessions"
-        rollout = next((path for path in sorted(session_root.glob("**/rollout-*.jsonl"),
-                                                key=lambda item: item.stat().st_mtime,
-                                                reverse=True)
-                        if path.stat().st_mtime >= started - 2 and events(path)
-                        and events(path)[0].get("payload", {}).get("cwd") == str(workspace)), None)
+        transcript: list[dict] = []
+        rollout: Path | None = None
+        for path in sorted(session_root.glob("**/rollout-*.jsonl"),
+                           key=lambda item: item.stat().st_mtime, reverse=True):
+            if path.stat().st_mtime < started - 2:
+                continue
+            records = events(path)
+            if records and records[0].get("payload", {}).get("cwd") == str(workspace):
+                rollout = path
+                transcript = records
+                break
         if rollout is None:
             raise RuntimeError("first TUI did not create a rollout in the fixture")
         result["rollout"] = str(rollout)
-        transcript = events(rollout)
         session = transcript[0]["payload"]["id"]
         result["session_id"] = session
         result["first_answer"] = next((item.get("payload", {}).get("last_agent_message")
@@ -96,8 +130,9 @@ def main() -> int:
                                  "What exact fact did I give before compaction? Reply with only the fact."],
                                 cwd=workspace, env=env, timeout=900)
         result["resume_exit"] = second.returncode
+        transcript = events(rollout)
         answers = [item.get("payload", {}).get("last_agent_message")
-                   for item in events(rollout) if item.get("type") == "event_msg"
+                   for item in transcript if item.get("type") == "event_msg"
                    and item.get("payload", {}).get("type") == "task_complete"]
         result["resumed_answer"] = answers[-1] if answers else None
         result["exact_recovery"] = result["resumed_answer"] == fact
