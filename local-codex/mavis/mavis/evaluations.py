@@ -14,6 +14,7 @@ import json
 import os
 from pathlib import Path
 import re
+import shlex
 import subprocess
 from typing import Any, Callable
 from urllib.request import Request, urlopen
@@ -88,6 +89,26 @@ def installed_candidate_fingerprint() -> dict[str, str]:
         "persona_template_sha256": sha256_file(share / "persona.toml"),
         "service_sha256": digest.hexdigest(),
     }
+
+
+def _safe_buried_inspection(command: str) -> bool:
+    """Allow output inspection, but no second fixture execution through a shell."""
+    if not command or any(token in command for token in ("$(", "`", "\n", "&&", "||")):
+        return False
+    normalized = command.replace("2>&1", "")
+    if "<" in normalized or ">" in normalized:
+        return False
+    allowed = {"ls", "echo", "rg", "grep", "head", "tail", "cat", "wc", "pwd", "stat"}
+    for part in re.split(r"[;|]", normalized):
+        try:
+            args = shlex.split(part)
+        except ValueError:
+            return False
+        if not args or args[0] not in allowed:
+            return False
+        if args[0] == "rg" and any(arg.startswith("--pre") for arg in args[1:]):
+            return False
+    return True
 
 
 def native_review_completed(log: str, verdict: str) -> bool:
@@ -440,17 +461,46 @@ class E0Evaluator:
             events = [json.loads(line) for line in rollout.read_text().splitlines() if line.strip()]
             if not events or events[0].get("payload", {}).get("cwd") != str(repo):
                 continue
-            commands = [event for event in events if event.get("type") == "response_item"
-                        and event.get("payload", {}).get("type") == "function_call"
-                        and event.get("payload", {}).get("name") == "exec_command"
-                        and "produce_log.py" in event.get("payload", {}).get("arguments", "")]
-            if len(commands) != 1:
+            exact_executions = 0
+            exact_call_id = None
+            unsafe_command = False
+            seen_call_ids = set()
+            for event in events:
+                payload = event.get("payload", {})
+                if (event.get("type") != "response_item"
+                        or payload.get("type") != "function_call"
+                        or payload.get("name") != "exec_command"):
+                    continue
+                call_id = payload.get("call_id")
+                if not isinstance(call_id, str) or not call_id or call_id in seen_call_ids:
+                    unsafe_command = True
+                    continue
+                seen_call_ids.add(call_id)
+                try:
+                    arguments = json.loads(payload.get("arguments", ""))
+                except (TypeError, ValueError) as exc:
+                    raise ValueError("E0 command arguments are malformed") from exc
+                command = arguments.get("cmd") if isinstance(arguments, dict) else None
+                if not isinstance(command, str):
+                    raise ValueError("E0 command is missing")
+                if command.strip() == "python3 produce_log.py":
+                    exact_executions += 1
+                    exact_call_id = call_id
+                    workdir = arguments.get("workdir")
+                    if workdir is not None and (not isinstance(workdir, str) or Path(workdir).resolve() != repo.resolve()):
+                        unsafe_command = True
+                elif not _safe_buried_inspection(command):
+                    unsafe_command = True
+            if exact_executions != 1 or unsafe_command:
                 continue
             outputs = [event.get("payload", {}).get("output", "") for event in events
                        if event.get("type") == "response_item"
-                       and event.get("payload", {}).get("type") == "function_call_output"]
-            primary = next((output for output in outputs if "Complete raw output:" in output
-                            and "Process exited with code 1" in output), None)
+                       and event.get("payload", {}).get("type") == "function_call_output"
+                       and event.get("payload", {}).get("call_id") == exact_call_id]
+            primary = outputs[0] if len(outputs) == 1 else None
+            if primary is not None and ("Complete raw output:" not in primary
+                                        or "Process exited with code 1" not in primary):
+                primary = None
             if primary is None:
                 continue
             match = re.search(r"Complete raw output: (\S+\.raw) \((\d+) bytes; closed\)", primary)

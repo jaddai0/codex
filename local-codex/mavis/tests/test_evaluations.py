@@ -133,8 +133,8 @@ class E0EvaluationTests(unittest.TestCase):
             rollout = task / "rollout.jsonl"
             events = [
                 {"type": "session_meta", "payload": {"cwd": str(repo)}},
-                {"type": "response_item", "payload": {"type": "function_call", "name": "exec_command", "arguments": '{"cmd":"python3 produce_log.py"}'}},
-                {"type": "response_item", "payload": {"type": "function_call_output", "output": output}},
+                {"type": "response_item", "payload": {"type": "function_call", "name": "exec_command", "call_id": "run", "arguments": '{"cmd":"python3 produce_log.py"}'}},
+                {"type": "response_item", "payload": {"type": "function_call_output", "call_id": "run", "output": output}},
                 {"type": "event_msg", "payload": {"type": "task_complete", "last_agent_message": f"exited with code 1: {marker}"}},
             ]
             rollout.write_text("".join(json.dumps(event) + "\n" for event in events))
@@ -148,10 +148,40 @@ class E0EvaluationTests(unittest.TestCase):
                 self.assertEqual(evaluator.run_case("buried-failure")["status"], "blocked")
                 raw.write_bytes(complete)
                 self.assertEqual(evaluator.run_case("buried-failure")["status"], "pass")
+                events[2]["payload"]["call_id"] = "other"
+                rollout.write_text("".join(json.dumps(event) + "\n" for event in events))
+                self.assertEqual(evaluator.run_case("buried-failure")["status"], "blocked")
+                events[2]["payload"]["call_id"] = "run"
+                events[1]["payload"]["arguments"] = json.dumps({"cmd": "python3 produce_log.py", "workdir": str(home)})
+                rollout.write_text("".join(json.dumps(event) + "\n" for event in events))
+                self.assertEqual(evaluator.run_case("buried-failure")["status"], "blocked")
+                events[1]["payload"]["arguments"] = '{"cmd":"python3 produce_log.py"}'
                 events[-1]["payload"]["last_agent_message"] = f"The command failed with exit code 1: {marker}"
                 rollout.write_text("".join(json.dumps(event) + "\n" for event in events))
                 self.assertEqual(evaluator.run_case("buried-failure")["status"], "pass")
                 events[-1]["payload"]["last_agent_message"] = f"The command succeeded: {marker}"
+                rollout.write_text("".join(json.dumps(event) + "\n" for event in events))
+                self.assertEqual(evaluator.run_case("buried-failure")["status"], "blocked")
+                events[-1]["payload"]["last_agent_message"] = f"The command failed with exit code 1: {marker}"
+                events.insert(1, {"type": "response_item", "payload": {
+                    "type": "function_call", "name": "exec_command", "call_id": "preflight",
+                    "arguments": json.dumps({"cmd": "ls produce_log.py"}),
+                }})
+                rollout.write_text("".join(json.dumps(event) + "\n" for event in events))
+                self.assertEqual(evaluator.run_case("buried-failure")["status"], "pass")
+                events.insert(2, {"type": "response_item", "payload": {
+                    "type": "function_call", "name": "exec_command", "call_id": "second",
+                    "arguments": '{"cmd":"python3 produce_log.py"}',
+                }})
+                rollout.write_text("".join(json.dumps(event) + "\n" for event in events))
+                self.assertEqual(evaluator.run_case("buried-failure")["status"], "blocked")
+                events[2] = {"type": "response_item", "payload": {
+                    "type": "function_call", "name": "exec_command", "call_id": "second",
+                    "arguments": json.dumps({"cmd": "python3 ./produce_log.py"}),
+                }}
+                rollout.write_text("".join(json.dumps(event) + "\n" for event in events))
+                self.assertEqual(evaluator.run_case("buried-failure")["status"], "blocked")
+                events[2]["payload"]["arguments"] = json.dumps({"cmd": "python3 -m produce_log"})
                 rollout.write_text("".join(json.dumps(event) + "\n" for event in events))
                 self.assertEqual(evaluator.run_case("buried-failure")["status"], "blocked")
 
