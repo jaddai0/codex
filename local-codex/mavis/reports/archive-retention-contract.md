@@ -3,7 +3,9 @@
 Mavis owns this local archive policy. It never infers that a project is closed from
 silence. Register the conversation IDs and their objective IDs, then close the
 project only after its objectives are accepted or cancelled. A bound conversation
-whose objective is omitted blocks closure.
+whose objective is omitted blocks closure. A conversation may belong to only
+one archive project; the registry lock enforces that rule across concurrent
+registrations.
 
 ```text
 mavis archive-retention register PROJECT --conversation SESSION [--objective OBJECTIVE ...]
@@ -16,7 +18,8 @@ mavis storage-pressure [--prune-reproducible-cache]
 
 `compact` requires 30 days since closure and no changed segment set, handoff,
 objective, or raw file. It scans known handoff and objective references, leaving
-those raw segments at their original paths. Each other segment is gzip compressed
+those raw segments at their original paths. It also protects live librarian
+follow-up citations. Each other segment is gzip compressed
 in the archive's own directory. The original SHA-256 and compressed SHA-256 stay
 in the manifest. Mavis reconstructs and hashes the exact original bytes before
 changing the manifest, then removes only the verified raw duplicate. Search and
@@ -24,14 +27,22 @@ librarian citation checks verify both hashes and read compressed segments direct
 An interrupted operation can reuse an already verified gzip or remove a verified
 raw duplicate. `restore` reconstructs raw files and checks hashes; `reopen`
 restores them before accepting new project activity.
+The existing idle maintenance claim runs a due-project sweep automatically, at
+most once per project per day. It records validation failures and leaves those
+archives intact. No independent clock-based scheduler is installed; if no idle
+maintenance claim occurs, no sweep occurs.
 
 Before transcript or command-output evidence is written, Mavis checks free space.
 At less than 20 GiB free or 10% of disk capacity, whichever is greater, it emits
 a warning, saves `storage-pressure.json`, and prunes registered reproducible cache
 files first. A cache file is eligible only while its retained source still has
 the registered hash. Unknown cache files, transcripts, logs, model weights, and
-other unique evidence are never pruned. Cache producers register files through
-`register_reproducible_cache` after successful generation.
+other unique evidence are never pruned. The registry is optional and malformed
+entries cause a warning rather than blocking evidence writes. No production
+cache producer currently registers files in this namespace, so the current
+production behavior is a capacity warning, not guaranteed space recovery.
+Future cache producers can use `register_reproducible_cache` after successful
+generation and retained-source verification.
 
 The disable path is to leave projects open and omit `compact`, and to omit
 `--prune-reproducible-cache` for manual pressure checks. The rollback path is

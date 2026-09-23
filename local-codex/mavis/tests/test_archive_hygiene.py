@@ -1,15 +1,19 @@
 from datetime import datetime, timedelta, timezone
+from concurrent.futures import ThreadPoolExecutor
 import gzip
 import hashlib
 import json
 from pathlib import Path
 import tempfile
+import time
 import unittest
 from unittest.mock import patch
 
 from mavis.archive_hygiene import ArchiveRetention, register_reproducible_cache, storage_pressure
 from mavis.evidence import run_command
 from mavis.helper_interfaces import LibrarianEvidence
+from mavis.helpers import HelperSession
+from mavis.maintenance import MaintenanceQueue
 from mavis.transcripts import TranscriptArchive
 
 
@@ -128,6 +132,59 @@ class ArchiveRetentionTests(unittest.TestCase):
             self.assertEqual(outcome["segments"][0]["status"], "referenced")
             self.assertTrue(original.is_file())
 
+    def test_live_librarian_followup_citation_protects_raw_source(self):
+        with tempfile.TemporaryDirectory() as directory:
+            home = Path(directory)
+            archive, original, retention, closed = self._closed(home)
+            HelperSession(home, "librarian").store_query_context(
+                "where was the decision", [{"path": str(original), "line": 1}], now=time.time())
+            result = retention.compact("project-1", now=closed + timedelta(days=31))
+            self.assertEqual(result["segments"][0]["status"], "referenced")
+            self.assertTrue(original.is_file())
+
+    def test_overlapping_project_registration_and_legacy_overlap_block_compression(self):
+        with tempfile.TemporaryDirectory() as directory:
+            home = Path(directory)
+            archive, original, retention, closed = self._closed(home)
+            with self.assertRaisesRegex(ValueError, "another archive project"):
+                retention.register("project-2", ["conversation-1"], [])
+            (retention.root / "project-2.json").write_text(json.dumps({
+                "schema_version": "mavis.archive-project/v1", "project_id": "project-2",
+                "conversation_ids": ["conversation-1"], "state": "open",
+            }))
+            with self.assertRaisesRegex(ValueError, "another archive project"):
+                retention.compact("project-1", now=closed + timedelta(days=31))
+            self.assertTrue(original.is_file())
+
+    def test_concurrent_registration_cannot_claim_same_conversation_twice(self):
+        with tempfile.TemporaryDirectory() as directory:
+            retention = ArchiveRetention(Path(directory))
+            def claim(project_id):
+                try:
+                    retention.register(project_id, ["conversation-1"], [])
+                    return "registered"
+                except ValueError:
+                    return "overlap-refused"
+            with ThreadPoolExecutor(max_workers=2) as pool:
+                outcomes = list(pool.map(claim, ("project-a", "project-b")))
+            self.assertEqual(sorted(outcomes), ["overlap-refused", "registered"])
+
+    def test_idle_sweep_compresses_due_project_and_foreground_skips_trigger(self):
+        with tempfile.TemporaryDirectory() as directory:
+            home = Path(directory)
+            archive, original, retention, closed = self._closed(home)
+            queue = MaintenanceQueue(home)
+            with patch.object(ArchiveRetention, "sweep_due", wraps=retention.sweep_due) as sweep:
+                self.assertIsNone(queue.claim_next(foreground_active=True))
+                sweep.assert_not_called()
+            report = retention.sweep_due(now=closed + timedelta(days=31))
+            self.assertEqual(report["projects"][0]["status"], "checked")
+            self.assertFalse(original.exists())
+            with patch.object(ArchiveRetention, "sweep_due", return_value=report) as sweep:
+                self.assertIsNone(queue.claim_next(foreground_active=False))
+                sweep.assert_called_once()
+            self.assertEqual(retention.sweep_due(now=closed + timedelta(days=31))["projects"], [])
+
     def test_reproducible_cache_is_only_pruned_on_pressure(self):
         with tempfile.TemporaryDirectory() as directory:
             home = Path(directory)
@@ -170,6 +227,20 @@ class ArchiveRetentionTests(unittest.TestCase):
             self.assertFalse((cache / "throwaway").exists())
             self.assertTrue((home / "storage-pressure.json").is_file())
             self.assertTrue((Path(payload["raw_output"]["path"]) / "stdout.log").is_file())
+
+    def test_malformed_optional_cache_registry_never_blocks_evidence(self):
+        with tempfile.TemporaryDirectory() as directory:
+            home = Path(directory)
+            cache = home / "cache" / "reproducible"
+            cache.mkdir(parents=True)
+            (cache / "manifest.json").write_text('{"entries": [{"path": "missing"}]}')
+            with self.assertWarnsRegex(RuntimeWarning, "registry has invalid entry"):
+                segment = TranscriptArchive(home, "conversation-1").append_segment([{"content": "evidence"}])
+            self.assertTrue(segment.is_file())
+            (cache / "manifest.json").write_text("{broken json")
+            with self.assertWarnsRegex(RuntimeWarning, "registered cache skipped"):
+                receipt = run_command(home, "objective-1", ["python3", "-c", "print('OK')"], home)
+            self.assertTrue(receipt.is_file())
 
 
 def shutil_usage(total, free):

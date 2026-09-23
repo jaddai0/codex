@@ -11,6 +11,57 @@ from mavis.transcripts import TranscriptArchive
 
 
 class TranscriptArchiveTests(unittest.TestCase):
+    def test_write_rejects_symlinked_conversation_without_touching_target(self):
+        with tempfile.TemporaryDirectory() as directory:
+            home = Path(directory) / "home"
+            outside = Path(directory) / "outside"
+            outside.mkdir(mode=0o755)
+            (home / "transcripts").mkdir(parents=True)
+            (home / "transcripts" / "conversation-1").symlink_to(outside, target_is_directory=True)
+            before = outside.stat().st_mode & 0o777
+            with self.assertRaises((OSError, ValueError)):
+                TranscriptArchive(home, "conversation-1").append_segment([{"content": "secret"}])
+            self.assertFalse((outside / "manifest.json").exists())
+            self.assertEqual(outside.stat().st_mode & 0o777, before)
+
+    def test_write_rejects_symlinked_transcripts_parent(self):
+        with tempfile.TemporaryDirectory() as directory:
+            home = Path(directory) / "home"
+            outside = Path(directory) / "outside"
+            home.mkdir()
+            outside.mkdir()
+            (home / "transcripts").symlink_to(outside, target_is_directory=True)
+            with self.assertRaises((OSError, ValueError)):
+                TranscriptArchive(home, "conversation-1").append_segment([{"content": "secret"}])
+            self.assertEqual(list(outside.iterdir()), [])
+
+    def test_write_rejects_symlinked_lock_segments_manifest_and_handoffs(self):
+        with tempfile.TemporaryDirectory() as directory:
+            home = Path(directory) / "home"
+            archive = TranscriptArchive(home, "conversation-1")
+            archive.append_segment([{"content": "initial"}])
+            outside = Path(directory) / "outside"
+            outside.mkdir()
+            for path in (archive.root / "import.lock", archive.root / "manifest.json",
+                         archive.root / "segments", archive.root / "handoffs"):
+                if path.is_dir():
+                    for child in path.iterdir():
+                        child.unlink()
+                    path.rmdir()
+                    target = outside
+                elif path.exists():
+                    target = outside / path.name
+                    target.write_text("untouched")
+                    path.unlink()
+                else:
+                    target = outside
+                path.symlink_to(target, target_is_directory=target.is_dir())
+                with self.assertRaises((OSError, ValueError)):
+                    archive.append_segment([{"content": "must not escape"}])
+                path.unlink()
+            self.assertFalse((outside / "segments").exists())
+            self.assertEqual((outside / "manifest.json").read_text(), "untouched")
+
     def test_search_rejects_symlinked_transcripts_parent(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
