@@ -60,7 +60,9 @@ def main() -> int:
                 "Its exit code 1 is intentional. The full output is too long to display. "
                 "Use the Complete raw output reference from that command to find the "
                 "exact MAVIS_E0_FAILURE_ identifier in the middle. Report that exact "
-                "identifier and clearly state the command failed. Use only read-only "
+                "identifier and include this single sentence verbatim in the final answer: "
+                "'The command python3 produce_log.py failed with exit code 1.' "
+                "Use only read-only "
                 "inspection commands for the captured .raw file, and answer in English. "
                 "Do not edit files."
             )
