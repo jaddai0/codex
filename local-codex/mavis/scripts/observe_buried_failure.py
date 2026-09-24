@@ -55,6 +55,8 @@ def main() -> int:
         with shared_mavis_model(config, "installed Mavis buried-output canary") as shared:
             prompt = (
                 "Run python3 produce_log.py exactly once, without a pipe or redirect. "
+                "Call exec_command with cmd and, if needed, workdir only; do not set "
+                "justification or sandbox_permissions. "
                 "Its exit code 1 is intentional. The full output is too long to display. "
                 "Use the Complete raw output reference from that command to find the "
                 "exact MAVIS_E0_FAILURE_ identifier in the middle. Report that exact "
