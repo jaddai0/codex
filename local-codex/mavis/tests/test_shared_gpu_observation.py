@@ -527,10 +527,10 @@ class SharedGpuObservationTests(unittest.TestCase):
 
     def test_status_call_has_bounded_timeout(self):
         with patch.object(observer.subprocess, "run",
-                          side_effect=subprocess.TimeoutExpired(["gpu-lease", "status"], 0.5)) as run:
+                          side_effect=subprocess.TimeoutExpired(["gpu-lease", "status"], 8)) as run:
             with self.assertRaises(subprocess.TimeoutExpired):
                 observer._lease_command("status")
-        self.assertEqual(run.call_args.kwargs["timeout"], 0.5)
+        self.assertEqual(run.call_args.kwargs["timeout"], 8)
 
     def test_slow_status_during_observation_aborts_exact_child(self):
         child = Mock(pid=4321)

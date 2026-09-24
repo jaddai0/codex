@@ -54,7 +54,8 @@ class UnsafeSharedGPU(RuntimeError):
 def _lease_command(*args: str) -> str:
     run = subprocess.run(
         [str(LEASE), *args], capture_output=True, text=True,
-        timeout=0.5 if args[0] == "status" else 15, check=False,
+        # status can spend up to 1s asking IRIS and 5s scanning processes.
+        timeout=8 if args[0] == "status" else 15, check=False,
     )
     if run.returncode:
         raise RuntimeError(
