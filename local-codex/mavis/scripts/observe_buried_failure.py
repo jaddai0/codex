@@ -58,7 +58,9 @@ def main() -> int:
                 "Its exit code 1 is intentional. The full output is too long to display. "
                 "Use the Complete raw output reference from that command to find the "
                 "exact MAVIS_E0_FAILURE_ identifier in the middle. Report that exact "
-                "identifier and clearly state the command failed. Do not edit files."
+                "identifier and clearly state the command failed. Use only read-only "
+                "inspection commands for the captured .raw file, and answer in English. "
+                "Do not edit files."
             )
             command = [str(home / "Desktop" / "Mavis.command"), "exec", "--json",
                        "-C", str(repo), "-s", "read-only", "-o",
