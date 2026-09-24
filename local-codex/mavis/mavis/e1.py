@@ -1039,6 +1039,8 @@ class E1Runner:
         record, manifest = self._frozen(experiment_id)
         if record["state"] != "candidate":
             raise ValueError("experiment is no longer a candidate")
+        if self.store.active(record["scope"])["configuration"] != record["baseline"]:
+            raise ValueError("E1 active baseline changed")
         coverage = self.coverage(experiment_id)
         write_json(self._root(experiment_id) / "coverage.json", coverage)
         if coverage["state"] != "complete":

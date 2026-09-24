@@ -29,6 +29,7 @@ from .storage import read_json, write_json
 
 DEFAULT_MODEL = "Qwen3.8-Flash-Next-Abliterated-MLX-4bit"
 _HANDOFF_LEASE_FD: ContextVar[int | None] = ContextVar("mavis_handoff_lease_fd", default=None)
+_TRIAL_PROCESSES: dict[int, subprocess.Popen[Any]] = {}
 
 
 @dataclass(frozen=True)
@@ -431,6 +432,8 @@ def owns_running_server(config: RuntimeConfig) -> bool:
 
 def ensure_isolated_settings(config: RuntimeConfig) -> None:
     """Pin loopback auth and every mutable path to Mavis's base directory."""
+    if (config.base_path / "cluster" / "deployments.json").exists():
+        raise RuntimeError("isolated Mavis runtime refuses a distributed deployment registry")
     settings_path = config.base_path / "settings.json"
     if settings_path.exists():
         settings = read_json(settings_path)
@@ -443,7 +446,8 @@ def ensure_isolated_settings(config: RuntimeConfig) -> None:
     server = settings.setdefault("server", {})
     if not isinstance(server, dict):
         raise ValueError("Mavis oMLX server settings must be an object")
-    server.update({"host": "127.0.0.1", "port": _port(config.endpoint)})
+    server.update({"host": "127.0.0.1", "port": _port(config.endpoint),
+                   "distributed_inference_enabled": False})
     model = settings.setdefault("model", {})
     if not isinstance(model, dict):
         raise ValueError("Mavis oMLX model settings must be an object")
@@ -529,6 +533,8 @@ def start_server(config: RuntimeConfig, wait_seconds: float = 30.0, *,
             if endpoint_alive(config.endpoint):
                 if require_new and not owns_running_server(config):
                     raise RuntimeError("Mavis endpoint changed owner during startup")
+                if require_new:
+                    _TRIAL_PROCESSES[process.pid] = process
                 return state
             time.sleep(0.25)
         raise TimeoutError("Mavis oMLX did not become healthy before the startup deadline")
@@ -589,7 +595,19 @@ def stop_trial_server(config: RuntimeConfig, expected_state: dict[str, Any], *,
     if not config.state_path.is_file() or read_json(config.state_path) != expected_state:
         raise RuntimeError("Mavis trial server launch record changed")
     pid = expected_state.get("pid")
-    if type(pid) is not int or pid <= 0 or not owns_running_server(config):
+    if type(pid) is not int or pid <= 0 or pid not in _TRIAL_PROCESSES:
+        raise RuntimeError("Mavis trial server has no process handle from this launch")
+    process = _TRIAL_PROCESSES[pid]
+    if process.pid != pid:
+        raise RuntimeError("Mavis trial server process handle changed")
+    try:
+        os.killpg(pid, 0)
+    except ProcessLookupError:
+        _TRIAL_PROCESSES.pop(pid, None)
+        return
+    if process.poll() is not None:
+        raise RuntimeError("Mavis model worker survived its server process")
+    if not owns_running_server(config):
         raise RuntimeError("Mavis trial server ownership is unproven")
     if os.getpgid(pid) != pid:
         raise RuntimeError("Mavis trial server process group changed")
@@ -603,8 +621,8 @@ def stop_trial_server(config: RuntimeConfig, expected_state: dict[str, Any], *,
         try:
             os.killpg(pid, 0)
         except ProcessLookupError:
-            if not _listener_pids(_port(config.endpoint)):
-                return
+            _TRIAL_PROCESSES.pop(pid, None)
+            return
         time.sleep(0.1)
     os.killpg(pid, signal.SIGKILL)
     deadline = time.monotonic() + timeout
@@ -612,8 +630,8 @@ def stop_trial_server(config: RuntimeConfig, expected_state: dict[str, Any], *,
         try:
             os.killpg(pid, 0)
         except ProcessLookupError:
-            if not _listener_pids(_port(config.endpoint)):
-                return
+            _TRIAL_PROCESSES.pop(pid, None)
+            return
         time.sleep(0.1)
     raise RuntimeError("Mavis trial server or model worker remained after abort")
 
@@ -742,6 +760,8 @@ def park_mavis_server(config: RuntimeConfig, *, timeout: float = 30,
         raise RuntimeError("Mavis server PID changed before parking")
     if expected_state is not None and read_json(config.state_path) != expected_state:
         raise RuntimeError("Mavis server launch record changed before parking")
+    if expected_state is not None and pid not in _TRIAL_PROCESSES:
+        raise RuntimeError("Mavis server has no process handle from this launch")
     if endpoint_alive(config.endpoint):
         status = request_json(config.endpoint, "/api/status")
         if (not isinstance(status, dict) or status.get("status") != "ok"
@@ -788,4 +808,7 @@ def park_mavis_server(config: RuntimeConfig, *, timeout: float = 30,
         time.sleep(0.2)
     else:
         raise TimeoutError("Mavis server or a model worker remained after stop")
-    return reserve_empty_mavis_port(config, verify_endpoint=False)
+    reservation = reserve_empty_mavis_port(config, verify_endpoint=False)
+    if expected_state is not None:
+        _TRIAL_PROCESSES.pop(pid, None)
+    return reservation

@@ -410,6 +410,8 @@ class E1RunnerTests(unittest.TestCase):
         self.assertEqual(record["baseline"], active["configuration"])
         self.assertEqual(self.runner.store._read_snapshot(record["baseline"])["prompts"],
                          {"system": "A"})
+        coverage_path = self.home / "e1" / "repair" / "coverage.json"
+        coverage_before = sha256_file(coverage_path) if coverage_path.is_file() else None
         pointer = self.runner.store._active_path("main")
         active["configuration"] = self.runner.store._snapshot(
             {"prompts": {"system": "different"}, "tool_settings": {}, "retrieval": {}}
@@ -417,6 +419,10 @@ class E1RunnerTests(unittest.TestCase):
         write_json(pointer, active)
         with self.assertRaisesRegex(ValueError, "active baseline changed"):
             self.runner.compare_native("repair", "regression")
+        with self.assertRaisesRegex(ValueError, "active baseline changed"):
+            self.runner.compare("repair", "review-job", self.root / "report.json")
+        self.assertEqual(sha256_file(coverage_path) if coverage_path.is_file() else None,
+                         coverage_before)
 
     def test_optional_input_packet_binds_external_baseline_and_checker(self):
         checker = self.root / "protected-host-check.py"

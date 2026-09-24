@@ -6,23 +6,26 @@ from contextlib import contextmanager
 from dataclasses import replace
 from pathlib import Path
 import subprocess
+import threading
 import time
-from typing import Callable, Iterator
+from typing import Any, Callable, Iterator
 from urllib.parse import quote
 from uuid import uuid4
 
 from .runtime import (
     RuntimeConfig,
     endpoint_alive,
-    ensure_runtime,
     inventory,
     load_model,
     loaded_generation_models,
-    owns_running_server,
+    park_mavis_server,
     request_json,
     require_idle_iris_handoff,
+    reserve_empty_mavis_port,
+    start_server,
+    stop_trial_server,
 )
-from .storage import write_json
+from .storage import read_json, write_json
 
 
 LEASE = Path.home() / ".local/bin/gpu-lease"
@@ -67,24 +70,48 @@ class _LeaseHeartbeat:
         now = time.monotonic()
         if force or now >= self.next_status:
             _safe_status(_lease_command("status"), purpose=self.purpose)
-            if self.iris_endpoint is not None and loaded_generation_models(self.iris_endpoint) != self.iris_models:
+            if (self.iris_endpoint is not None and
+                    loaded_generation_models(self.iris_endpoint) != self.iris_models):
                 raise RuntimeError("IRIS generation model inventory changed during E1")
             self.next_status = now + 15
         if now >= self.next_renew:
+            _owned_status(_lease_command("status"), self.purpose)
             _lease_command("renew", HOLDER, LEASE_MINUTES)
             _safe_status(_lease_command("status"), purpose=self.purpose)
             self.next_renew = now + 300
 
 
-def _idle_mavis_server(config: RuntimeConfig) -> None:
+def _mavis_status(config: RuntimeConfig) -> dict[str, Any]:
     status = request_json(config.endpoint, "/api/status")
     if (not isinstance(status, dict) or status.get("status") != "ok"
-            or any(type(status.get(key)) is not int or status[key] != 0 for key in
+            or any(type(status.get(key)) is not int or status[key] < 0 for key in
                    ("active_requests", "waiting_requests", "models_loading"))):
+        raise RuntimeError("Mavis server work status is untrusted")
+    return status
+
+
+def _idle_mavis_server(config: RuntimeConfig) -> None:
+    status = _mavis_status(config)
+    if any(status[key] != 0 for key in
+           ("active_requests", "waiting_requests", "models_loading")):
         raise RuntimeError("Mavis server has active, waiting, or loading work")
 
 
-def _cleanup_failure(config: RuntimeConfig, purpose: str, error: BaseException) -> Path:
+def _abort_trial(config: RuntimeConfig, state: dict[str, Any], *,
+                 own_loading: bool = False) -> None:
+    if endpoint_alive(config.endpoint):
+        status = _mavis_status(config)
+        if status["waiting_requests"] or (
+            status["active_requests"] > (1 if own_loading and status["models_loading"] else 0)
+        ):
+            raise RuntimeError("Mavis has active or waiting work outside this trial's load")
+        if status["models_loading"] and not own_loading:
+            raise RuntimeError("Mavis has an unowned model load")
+    stop_trial_server(config, state)
+
+
+def _cleanup_failure(config: RuntimeConfig, purpose: str, error: BaseException,
+                     *, gpu_work_stopped: bool, lease_released: bool) -> Path:
     def observed(endpoint: str) -> object:
         try:
             return inventory(endpoint)
@@ -96,6 +123,7 @@ def _cleanup_failure(config: RuntimeConfig, purpose: str, error: BaseException) 
         "schema_version": "mavis.e1-gpu-cleanup-failure/v1",
         "at_epoch": time.time(), "gpu_lease_holder": HOLDER,
         "gpu_lease_purpose": purpose, "error": str(error),
+        "gpu_work_stopped": gpu_work_stopped, "lease_released": lease_released,
         "iris_endpoint": config.iris_endpoint,
         "iris_inventory": observed(config.iris_endpoint),
         "mavis_endpoint": config.endpoint,
@@ -104,16 +132,51 @@ def _cleanup_failure(config: RuntimeConfig, purpose: str, error: BaseException) 
     return path
 
 
+def _monitored_load(config: RuntimeConfig, heartbeat: _LeaseHeartbeat,
+                    server_state: dict[str, Any], stopped: dict[str, bool]) -> None:
+    """Abort this trial's process group if IRIS becomes live during oMLX load."""
+    done = threading.Event()
+    failures: list[BaseException] = []
+    def worker() -> None:
+        try:
+            load_model(config)
+        except BaseException as error:
+            failures.append(error)
+        finally:
+            done.set()
+    threading.Thread(target=worker, name="mavis-e1-load", daemon=True).start()
+    while not done.wait(5):
+        try:
+            heartbeat(force=True)
+        except BaseException:
+            _abort_trial(config, server_state, own_loading=True)
+            stopped["yes"] = True
+            done.wait(10)
+            raise
+    try:
+        heartbeat(force=True)
+    except BaseException:
+        _abort_trial(config, server_state)
+        stopped["yes"] = True
+        raise
+    if failures:
+        raise failures[0]
+
+
 @contextmanager
 def admitted_e1_model(config: RuntimeConfig, purpose: str) -> Iterator[Callable[[], None]]:
-    """Keep IRIS loaded, lease the GPU, and unload only this trial's Mavis model."""
+    """Load only on a new trial-owned server; keep IRIS's model untouched."""
     config = replace(config, allow_concurrent_local=True, idle_seconds=900)
     purpose = f"{purpose}:{uuid4().hex}"
     _safe_status(_lease_command("status"))
     _lease_command("acquire", HOLDER, purpose, LEASE_MINUTES)
     heartbeat = _LeaseHeartbeat(purpose)
-    load_attempted = False
     iris_models: list[str] | None = None
+    server_state: dict[str, Any] | None = None
+    stopped = {"yes": False}
+    load_attempted = False
+    unsafe_startup = False
+    primary_error: BaseException | None = None
     try:
         heartbeat(force=True)
         iris_models = loaded_generation_models(config.iris_endpoint)
@@ -122,64 +185,114 @@ def admitted_e1_model(config: RuntimeConfig, purpose: str) -> Iterator[Callable[
         require_idle_iris_handoff(config, expected_models=iris_models)
         heartbeat.iris_endpoint = config.iris_endpoint
         heartbeat.iris_models = iris_models
-        if endpoint_alive(config.endpoint):
-            if not owns_running_server(config):
-                raise RuntimeError("E1 will not reuse a server Mavis does not own")
-            if loaded_generation_models(config.endpoint):
-                raise RuntimeError("Mavis server already has a loaded generation model")
-            _idle_mavis_server(config)
-        ensure_runtime(config, load=False)
+        heartbeat(force=True)
+        # Never reuse a preexisting server, even one with Mavis's base path.
+        reservation = reserve_empty_mavis_port(config)
+        reservation.close()
+        try:
+            server_state = start_server(config, require_new=True)
+        except BaseException as error:
+            unsafe_startup = bool(getattr(error, "unsafe_gpu_work", False))
+            raise
+        if read_json(config.state_path) != server_state:
+            raise RuntimeError("Mavis trial launch record changed during startup")
+        if not any(row.get("id") == config.model for row in inventory(config.endpoint)):
+            raise RuntimeError("selected Mavis model is absent from the new server")
         if loaded_generation_models(config.endpoint):
-            raise RuntimeError("Mavis model loaded outside this E1 trial")
+            raise RuntimeError("new Mavis server already has a generation model")
         _idle_mavis_server(config)
         heartbeat(force=True)
         load_attempted = True
-        load_model(config)
-        heartbeat(force=True)
+        _monitored_load(config, heartbeat, server_state, stopped)
         if loaded_generation_models(config.iris_endpoint) != iris_models:
             raise RuntimeError("IRIS changed while Mavis loaded")
         yield heartbeat
+    except BaseException as error:
+        primary_error = error
+        raise
     finally:
-        owned = False
         cleanup_error: BaseException | None = None
-        failure_receipt: Path | None = None
+        gpu_stopped = (server_state is None and not unsafe_startup) or stopped["yes"]
+        lease_released = False
+        receipt: Path | None = None
         try:
-            _owned_status(_lease_command("status"), purpose)
-            owned = True
-            if load_attempted:
-                loaded = loaded_generation_models(config.endpoint)
-                if loaded:
-                    if loaded != [config.model] or not owns_running_server(config):
-                        raise RuntimeError("Mavis model inventory or server ownership changed during E1")
-                    _idle_mavis_server(config)
-                    for attempt in range(2):
-                        try:
-                            request_json(config.endpoint,
-                                         f"/v1/models/{quote(config.model, safe='')}/unload",
-                                         method="POST", timeout=180)
-                        except (OSError, RuntimeError) as error:
-                            if not loaded_generation_models(config.endpoint):
-                                break  # response failed after the model actually unloaded
-                            if attempt == 1:
-                                raise RuntimeError("Mavis E1 model unload failed twice") from error
-                        if not loaded_generation_models(config.endpoint):
-                            break
-                    else:
-                        raise RuntimeError("Mavis model remained loaded after E1 cleanup")
-                if loaded_generation_models(config.iris_endpoint) != iris_models:
-                    raise RuntimeError("IRIS lost its original generation model during E1")
+            _safe_status(_lease_command("status"), purpose=purpose)
+            if server_state is not None and not stopped["yes"]:
+                if read_json(config.state_path) != server_state:
+                    raise RuntimeError("Mavis trial launch record changed before cleanup")
+                if load_attempted and endpoint_alive(config.endpoint):
+                    status = _mavis_status(config)
+                    if status["models_loading"]:
+                        _abort_trial(config, server_state, own_loading=True)
+                        stopped["yes"] = True
+                    if not stopped["yes"]:
+                        loaded = loaded_generation_models(config.endpoint)
+                        if loaded:
+                            if loaded != [config.model]:
+                                raise RuntimeError("Mavis generation inventory changed during E1")
+                            _idle_mavis_server(config)
+                            for attempt in range(2):
+                                try:
+                                    request_json(config.endpoint,
+                                                 f"/v1/models/{quote(config.model, safe='')}/unload",
+                                                 method="POST", timeout=180)
+                                except (OSError, RuntimeError) as error:
+                                    if not loaded_generation_models(config.endpoint):
+                                        break
+                                    if attempt == 1:
+                                        raise RuntimeError("Mavis E1 model unload failed twice") from error
+                                if not loaded_generation_models(config.endpoint):
+                                    break
+                            else:
+                                raise RuntimeError("Mavis model remained loaded after E1 cleanup")
+                if not stopped["yes"]:
+                    reservation = park_mavis_server(
+                        config, expected_pid=int(server_state["pid"]),
+                        expected_state=server_state,
+                    )
+                    reservation.close()
+                    if endpoint_alive(config.endpoint):
+                        raise RuntimeError("Mavis server remained live after E1 cleanup")
+            gpu_stopped = not unsafe_startup
+            if iris_models is not None and loaded_generation_models(config.iris_endpoint) != iris_models:
+                raise RuntimeError("IRIS lost its original generation model during E1")
         except BaseException as error:
             cleanup_error = error
-            failure_receipt = _cleanup_failure(config, purpose, error)
+            if server_state is not None and not stopped["yes"]:
+                try:
+                    _abort_trial(config, server_state, own_loading=load_attempted and
+                                 endpoint_alive(config.endpoint) and
+                                 _mavis_status(config)["models_loading"] > 0)
+                    stopped["yes"] = True
+                    gpu_stopped = True
+                except BaseException as stop_error:
+                    cleanup_error = RuntimeError(f"{error}; trial server abort failed: {stop_error}")
         finally:
-            if owned:
+            if gpu_stopped:
                 try:
                     _owned_status(_lease_command("status"), purpose)
                     _lease_command("release", HOLDER)
+                    lease_released = True
                 except BaseException as error:
-                    failure_receipt = _cleanup_failure(config, purpose, error)
-                    cleanup_error = error
+                    cleanup_error = error if cleanup_error is None else RuntimeError(
+                        f"{cleanup_error}; GPU lease release also failed: {error}"
+                    )
+            if cleanup_error is not None or not gpu_stopped or not lease_released:
+                failure = cleanup_error or primary_error or RuntimeError(
+                    "E1 trial GPU work may still be active"
+                )
+                try:
+                    receipt = _cleanup_failure(config, purpose, failure,
+                                               gpu_work_stopped=gpu_stopped,
+                                               lease_released=lease_released)
+                except BaseException as error:
+                    cleanup_error = RuntimeError(f"{failure}; cleanup receipt failed: {error}")
+        if not gpu_stopped:
+            raise RuntimeError(
+                f"E1 trial GPU work may still be active ({cleanup_error or primary_error}); "
+                f"lease retained; inventory receipt: {receipt}"
+            ) from cleanup_error
         if cleanup_error is not None:
             raise RuntimeError(
-                f"E1 GPU cleanup failed: {cleanup_error}; inventory receipt: {failure_receipt}"
+                f"E1 GPU cleanup failed: {cleanup_error}; inventory receipt: {receipt}"
             ) from cleanup_error

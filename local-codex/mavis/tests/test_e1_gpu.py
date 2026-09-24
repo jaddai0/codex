@@ -1,9 +1,10 @@
-"""Source-only fault checks for installed E1 shared GPU admission."""
+"""No-GPU fault checks for installed E1 shared GPU admission."""
 
 from pathlib import Path
 import tempfile
+import threading
 import unittest
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 
 from mavis import e1_gpu
 from mavis.runtime import RuntimeConfig
@@ -15,17 +16,21 @@ class E1GPUAdmissionTests(unittest.TestCase):
         self.temp = tempfile.TemporaryDirectory()
         self.addCleanup(self.temp.cleanup)
         self.config = RuntimeConfig(home=Path(self.temp.name), model="model-a")
+        self.state = {"pid": 1234, "command": ["trial-omlx"]}
         self.commands = []
         self.held = False
         self.loaded = False
+        self.server = False
         self.iris = ["iris-qwen"]
         self.game = False
         self.unavailable = False
-        self.owner = True
         self.purpose = ""
         self.fail_load = False
         self.fail_unload = False
+        self.fail_abort = False
         self.active_requests = 0
+        self.models_loading = 0
+        self.load_gate = None
 
         def command(*args):
             self.commands.append(args)
@@ -55,14 +60,18 @@ class E1GPUAdmissionTests(unittest.TestCase):
         def load(config):
             self.assertTrue(config.allow_concurrent_local)
             self.assertEqual(config.idle_seconds, 900)
-            self.loaded = True  # a failed HTTP response may follow a successful load
+            if self.load_gate is not None:
+                self.models_loading = 1
+                self.load_gate.wait(20)
+                self.models_loading = 0
+            self.loaded = True  # an HTTP failure may follow a successful load
             if self.fail_load:
                 raise RuntimeError("load response lost")
 
         def request(endpoint, path, **kwargs):
             if path == "/api/status":
                 return {"status": "ok", "active_requests": self.active_requests,
-                        "waiting_requests": 0, "models_loading": 0}
+                        "waiting_requests": 0, "models_loading": self.models_loading}
             self.assertEqual(path, "/v1/models/model-a/unload")
             self.assertEqual(kwargs["method"], "POST")
             if self.fail_unload:
@@ -70,36 +79,88 @@ class E1GPUAdmissionTests(unittest.TestCase):
             self.loaded = False
             return {}
 
+        def start(config, *, require_new):
+            self.assertTrue(require_new)
+            self.assertFalse(self.server)
+            self.server = True
+            return self.state
+
+        def park(config, *, expected_pid, expected_state):
+            self.assertEqual(expected_pid, 1234)
+            self.assertEqual(expected_state, self.state)
+            self.assertTrue(self.server)
+            self.server = False
+            self.loaded = False
+            return Mock()
+
+        def abort(config, state):
+            self.assertEqual(state, self.state)
+            if self.fail_abort:
+                raise RuntimeError("trial abort failed")
+            self.server = False
+            self.loaded = False
+            self.models_loading = 0
+            if self.load_gate is not None:
+                self.load_gate.set()
+
         patchers = [
             patch.object(e1_gpu, "_lease_command", side_effect=command),
             patch.object(e1_gpu, "require_idle_iris_handoff"),
             patch.object(e1_gpu, "loaded_generation_models", side_effect=generations),
-            patch.object(e1_gpu, "endpoint_alive", return_value=True),
-            patch.object(e1_gpu, "owns_running_server", side_effect=lambda _config: self.owner),
-            patch.object(e1_gpu, "ensure_runtime", return_value={}),
+            patch.object(e1_gpu, "endpoint_alive", side_effect=lambda _: self.server),
+            patch.object(e1_gpu, "reserve_empty_mavis_port", return_value=Mock()),
+            patch.object(e1_gpu, "start_server", side_effect=start),
+            patch.object(e1_gpu, "read_json", return_value=self.state),
+            patch.object(e1_gpu, "park_mavis_server", side_effect=park),
+            patch.object(e1_gpu, "stop_trial_server", side_effect=abort),
             patch.object(e1_gpu, "load_model", side_effect=load),
             patch.object(e1_gpu, "request_json", side_effect=request),
-            patch.object(e1_gpu, "inventory", side_effect=lambda endpoint: [
-                {"id": model, "loaded": True} for model in generations(endpoint)]),
+            patch.object(e1_gpu, "inventory", side_effect=lambda endpoint: (
+                [{"id": "model-a", "loaded": self.loaded}] if endpoint == self.config.endpoint
+                else [{"id": model, "loaded": True} for model in self.iris])),
         ]
+        self.patches = [p.start() for p in patchers]
         for patcher in patchers:
-            started = patcher.start()
-            if patcher is patchers[1]:
-                self.handoff = started
             self.addCleanup(patcher.stop)
+        self.handoff = self.patches[1]
+        self.reserve = self.patches[4]
+        self.start = self.patches[5]
+        self.park = self.patches[7]
+        self.abort = self.patches[8]
 
-    def test_keeps_iris_loaded_and_unloads_only_its_model(self):
+    def test_new_server_preserves_iris_then_unloads_and_parks(self):
         with e1_gpu.admitted_e1_model(self.config, "e1:trial") as heartbeat:
             self.assertTrue(self.loaded)
             self.assertEqual(self.iris, ["iris-qwen"])
             heartbeat.next_renew = 0
             heartbeat(force=True)
         self.assertFalse(self.loaded)
+        self.assertFalse(self.server)
         self.assertFalse(self.held)
-        self.assertEqual(self.iris, ["iris-qwen"])
         self.assertEqual(self.handoff.call_args.kwargs["expected_models"], ["iris-qwen"])
         self.assertEqual([cmd[0] for cmd in self.commands].count("renew"), 1)
-        self.assertEqual(self.commands[-1][0], "release")
+        self.park.assert_called_once()
+        self.abort.assert_not_called()
+
+    def test_preexisting_server_fails_without_load_or_stop(self):
+        self.server = True
+        self.reserve.side_effect = RuntimeError("port occupied")
+        with self.assertRaisesRegex(RuntimeError, "port occupied"):
+            with e1_gpu.admitted_e1_model(self.config, "e1:trial"):
+                pass
+        self.start.assert_not_called()
+        self.park.assert_not_called()
+        self.abort.assert_not_called()
+        self.assertFalse(self.held)
+
+    def test_race_after_empty_reservation_fails_without_adopting_server(self):
+        self.start.side_effect = RuntimeError("endpoint occupied by another session")
+        with self.assertRaisesRegex(RuntimeError, "occupied by another session"):
+            with e1_gpu.admitted_e1_model(self.config, "e1:trial"):
+                pass
+        self.park.assert_not_called()
+        self.abort.assert_not_called()
+        self.assertFalse(self.held)
 
     def test_game_or_unknown_game_state_refuses_before_acquire(self):
         for attribute in ("game", "unavailable"):
@@ -111,62 +172,66 @@ class E1GPUAdmissionTests(unittest.TestCase):
             self.assertNotIn("acquire", [cmd[0] for cmd in self.commands])
             setattr(self, attribute, False)
 
-    def test_preloaded_or_unowned_mavis_server_is_not_changed(self):
-        for loaded, owner in ((True, True), (False, False)):
-            self.loaded, self.owner = loaded, owner
-            with self.assertRaises(RuntimeError):
-                with e1_gpu.admitted_e1_model(self.config, "e1:trial"):
-                    pass
-            self.assertEqual(self.loaded, loaded)
-            self.assertFalse(self.held)
-            self.assertNotIn("unload", [cmd[0] for cmd in self.commands])
-
-    def test_partial_load_failure_still_unloads_and_releases(self):
+    def test_partial_load_failure_stops_trial_server_then_releases(self):
         self.fail_load = True
         with self.assertRaisesRegex(RuntimeError, "load response lost"):
             with e1_gpu.admitted_e1_model(self.config, "e1:trial"):
                 pass
         self.assertFalse(self.loaded)
+        self.assertFalse(self.server)
         self.assertFalse(self.held)
-        self.assertEqual(self.iris, ["iris-qwen"])
 
-    def test_same_name_lease_takeover_does_not_unload_or_release_new_owner(self):
+    def test_game_starts_during_blocking_load_and_aborts_exact_trial(self):
+        self.load_gate = threading.Event()
+        original_load = self.patches[9]
+        def loading(config):
+            self.game = True
+            self.models_loading = 1
+            self.load_gate.wait(20)
+            self.models_loading = 0
+        original_load.side_effect = loading
+        with self.assertRaisesRegex(RuntimeError, "game state is unsafe"):
+            with e1_gpu.admitted_e1_model(self.config, "e1:trial"):
+                pass
+        self.abort.assert_called_once_with(self.config.__class__(
+            **{**self.config.__dict__, "allow_concurrent_local": True, "idle_seconds": 900}
+        ), self.state)
+        self.assertFalse(self.server)
+        self.assertFalse(self.held)
+
+    def test_same_name_lease_takeover_stops_own_server_but_not_new_lease(self):
         with self.assertRaisesRegex(RuntimeError, "purpose changed"):
             with e1_gpu.admitted_e1_model(self.config, "e1:trial") as heartbeat:
                 self.purpose = "another-codex-session"
                 heartbeat(force=True)
-        self.assertTrue(self.loaded)
+        self.abort.assert_called_once()
+        self.assertFalse(self.server)
         self.assertTrue(self.held)
         self.assertNotIn("release", [cmd[0] for cmd in self.commands])
         receipts = list((self.config.home / "e1/admission-failures").glob("*.json"))
         self.assertEqual(len(receipts), 1)
-        self.assertEqual(read_json(receipts[0])["mavis_inventory"][0]["id"], "model-a")
+        self.assertEqual(read_json(receipts[0])["mavis_inventory"], [{"id": "model-a", "loaded": False}])
 
-    def test_game_start_during_trial_unloads_and_releases(self):
-        with self.assertRaisesRegex(RuntimeError, "game state"):
-            with e1_gpu.admitted_e1_model(self.config, "e1:trial") as heartbeat:
-                self.game = True
-                heartbeat(force=True)
-        self.assertFalse(self.loaded)
-        self.assertFalse(self.held)
-
-    def test_failed_unload_reports_error_and_still_releases(self):
-        self.fail_unload = True
-        with self.assertRaisesRegex(RuntimeError, "unload failed twice"):
-            with e1_gpu.admitted_e1_model(self.config, "e1:trial"):
-                pass
-        self.assertTrue(self.loaded)
-        self.assertFalse(self.held)
-        receipts = list((self.config.home / "e1/admission-failures").glob("*.json"))
-        self.assertEqual(len(receipts), 1)
-        self.assertEqual(read_json(receipts[0])["iris_inventory"][0]["id"], "iris-qwen")
-
-    def test_active_mavis_request_prevents_unload_and_records_failure(self):
-        with self.assertRaisesRegex(RuntimeError, "active, waiting, or loading"):
+    def test_active_request_prevents_stop_and_retains_lease_with_receipt(self):
+        with self.assertRaisesRegex(RuntimeError, "lease retained"):
             with e1_gpu.admitted_e1_model(self.config, "e1:trial"):
                 self.active_requests = 1
+        self.assertTrue(self.server)
         self.assertTrue(self.loaded)
-        self.assertFalse(self.held)
+        self.assertTrue(self.held)
+        self.abort.assert_not_called()
+        receipts = list((self.config.home / "e1/admission-failures").glob("*.json"))
+        self.assertEqual(len(receipts), 1)
+        self.assertFalse(read_json(receipts[0])["gpu_work_stopped"])
+
+    def test_failed_abort_retains_lease_and_writes_receipt(self):
+        self.fail_unload = True
+        self.fail_abort = True
+        with self.assertRaisesRegex(RuntimeError, "lease retained"):
+            with e1_gpu.admitted_e1_model(self.config, "e1:trial"):
+                pass
+        self.assertTrue(self.held)
+        self.assertTrue(self.server)
         self.assertEqual(len(list((self.config.home / "e1/admission-failures").glob("*.json"))), 1)
 
 

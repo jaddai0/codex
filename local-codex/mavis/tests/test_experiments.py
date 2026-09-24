@@ -245,6 +245,46 @@ class ExperimentLifecycleTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "active baseline changed"):
             self.store.stage("fix-1")
 
+    def test_comparison_rechecks_active_seed_under_profile_boundary(self):
+        active = self.store.active("main")
+        active["configuration"] = self.store._snapshot(self.candidate)
+        write_json(self.store._active_path("main"), active)
+        with self.assertRaisesRegex(ValueError, "active baseline changed"):
+            self._compare()
+        self.assertEqual(self.store.load("fix-1")["state"], "candidate")
+
+    def test_comparison_is_serialized_with_generation_host_lease(self):
+        with (self.home / "generation.lock").open("a+") as lease:
+            fcntl.flock(lease.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+            with self.assertRaisesRegex(RuntimeError, "generation owns"):
+                self._compare()
+        self.assertEqual(self.store.load("fix-1")["state"], "candidate")
+
+    def test_comparison_uses_its_own_scope_not_main(self):
+        self.store.seed_active("scratch", BASE)
+        candidate = deepcopy(BASE)
+        candidate["retrieval"]["top_k"] = 8
+        record = self.store.create("scratch-fix", "scratch", "retrieval", candidate,
+                                   hypothesis="Improve retrieval", workload={"suite": "E1"},
+                                   split={"held_out": ["case-1"], "minimum_gain": 0.1})
+        active = self.store.active("main")
+        active["configuration"] = self.store._snapshot(self.candidate)
+        write_json(self.store._active_path("main"), active)
+        def result(arm, score):
+            path = self.home / f"scratch-{arm}.log"
+            path.write_text("host result\n")
+            value = {"configuration_sha256": record[arm]["sha256"],
+                     "workload_digest": _digest(record["workload"]),
+                     "case_ids": ["case-1"], "mandatory_passed": True,
+                     "target_score": score,
+                     "evidence": {"path": str(path), "sha256": sha256_file(path)}}
+            if arm == "candidate":
+                value["candidate_job_id"] = "scratch-worker"
+            return value
+        compared = self.store.compare("scratch-fix", baseline_result=result("baseline", 0.2),
+                                      candidate_result=result("candidate", 0.8))
+        self.assertEqual(compared["state"], "compared")
+
     def test_interrupted_promotion_is_detected_and_can_finish(self):
         self._compare()
         self.store.review("fix-1", self._review())

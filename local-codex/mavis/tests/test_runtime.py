@@ -28,6 +28,7 @@ from mavis.runtime import (
     stop_trial_server,
     wait_iris_model_drain,
 )
+import mavis.runtime as runtime
 from mavis.storage import write_json
 
 
@@ -49,6 +50,32 @@ class FakeProcess:
 
 
 class RuntimeTests(unittest.TestCase):
+    def test_trial_abort_requires_process_handle_from_this_python_launch(self):
+        with tempfile.TemporaryDirectory() as directory:
+            config = RuntimeConfig(home=Path(directory))
+            state = {"pid": 1234, "command": ["trial"]}
+            write_json(config.state_path, state)
+            with patch.dict(runtime._TRIAL_PROCESSES, {}, clear=True), \
+                    patch("mavis.runtime.os.killpg") as kill, \
+                    self.assertRaisesRegex(RuntimeError, "no process handle"):
+                stop_trial_server(config, state)
+            kill.assert_not_called()
+
+    def test_trial_abort_reaps_only_registered_spawned_group(self):
+        with tempfile.TemporaryDirectory() as directory:
+            config = RuntimeConfig(home=Path(directory))
+            state = {"pid": 1234, "command": ["trial"]}
+            write_json(config.state_path, state)
+            process = FakeProcess()
+            with patch.dict(runtime._TRIAL_PROCESSES, {1234: process}, clear=True), \
+                    patch("mavis.runtime.owns_running_server", return_value=True), \
+                    patch("mavis.runtime.os.getpgid", return_value=1234), \
+                    patch("mavis.runtime.os.waitpid", return_value=(1234, 0)), \
+                    patch("mavis.runtime.os.killpg", side_effect=[None, None, ProcessLookupError]) as kill:
+                stop_trial_server(config, state)
+                self.assertNotIn(1234, runtime._TRIAL_PROCESSES)
+            kill.assert_any_call(1234, signal.SIGTERM)
+
     def test_trial_abort_rejects_changed_launch_record_without_signal(self):
         with tempfile.TemporaryDirectory() as directory:
             config = RuntimeConfig(home=Path(directory))
@@ -344,14 +371,28 @@ class RuntimeTests(unittest.TestCase):
     def test_settings_pin_auth_server_model_and_cache_to_mavis(self):
         with tempfile.TemporaryDirectory() as directory:
             config = RuntimeConfig(home=Path(directory))
+            write_json(config.base_path / "settings.json", {
+                "version": "1.0", "server": {"distributed_inference_enabled": True}
+            })
             ensure_isolated_settings(config)
             settings = __import__("json").loads(
                 (config.base_path / "settings.json").read_text()
             )
-            self.assertEqual(settings["server"], {"host": "127.0.0.1", "port": 8001})
+            self.assertEqual(settings["server"], {"host": "127.0.0.1", "port": 8001,
+                                                   "distributed_inference_enabled": False})
             self.assertTrue(settings["auth"]["skip_api_key_verification"])
             self.assertEqual(settings["model"]["model_dirs"], [str(config.model_dir)])
             self.assertEqual(settings["cache"]["ssd_cache_dir"], str(config.base_path / "cache"))
+
+    def test_isolated_runtime_refuses_distributed_deployment_registry(self):
+        with tempfile.TemporaryDirectory() as directory:
+            config = RuntimeConfig(home=Path(directory))
+            write_json(config.base_path / "cluster" / "deployments.json", {
+                "schema_version": 1, "deployments": []
+            })
+            with self.assertRaisesRegex(RuntimeError, "distributed deployment"):
+                ensure_isolated_settings(config)
+            self.assertFalse((config.base_path / "settings.json").exists())
 
     def test_admission_blocks_recent_iris_generation_but_ignores_embedding(self):
         with tempfile.TemporaryDirectory() as directory:

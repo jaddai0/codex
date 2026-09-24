@@ -226,10 +226,13 @@ class ExperimentStore:
     def compare(self, experiment_id: str, *, baseline_result: dict[str, Any],
                 candidate_result: dict[str, Any]) -> dict[str, Any]:
         """Require matched held-out cases, mandatory passes, and real improvement."""
-        with self._locked():
+        with _profile_transition_lease(self.home), profile_boundary_lock(self.home), self._locked():
             record = self._load(experiment_id)
             if record["state"] != "candidate":
                 raise ValueError("only an unevaluated candidate can be compared")
+            active = read_json(self._active_path(record["scope"]))
+            if active["configuration"] != record["baseline"]:
+                raise ValueError("active baseline changed since experiment began")
             cases = record["evaluation_split"]["held_out"]
             if not isinstance(cases, list) or not cases or len(cases) != len(set(cases)):
                 raise ValueError("held-out case IDs must be unique")
