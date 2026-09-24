@@ -82,7 +82,8 @@
         "An initial installed six-test run was rejected by Terra because fractional tax escaped the blueprint. The fixture added that case, the source package passed 300 tests, and installed candidate 003c908e1 passed fresh E0.",
         "The fresh seven-test held-out task passed catalog then checkout across compaction and process restart. Host checks passed 3/3 and 7/7; Terra independently accepted; the protected blueprint, tests, dirty note, and untracked draft retained their hashes. IRIS stayed loaded and the GPU lease was released.",
         "Broader large-repository, ambiguous-failure, flaky-dependency, concurrent-worktree, decomposition, and tool-discovery shards remain open.",
-        "The protected large-project fixture passed verify_fixture.py, observe_large_e2.py dry-run, capture_native_large_e2.py --dry-run, and 12 synthetic checks on 2026-09-24. The native installed run and independent acceptance have not occurred; see Mavis/evidence/phase4-large-fixture/*-20260924.log."
+        "The protected large-project fixture passed verify_fixture.py, observe_large_e2.py dry-run, capture_native_large_e2.py --dry-run, and 12 synthetic checks on 2026-09-24. The native installed run and independent acceptance have not occurred; see Mavis/evidence/phase4-large-fixture/*-20260924.log.",
+        "Four additional Phase 4 challenge seeds (ambiguous order total, repeatable sampler failure, offline dependency fallback, tool discovery) were built as clean Git repositories. The host independently verified all 54 tracked file hashes, each seeded visible and hidden failure, and four temporary known-good repairs that passed both surfaces. See Mavis/evidence/phase4-challenges/visible/manifest.json, visible/REPORT.md, host/verify.py, host/seed-*.json, and host/positive-summary.json. These fixtures have not yet been run through installed Mavis."
       ],
       "id": "phase-4",
       "requirement": "Pass a held-out multi-package task across compaction and restart.",
@@ -92,7 +93,8 @@
       "artifact": "~/.local-codex/mavis-service/evaluations/phase5",
       "command": "python3 -m mavis eval phase5",
       "evidence": [
-        "Conditional evaluation pending Phase 4."
+        "Conditional evaluation pending Phase 4.",
+        "A current source-only readiness audit at Mavis/evidence/agent-reports/phase5-readiness-live-2026-09-24.md found the hosted typed adapter and budget ledger in the gateway but no Mavis Jev consumer, local decision service, independently labeled held-out set, shared-compute comparison, or shadow/traffic receipt. The local-candidate acceptance remains open."
       ],
       "id": "phase-5",
       "requirement": "Evaluate and stage a local Jev-style candidate without violating license or training boundaries.",
@@ -125,12 +127,12 @@
   "status": "partial",
   "task": "Implement the Mavis local coding execution and verified improvement plan.",
   "uncertainty": [
-    "Current installed candidate 069dfa8dd has no all-pass E0 receipt. IRIS oMLX gracefully restarted three times during the candidate-bound compaction gate, leaving its model unloaded after each restart. The model was restored afterward, but shared-GPU admission still requires a stable loaded IRIS model idle for 15 minutes. The GPU lease was released.",
+    "Current installed candidate 069dfa8dd has no all-pass E0 receipt. The compaction observer recovered its fact but IRIS oMLX restarted, invalidating the isolation check. A subsequent 15-minute idle retry was interrupted by a manually requested Qwen unload from another session. Mavis has not restarted, loaded, or unloaded that server; E0 waits for a stable loaded IRIS model and shared-GPU admission.",
     "Installed candidate eba4c2b81 passed fresh E0 10/10 in run 326665986826461ba7c2a74b8705789e. The project-bound memory MCP tool works in the default sandbox. Three repeated checkout pairs gave a narrow positive signal, but a distinct settings-helper task exited without implementing and failed host acceptance; automatic helper promotion is rejected.",
     "Installed candidate 7ad62299b passed all ten E0 cases in run 9682efbf5d8f40ee9abe5f16ecf75ac9. The prior installation is retained at ~/.local/share/local-codex-backups/mavis-before-librarian-launcher-20260924.",
     "Phase 2 installed librarian and output-reader role canaries passed with pinned Qwen3.5-4B and independent Terra review. The 0.8B candidate failed factual answer and irregular-log quality. A 4B coding arm completed and passed host acceptance while the baseline looped after passing host tests; the single unmatched pair does not establish net benefit, and default-sandbox helper access remains open.",
     "Phase 3 E1 has source gates and native assignment plumbing. A real paired comparison, independent promotion, and rollback remain open.",
-    "Phase 4 held-out two-package work passed across compaction and restart with independent Terra acceptance. Broader large-project, conflict, flaky-dependency, and tool-discovery coverage remains open.",
+    "Phase 4 held-out two-package work passed across compaction and restart with independent Terra acceptance. A protected large-project fixture and four challenge seeds are prepared; installed large-project, conflict, flaky-dependency, and tool-discovery runs remain open.",
     "The Rust core suite ran 4,591 tests and had 278 failures from environment and cross-package cases; the Mavis-focused Rust tests passed. The broad suite remains an open gate.",
     "Hosted Jev returned one typed answer under the local capped ledger; external invoice reconciliation and a local Jev candidate remain open."
   ]
