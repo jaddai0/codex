@@ -457,11 +457,9 @@ def _gateway_arguments(
             "with shasum -a 256; do not hash parsed or re-serialized JSON), "
             f"gateway_worker_job_id ({job_id}), and verifier_job_id ({job_id}-terra). "
             "This names the planned separate verifier; it does not claim that verifier ran. "
-            "Use the frozen packet's exact hashes. Build the final JSON in a "
-            "file, parse that exact file with json.loads, then output its exact "
-            "bytes; do not retype or shorten the validated JSON. Return one "
-            "complete raw JSON object without a preamble, code fences, or "
-            "trailing text."
+            "Use the frozen packet's exact hashes. Keep cited_evidence to "
+            "one short verbatim evidence string per case. Return one complete "
+            "raw JSON object without a preamble, code fences, or trailing text."
         ),
         "lane": "minimax",
         "model": owner["model"],
