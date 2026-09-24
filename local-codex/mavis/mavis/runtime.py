@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from contextlib import contextmanager
 from contextvars import ContextVar
 from datetime import datetime
@@ -43,6 +43,7 @@ class RuntimeConfig:
     idle_seconds: int = 900
     reserve_bytes: int = 64 * 1024**3
     allow_concurrent_local: bool = False
+    api_key: str | None = field(default=None, repr=False)
 
     @property
     def base_path(self) -> Path:
@@ -76,18 +77,35 @@ def request_json(
         return json.load(response)
 
 
-def inventory(endpoint: str) -> list[dict[str, Any]]:
-    payload = request_json(endpoint, "/admin/api/models")
+def _auth_headers(api_key: str | None) -> dict[str, str] | None:
+    return {"Authorization": f"Bearer {api_key}"} if api_key else None
+
+
+def _own_api(config: RuntimeConfig) -> dict[str, str]:
+    return {"api_key": config.api_key} if config.api_key else {}
+
+
+def _own_headers(config: RuntimeConfig) -> dict[str, dict[str, str]]:
+    return {"headers": _auth_headers(config.api_key)} if config.api_key else {}
+
+
+def inventory(endpoint: str, *, api_key: str | None = None) -> list[dict[str, Any]]:
+    # The admin route requires a browser session cookie. A trial key uses the
+    # public, Bearer-authenticated status route with the same admission fields.
+    path = "/v1/models/status" if api_key else "/admin/api/models"
+    payload = request_json(endpoint, path, **(
+        {"headers": _auth_headers(api_key)} if api_key else {}
+    ))
     records = payload.get("models", payload) if isinstance(payload, dict) else payload
     if not isinstance(records, list) or not all(isinstance(item, dict) for item in records):
         raise RuntimeError("oMLX returned an invalid model inventory")
     return records
 
 
-def loaded_generation_models(endpoint: str) -> list[str]:
+def loaded_generation_models(endpoint: str, *, api_key: str | None = None) -> list[str]:
     """Require a readable inventory and name every loaded non-embedding model."""
     models = []
-    for row in inventory(endpoint):
+    for row in inventory(endpoint, **({"api_key": api_key} if api_key else {})):
         if row.get("loaded") is not True:
             continue
         if row.get("engine_type") == "embedding" or row.get("model_type") == "embedding":
@@ -99,9 +117,9 @@ def loaded_generation_models(endpoint: str) -> list[str]:
     return models
 
 
-def endpoint_alive(endpoint: str) -> bool:
+def endpoint_alive(endpoint: str, *, api_key: str | None = None) -> bool:
     try:
-        inventory(endpoint)
+        inventory(endpoint, **({"api_key": api_key} if api_key else {}))
         return True
     except (OSError, URLError, RuntimeError, ValueError, json.JSONDecodeError):
         return False
@@ -442,7 +460,15 @@ def ensure_isolated_settings(config: RuntimeConfig) -> None:
     auth = settings.setdefault("auth", {})
     if not isinstance(auth, dict):
         raise ValueError("Mavis oMLX auth settings must be an object")
-    auth["skip_api_key_verification"] = True
+    if config.api_key:
+        if auth.get("api_key") not in (None, config.api_key):
+            raise RuntimeError("residual authentication from another Mavis trial")
+        auth["api_key"] = config.api_key
+        auth["skip_api_key_verification"] = False
+    else:
+        if auth.get("api_key"):
+            raise RuntimeError("residual Mavis trial authentication must be cleared after server stop")
+        auth["skip_api_key_verification"] = True
     server = settings.setdefault("server", {})
     if not isinstance(server, dict):
         raise ValueError("Mavis oMLX server settings must be an object")
@@ -459,9 +485,30 @@ def ensure_isolated_settings(config: RuntimeConfig) -> None:
     write_json(settings_path, settings)
 
 
+def clear_trial_auth_settings(config: RuntimeConfig) -> None:
+    """Clear only this trial's key after its server group is proven stopped."""
+    if not config.api_key:
+        raise ValueError("trial authentication key is missing")
+    path = config.base_path / "settings.json"
+    if not path.is_file():
+        return
+    settings = read_json(path)
+    auth = settings.get("auth")
+    if not isinstance(auth, dict):
+        raise RuntimeError("Mavis trial authentication settings are invalid")
+    current = auth.get("api_key")
+    if current is None:
+        return
+    if current != config.api_key or auth.get("skip_api_key_verification") is not False:
+        raise RuntimeError("Mavis trial authentication identity changed")
+    auth.pop("api_key")
+    auth["skip_api_key_verification"] = True
+    write_json(path, settings)
+
+
 def start_server(config: RuntimeConfig, wait_seconds: float = 30.0, *,
                  require_new: bool = False) -> dict[str, Any]:
-    if endpoint_alive(config.endpoint):
+    if endpoint_alive(config.endpoint, **_own_api(config)):
         if require_new:
             raise RuntimeError("Mavis endpoint was already running before this observation")
         if not owns_running_server(config):
@@ -499,6 +546,7 @@ def start_server(config: RuntimeConfig, wait_seconds: float = 30.0, *,
     stderr = (logs / "omlx.stderr.log").open("ab")
     try:
         child_env = os.environ.copy()
+        child_env.pop("MAVIS_E0_TRIAL_API_KEY", None)
         child_env["OMLX_BASE_PATH"] = str(config.base_path)
         isolated_home = config.home / "user-home"
         isolated_home.mkdir(parents=True, exist_ok=True)
@@ -530,7 +578,7 @@ def start_server(config: RuntimeConfig, wait_seconds: float = 30.0, *,
                 raise RuntimeError(
                     f"Mavis oMLX exited during startup with status {process.returncode}"
                 )
-            if endpoint_alive(config.endpoint):
+            if endpoint_alive(config.endpoint, **_own_api(config)):
                 if require_new and not owns_running_server(config):
                     raise RuntimeError("Mavis endpoint changed owner during startup")
                 _TRIAL_PROCESSES[process.pid] = process
@@ -640,8 +688,13 @@ def stop_trial_server(config: RuntimeConfig, expected_state: dict[str, Any], *,
 
 
 def available_memory_bytes() -> int:
-    page_size = int(subprocess.check_output(["sysctl", "-n", "hw.pagesize"], text=True).strip())
-    output = subprocess.check_output(["vm_stat"], text=True)
+    # The installed E0 evaluator carries a trial-only API key in its own env.
+    # OS probes have no need for that credential.
+    probe_env = {key: value for key, value in os.environ.items()
+                 if key != "MAVIS_E0_TRIAL_API_KEY"}
+    page_size = int(subprocess.check_output(["sysctl", "-n", "hw.pagesize"],
+                                            text=True, env=probe_env).strip())
+    output = subprocess.check_output(["vm_stat"], text=True, env=probe_env)
     counts: dict[str, int] = {}
     for line in output.splitlines():
         if ":" not in line:
@@ -656,7 +709,7 @@ def available_memory_bytes() -> int:
 
 def admission(config: RuntimeConfig, *, now: float | None = None) -> dict[str, Any]:
     now = time.time() if now is None else now
-    mavis_records = inventory(config.endpoint)
+    mavis_records = inventory(config.endpoint, **_own_api(config))
     target = next((item for item in mavis_records if item.get("id") == config.model), None)
     if target is None:
         raise RuntimeError(f"Mavis model is not discoverable: {config.model}")
@@ -699,8 +752,9 @@ def load_model(config: RuntimeConfig) -> dict[str, Any]:
         f"/v1/models/{quote(config.model, safe='')}/load",
         method="POST",
         timeout=900,
+        **_own_headers(config),
     )
-    records = inventory(config.endpoint)
+    records = inventory(config.endpoint, **_own_api(config))
     selected = next((item for item in records if item.get("id") == config.model), None)
     if not selected or not selected.get("loaded"):
         raise RuntimeError("oMLX did not report the selected Mavis model as loaded")
@@ -709,7 +763,7 @@ def load_model(config: RuntimeConfig) -> dict[str, Any]:
 
 def ensure_runtime(config: RuntimeConfig, *, load: bool = True) -> dict[str, Any]:
     state = start_server(config)
-    records = inventory(config.endpoint)
+    records = inventory(config.endpoint, **_own_api(config))
     selected = next((item for item in records if item.get("id") == config.model), None)
     if selected is None:
         raise RuntimeError("Mavis server identity check failed: selected model is absent")
@@ -733,7 +787,7 @@ def stop_server(config: RuntimeConfig) -> None:
         raise RuntimeError("Mavis server exact launch ownership is unproven")
     if not owns_running_server(config):
         raise RuntimeError("refusing to stop a process Mavis does not own")
-    status = request_json(config.endpoint, "/api/status")
+    status = request_json(config.endpoint, "/api/status", **_own_headers(config))
     if (not isinstance(status, dict) or status.get("status") != "ok"
             or any(type(status.get(key)) is not int or status[key] != 0 for key in
                    ("active_requests", "waiting_requests", "models_loading"))):
@@ -746,7 +800,7 @@ def stop_server(config: RuntimeConfig) -> None:
 def reserve_empty_mavis_port(config: RuntimeConfig, *,
                              verify_endpoint: bool = True) -> socket.socket:
     """Reserve only an empty port; never stop an existing server."""
-    if verify_endpoint and endpoint_alive(config.endpoint):
+    if verify_endpoint and endpoint_alive(config.endpoint, **_own_api(config)):
         raise RuntimeError("Mavis endpoint is occupied; refusing to reserve its port")
     parsed = urlparse(config.endpoint)
     reservation = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
@@ -782,8 +836,8 @@ def park_mavis_server(config: RuntimeConfig, *, timeout: float = 30,
         raise RuntimeError("Mavis server launch record changed before parking")
     if expected_state is not None and pid not in _TRIAL_PROCESSES:
         raise RuntimeError("Mavis server has no process handle from this launch")
-    if endpoint_alive(config.endpoint):
-        status = request_json(config.endpoint, "/api/status")
+    if endpoint_alive(config.endpoint, **_own_api(config)):
+        status = request_json(config.endpoint, "/api/status", **_own_headers(config))
         if (not isinstance(status, dict) or status.get("status") != "ok"
                 or type(status.get("active_requests")) is not int
                 or type(status.get("waiting_requests")) is not int

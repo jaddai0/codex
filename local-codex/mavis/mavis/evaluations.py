@@ -209,13 +209,15 @@ def _local_response_url(url: str) -> str:
     return url
 
 
-def _post_json(url: str, payload: dict[str, Any], timeout: float = 180.0) -> dict[str, Any]:
+def _post_json(url: str, payload: dict[str, Any], timeout: float = 180.0, *,
+               api_key: str | None = None) -> dict[str, Any]:
     body = json.dumps(payload).encode("utf-8")
     request = Request(
         _local_response_url(url),
         data=body,
         method="POST",
-        headers={"Content-Type": "application/json", "Accept": "application/json"},
+        headers={"Content-Type": "application/json", "Accept": "application/json",
+                 **({"Authorization": f"Bearer {api_key}"} if api_key else {})},
     )
     with urlopen(request, timeout=timeout) as response:
         parsed = json.load(response)
@@ -441,10 +443,14 @@ class E0Evaluator:
                     response_ids=prior["response_ids"],
                     live_receipt_sha256=sha256_file(prior_path),
                 )
-        if not endpoint_alive(self.config.endpoint):
+        if not endpoint_alive(self.config.endpoint, **(
+            {"api_key": self.config.api_key} if self.config.api_key else {}
+        )):
             return self._receipt("tool-roundtrip", "blocked", ["Mavis endpoint is unavailable"])
         selected = next(
-            (item for item in inventory(self.config.endpoint) if item.get("id") == self.config.model),
+            (item for item in inventory(self.config.endpoint, **(
+                {"api_key": self.config.api_key} if self.config.api_key else {}
+            )) if item.get("id") == self.config.model),
             None,
         )
         if not selected or not selected.get("loaded"):
@@ -456,6 +462,8 @@ class E0Evaluator:
             lease = subprocess.run(
                 [str(Path.home() / ".local/bin/gpu-lease"), "status"],
                 capture_output=True, text=True, timeout=15, check=False,
+                env={key: value for key, value in os.environ.items()
+                     if key != "MAVIS_E0_TRIAL_API_KEY"},
             )
             if (lease.returncode != 0
                     or not lease.stdout.startswith("codex-mavis has the GPU:")
@@ -487,7 +495,8 @@ class E0Evaluator:
             ],
             "tool_choice": "required",
         }
-        first = _post_json(self.config.endpoint.rstrip("/") + "/responses", payload)
+        first = _post_json(self.config.endpoint.rstrip("/") + "/responses", payload,
+                           **({"api_key": self.config.api_key} if self.config.api_key else {}))
         calls = [item for item in first.get("output", []) if item.get("type") == "function_call"]
         if len(calls) != 1 or calls[0].get("name") != "mavis_probe":
             raise RuntimeError("model did not emit the required function call")
@@ -509,6 +518,7 @@ class E0Evaluator:
                 "store": True,
                 "max_output_tokens": 256,
             },
+            **({"api_key": self.config.api_key} if self.config.api_key else {}),
         )
         if second.get("status") != "completed":
             write_json(self.root / "tool-roundtrip-incomplete.json", {

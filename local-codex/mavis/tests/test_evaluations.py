@@ -1,14 +1,16 @@
 from pathlib import Path
 import json
+import io
 import os
 import subprocess
 import tempfile
 import unittest
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 
 from mavis.evaluations import (E0_CASES, E0Evaluator, _safe_buried_inspection,
                                _trusted_raw_output_path,
-                               installed_candidate_fingerprint, native_review_completed)
+                               _post_json, installed_candidate_fingerprint,
+                               native_review_completed)
 from mavis.e0_tasks import prepare_small_repository, small_repository_review_prompt
 from mavis.e2_tasks import terra_review_command
 from mavis.runtime import RuntimeConfig
@@ -16,6 +18,44 @@ from mavis.storage import sha256_file, write_json
 
 
 class E0EvaluationTests(unittest.TestCase):
+    def test_trial_post_sends_bearer_key_only_in_request_header(self):
+        response = Mock()
+        response.__enter__ = Mock(return_value=io.BytesIO(b'{"status":"completed"}'))
+        response.__exit__ = Mock(return_value=False)
+        with patch("mavis.evaluations.urlopen", return_value=response) as open_url:
+            self.assertEqual(_post_json("http://127.0.0.1:8001/v1/responses",
+                                         {"model": "fixture"}, api_key="test-secret"),
+                             {"status": "completed"})
+        request = open_url.call_args.args[0]
+        self.assertEqual(request.get_header("Authorization"), "Bearer test-secret")
+        self.assertNotIn(b"test-secret", request.data)
+
+    def test_tool_roundtrip_trial_key_reaches_both_calls_not_lease_child(self):
+        with tempfile.TemporaryDirectory() as directory:
+            config = RuntimeConfig(home=Path(directory), api_key="test-secret")
+            evaluator = E0Evaluator(Path(directory), config)
+            first = {"id": "first", "output": [{
+                "type": "function_call", "name": "mavis_probe", "call_id": "call",
+                "arguments": '{"value":"E0_CANARY"}',
+            }]}
+            second = {"id": "second", "status": "completed"}
+            with (patch.dict(os.environ, {"MAVIS_E0_SHARED_GPU_LEASE": "codex-mavis",
+                                       "MAVIS_E0_TRIAL_API_KEY": "test-secret"}),
+                  patch("mavis.evaluations.endpoint_alive", return_value=True),
+                  patch("mavis.evaluations.inventory", return_value=[
+                      {"id": config.model, "loaded": True}]),
+                  patch("mavis.evaluations.subprocess.run", return_value=subprocess.CompletedProcess(
+                      ["gpu-lease", "status"], 0, "codex-mavis has the GPU: canary\n")) as lease,
+                  patch("mavis.evaluations.require_idle_iris_handoff"),
+                  patch("mavis.evaluations.admission", return_value={"allowed": True}),
+                  patch("mavis.evaluations._post_json", side_effect=[first, second]) as post,
+                  patch("mavis.evaluations.installed_candidate_fingerprint", return_value={
+                      "core_sha256": "a" * 64})):
+                self.assertEqual(evaluator.run_case("tool-roundtrip")["status"], "pass")
+            self.assertNotIn("MAVIS_E0_TRIAL_API_KEY", lease.call_args.kwargs["env"])
+            self.assertEqual([call.kwargs["api_key"] for call in post.call_args_list],
+                             ["test-secret", "test-secret"])
+
     def test_compaction_restart_reads_ignored_project_archive(self):
         with tempfile.TemporaryDirectory() as directory:
             base = Path(directory)

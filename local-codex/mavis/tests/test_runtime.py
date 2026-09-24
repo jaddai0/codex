@@ -14,6 +14,7 @@ from mavis.runtime import (
     RuntimeConfig,
     admission,
     acquire_iris_model_drain,
+    clear_trial_auth_settings,
     ensure_isolated_settings,
     handoff_lease_fd,
     loaded_generation_models,
@@ -51,6 +52,79 @@ class FakeProcess:
 
 
 class RuntimeTests(unittest.TestCase):
+    def test_trial_auth_settings_are_private_and_residual_key_blocks_normal_start(self):
+        with tempfile.TemporaryDirectory() as directory:
+            config = RuntimeConfig(home=Path(directory), api_key="test-secret")
+            self.assertNotIn("test-secret", repr(config))
+            ensure_isolated_settings(config)
+            settings_path = config.base_path / "settings.json"
+            self.assertEqual(settings_path.stat().st_mode & 0o777, 0o600)
+            settings = __import__("json").loads(settings_path.read_text())
+            self.assertEqual(settings["auth"]["api_key"], "test-secret")
+            self.assertIs(settings["auth"]["skip_api_key_verification"], False)
+            with self.assertRaisesRegex(RuntimeError, "residual Mavis trial"):
+                ensure_isolated_settings(RuntimeConfig(home=config.home))
+            with self.assertRaisesRegex(RuntimeError, "another Mavis trial"):
+                ensure_isolated_settings(RuntimeConfig(home=config.home, api_key="other"))
+            clear_trial_auth_settings(config)
+            self.assertNotIn("test-secret", settings_path.read_text())
+            ensure_isolated_settings(RuntimeConfig(home=config.home))
+
+    def test_trial_key_is_absent_from_server_argv_and_launch_record(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            binary = root / "omlx"
+            binary.write_text("fixture")
+            config = RuntimeConfig(home=root / "home", omlx_binary=binary,
+                                   api_key="test-secret")
+            process = FakeProcess()
+            with patch.dict(os.environ, {"MAVIS_E0_TRIAL_API_KEY": "inherited-stale"}), \
+                    patch.dict(runtime._TRIAL_PROCESSES, {}, clear=True), \
+                    patch("mavis.runtime.endpoint_alive", side_effect=[False, True]) as alive, \
+                    patch("mavis.runtime.port_in_use", return_value=False), \
+                    patch("mavis.runtime.owns_running_server", return_value=True), \
+                    patch("mavis.runtime.subprocess.Popen", return_value=process) as spawn:
+                state = start_server(config, require_new=True)
+            self.assertNotIn("test-secret", str(state))
+            self.assertNotIn("test-secret", str(spawn.call_args.args[0]))
+            self.assertNotIn("MAVIS_E0_TRIAL_API_KEY", spawn.call_args.kwargs["env"])
+            self.assertEqual(alive.call_args_list[-1].kwargs, {"api_key": "test-secret"})
+
+    def test_authenticated_inventory_sends_bearer_without_logging_key(self):
+        import io
+        from unittest.mock import Mock
+        payload = io.BytesIO(b'[{"id":"model"}]')
+        response = Mock()
+        response.__enter__ = Mock(return_value=payload)
+        response.__exit__ = Mock(return_value=False)
+        with patch("mavis.runtime.urlopen", return_value=response) as open_url:
+            self.assertEqual(runtime.inventory("http://127.0.0.1:8001/v1",
+                                               api_key="test-secret"), [{"id": "model"}])
+        request = open_url.call_args.args[0]
+        self.assertTrue(request.full_url.endswith("/v1/models/status"))
+        self.assertEqual(request.get_header("Authorization"), "Bearer test-secret")
+
+    def test_trial_inventory_avoids_cookie_only_admin_route(self):
+        from urllib.error import HTTPError
+        def route(_endpoint, path, **_kwargs):
+            if path == "/admin/api/models":
+                raise HTTPError(path, 401, "admin session required", {}, None)
+            self.assertEqual(path, "/v1/models/status")
+            return {"models": [{"id": "model", "loaded": True,
+                                "estimated_size": 123, "last_access": 456}]}
+        with patch("mavis.runtime.request_json", side_effect=route):
+            self.assertEqual(runtime.inventory("http://127.0.0.1:8001/v1",
+                                               api_key="test-secret")[0]["estimated_size"], 123)
+
+    def test_memory_probe_drops_e0_trial_key_from_os_children(self):
+        with patch.dict(os.environ, {"MAVIS_E0_TRIAL_API_KEY": "test-secret"}), \
+                patch("mavis.runtime.subprocess.check_output",
+                      side_effect=["4096\n", "Pages free: 1.\n"]) as check:
+            self.assertEqual(runtime.available_memory_bytes(), 4096)
+        self.assertEqual(check.call_count, 2)
+        for call in check.call_args_list:
+            self.assertNotIn("MAVIS_E0_TRIAL_API_KEY", call.kwargs["env"])
+
     def test_public_stop_fails_closed_without_exact_launch_handle(self):
         with tempfile.TemporaryDirectory() as directory:
             config = RuntimeConfig(home=Path(directory))

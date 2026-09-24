@@ -63,6 +63,7 @@ def runtime_config(args: argparse.Namespace) -> RuntimeConfig:
         model=args.model,
         model_dir=Path(args.model_dir).expanduser(),
         omlx_binary=Path(args.omlx_binary).expanduser(),
+        api_key=os.environ.get("MAVIS_E0_TRIAL_API_KEY") or None,
     )
 
 

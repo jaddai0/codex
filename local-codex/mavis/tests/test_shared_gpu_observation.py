@@ -9,8 +9,10 @@ import tempfile
 import threading
 import unittest
 from unittest.mock import Mock, patch
+from urllib.error import HTTPError
 
-from mavis.runtime import RuntimeConfig
+from mavis.runtime import RuntimeConfig, ensure_isolated_settings
+from mavis.storage import write_json
 
 
 SCRIPT = Path(__file__).resolve().parent.parent / "scripts" / "shared_gpu_observation.py"
@@ -51,6 +53,226 @@ class SharedGpuObservationTests(unittest.TestCase):
         self.config = RuntimeConfig(home=Path("/private/tmp/mavis-test"),
                                     allow_concurrent_local=True)
         self.lease = Lease()
+
+    def test_trial_auth_requires_live_401_then_keyed_status(self):
+        config = RuntimeConfig(home=Path("/tmp/mavis-auth-test"), api_key="test-secret")
+        unauthorized = HTTPError(config.endpoint, 401, "unauthorized", {}, None)
+        with patch.object(observer, "request_json", side_effect=[
+            unauthorized, {"status": "ok"},
+        ]) as request:
+            observer._prove_trial_auth(config)
+        unauthorized.close()
+        self.assertEqual(request.call_args_list[1].kwargs["headers"],
+                         {"Authorization": "Bearer test-secret"})
+        with patch.object(observer, "request_json", return_value={"status": "ok"}), \
+                self.assertRaisesRegex(RuntimeError, "without its key"):
+            observer._prove_trial_auth(config)
+
+    def test_authenticated_stopped_child_allows_one_inflight_request_on_own_server(self):
+        with tempfile.TemporaryDirectory() as directory:
+            config = RuntimeConfig(home=Path(directory), api_key="test-secret")
+            config.base_path.mkdir(parents=True)
+            (config.base_path / "settings.json").write_text(json.dumps({
+                "auth": {"api_key": "test-secret", "skip_api_key_verification": False}
+            }))
+            with (patch.object(observer, "endpoint_alive", return_value=True),
+                  patch.object(observer, "request_json", return_value={
+                      "status": "ok", "active_requests": 1,
+                      "waiting_requests": 0, "models_loading": 0,
+                  }), patch.object(observer, "stop_trial_server") as stop,
+                  patch.object(observer, "reserve_empty_mavis_port", return_value=Mock()),
+                  patch.object(observer, "clear_trial_auth_settings") as clear):
+                observer._abort_observation_server(
+                    config, {"pid": 1234}, own_generation=True,
+                )
+            stop.assert_called_once()
+            clear.assert_called_once_with(config)
+
+    def test_authenticated_own_unload_allows_one_inflight_request_without_child(self):
+        with tempfile.TemporaryDirectory() as directory:
+            config = RuntimeConfig(home=Path(directory), api_key="test-secret")
+            config.base_path.mkdir(parents=True)
+            (config.base_path / "settings.json").write_text(json.dumps({
+                "auth": {"api_key": "test-secret", "skip_api_key_verification": False}
+            }))
+            with (patch.object(observer, "endpoint_alive", return_value=True),
+                  patch.object(observer, "request_json", return_value={
+                      "status": "ok", "active_requests": 1,
+                      "waiting_requests": 0, "models_loading": 0,
+                  }), patch.object(observer, "stop_trial_server") as stop,
+                  patch.object(observer, "reserve_empty_mavis_port", return_value=Mock()),
+                  patch.object(observer, "clear_trial_auth_settings") as clear):
+                observer._abort_observation_server(
+                    config, {"pid": 1234}, own_unload=True,
+                )
+            stop.assert_called_once()
+            clear.assert_called_once_with(config)
+
+    def test_authenticated_own_unload_refuses_second_request(self):
+        with tempfile.TemporaryDirectory() as directory:
+            config = RuntimeConfig(home=Path(directory), api_key="test-secret")
+            config.base_path.mkdir(parents=True)
+            (config.base_path / "settings.json").write_text(json.dumps({
+                "auth": {"api_key": "test-secret", "skip_api_key_verification": False}
+            }))
+            with (patch.object(observer, "endpoint_alive", return_value=True),
+                  patch.object(observer, "request_json", return_value={
+                      "status": "ok", "active_requests": 2,
+                      "waiting_requests": 0, "models_loading": 0,
+                  }), patch.object(observer, "stop_trial_server") as stop,
+                  self.assertRaisesRegex(RuntimeError, "outside this observation")):
+                observer._abort_observation_server(
+                    config, {"pid": 1234}, own_unload=True,
+                )
+            stop.assert_not_called()
+
+    def test_post_launch_auth_failure_parks_then_scrubs_trial_key(self):
+        with tempfile.TemporaryDirectory() as directory:
+            config = RuntimeConfig(home=Path(directory), api_key="test-secret",
+                                   allow_concurrent_local=True)
+            state = {"pid": 1234}
+            def start(_config, *, require_new):
+                self.assertTrue(require_new)
+                ensure_isolated_settings(_config)
+                return state
+            with (patch.object(observer, "_lease_command", side_effect=self.lease),
+                  patch.object(observer, "loaded_generation_models", return_value=["iris-model"]),
+                  patch.object(observer, "require_idle_iris_handoff"),
+                  patch.object(observer, "reserve_empty_mavis_port", return_value=Mock()),
+                  patch.object(observer, "start_server", side_effect=start),
+                  patch.object(observer, "read_json", return_value=state),
+                  patch.object(observer, "_prove_trial_auth",
+                               side_effect=RuntimeError("auth probe failed")),
+                  patch.object(observer, "park_mavis_server", return_value=Mock()) as park,
+                  patch.object(observer, "endpoint_alive", return_value=False),
+                  self.assertRaisesRegex(RuntimeError, "auth probe failed")):
+                with observer.shared_mavis_model(config, "test"):
+                    pass
+            park.assert_called_once()
+            self.assertNotIn("test-secret", (config.base_path / "settings.json").read_text())
+            self.assertIn(("release", "codex-mavis"), self.lease.calls)
+
+    def test_failed_start_after_auth_write_scrubs_only_after_empty_port(self):
+        with tempfile.TemporaryDirectory() as directory:
+            config = RuntimeConfig(home=Path(directory), api_key="test-secret",
+                                   allow_concurrent_local=True)
+            def start(_config, *, require_new):
+                self.assertTrue(require_new)
+                ensure_isolated_settings(_config)
+                raise RuntimeError("startup failed after owned group stopped")
+            with (patch.object(observer, "_lease_command", side_effect=self.lease),
+                  patch.object(observer, "loaded_generation_models", return_value=["iris-model"]),
+                  patch.object(observer, "require_idle_iris_handoff"),
+                  patch.object(observer, "reserve_empty_mavis_port", return_value=Mock()) as reserve,
+                  patch.object(observer, "start_server", side_effect=start),
+                  self.assertRaisesRegex(RuntimeError, "startup failed")):
+                with observer.shared_mavis_model(config, "test"):
+                    pass
+            self.assertEqual(reserve.call_count, 2)
+            self.assertNotIn("test-secret", (config.base_path / "settings.json").read_text())
+            self.assertIn(("release", "codex-mavis"), self.lease.calls)
+
+    def test_game_during_authenticated_generation_aborts_own_server(self):
+        with tempfile.TemporaryDirectory() as directory:
+            config = RuntimeConfig(home=Path(directory), api_key="test-secret",
+                                   allow_concurrent_local=True)
+            state = {"pid": 1234}
+            def start(_config, *, require_new):
+                self.assertTrue(require_new)
+                ensure_isolated_settings(_config)
+                write_json(_config.state_path, state)
+                return state
+            def generation(endpoint, **_kwargs):
+                return ["iris-model"] if endpoint == config.iris_endpoint else []
+            def status(*_args, **_kwargs):
+                return {"status": "ok", "active_requests": 1 if self.lease.game_live else 0,
+                        "waiting_requests": 0, "models_loading": 0}
+            with (patch.object(observer, "_lease_command", side_effect=self.lease),
+                  patch.object(observer, "loaded_generation_models", side_effect=generation),
+                  patch.object(observer, "require_idle_iris_handoff"),
+                  patch.object(observer, "reserve_empty_mavis_port", return_value=Mock()),
+                  patch.object(observer, "start_server", side_effect=start),
+                  patch.object(observer, "_prove_trial_auth"),
+                  patch.object(observer, "inventory", return_value=[{"id": config.model}]),
+                  patch.object(observer, "endpoint_alive", return_value=True),
+                  patch.object(observer, "load_model"),
+                  patch.object(observer, "request_json", side_effect=status),
+                  patch.object(observer, "stop_trial_server") as stop,
+                  patch.object(observer, "park_mavis_server") as park,
+                  patch.object(observer, "_failure_receipt",
+                               return_value=Path("/tmp/e0-auth-game.json"))):
+                with self.assertRaisesRegex(RuntimeError, "game state is unsafe"):
+                    with observer.shared_mavis_model(config, "test") as shared:
+                        shared["observation_child_pid"] = 4321
+                        self.lease.game_live = True
+            stop.assert_called_once_with(config, state)
+            park.assert_not_called()
+            self.assertNotIn("test-secret", (config.base_path / "settings.json").read_text())
+            self.assertIn(("release", "codex-mavis"), self.lease.calls)
+
+    def test_game_during_shielded_unload_aborts_exact_trial_server(self):
+        for had_child in (False, True):
+            with self.subTest(had_child=had_child):
+                self.lease.purpose = "our-e0"
+                self.lease.game_live = False
+                blocked = threading.Event()
+                entered = threading.Event()
+                stopped = {"yes": False}
+                def unload(*_args, **_kwargs):
+                    entered.set()
+                    self.lease.game_live = True
+                    blocked.wait(10)
+                    return {"status": "ok"}
+                def abort(_config, state, *, own_generation, own_unload, stopped):
+                    self.assertEqual(state, {"pid": 1234})
+                    self.assertEqual(own_generation, had_child)
+                    self.assertTrue(own_unload)
+                    stopped["yes"] = True
+                    blocked.set()
+                with (patch.object(observer, "_lease_command", side_effect=self.lease),
+                      patch.object(observer, "request_json", side_effect=unload),
+                      patch.object(observer, "loaded_generation_models", return_value=["iris-model"]),
+                      patch.object(observer, "_abort_observation_server", side_effect=abort) as stop,
+                      self.assertRaisesRegex(RuntimeError, "game state is unsafe")):
+                    observer._monitored_unload(self.config, "our-e0", {"pid": 1234},
+                                               stopped, ["iris-model"],
+                                               own_generation=had_child)
+                self.assertTrue(entered.is_set())
+                self.assertTrue(stopped["yes"])
+                stop.assert_called_once()
+
+    def test_scrub_failure_after_proven_park_releases_lease_with_receipt(self):
+        with tempfile.TemporaryDirectory() as directory:
+            config = RuntimeConfig(home=Path(directory), api_key="test-secret",
+                                   allow_concurrent_local=True)
+            state = {"pid": 1234}
+            write_json(config.state_path, state)
+            with (patch.object(observer, "_lease_command", side_effect=self.lease),
+                  patch.object(observer, "loaded_generation_models", side_effect=lambda endpoint, **_: (
+                      ["iris-model"] if endpoint == config.iris_endpoint else [])),
+                  patch.object(observer, "require_idle_iris_handoff"),
+                  patch.object(observer, "reserve_empty_mavis_port", return_value=Mock()),
+                  patch.object(observer, "start_server", return_value=state),
+                  patch.object(observer, "_prove_trial_auth"),
+                  patch.object(observer, "inventory", return_value=[{"id": config.model}]),
+                  patch.object(observer, "endpoint_alive", return_value=False),
+                  patch.object(observer, "request_json", return_value={
+                      "status": "ok", "active_requests": 0,
+                      "waiting_requests": 0, "models_loading": 0,
+                  }), patch.object(observer, "load_model"),
+                  patch.object(observer, "park_mavis_server", return_value=Mock()) as park,
+                  patch.object(observer, "clear_trial_auth_settings",
+                               side_effect=RuntimeError("scrub failed")),
+                  patch.object(observer, "stop_trial_server") as abort,
+                  patch.object(observer, "_failure_receipt",
+                               return_value=Path("/tmp/e0-auth-scrub.json")) as receipt):
+                with self.assertRaisesRegex(RuntimeError, "scrub failed"):
+                    with observer.shared_mavis_model(config, "test"):
+                        pass
+            park.assert_called_once()
+            abort.assert_not_called()
+            receipt.assert_called_once()
+            self.assertIn(("release", "codex-mavis"), self.lease.calls)
 
     def test_status_call_has_bounded_timeout(self):
         with patch.object(observer.subprocess, "run",

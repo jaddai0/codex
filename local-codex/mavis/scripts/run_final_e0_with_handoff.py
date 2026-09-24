@@ -7,6 +7,7 @@ import inspect
 import json
 import os
 from pathlib import Path
+import secrets
 import subprocess
 import sys
 import time
@@ -26,7 +27,8 @@ def main() -> int:
     output = service / "evaluations" / "e0" / "final-installed-shared.json"
     log = output.with_suffix(".log")
     live_log = output.with_name("tool-roundtrip-live.log")
-    config = RuntimeConfig(home=service, allow_concurrent_local=True)
+    config = RuntimeConfig(home=service, allow_concurrent_local=True,
+                           api_key=secrets.token_urlsafe(48))
 
     require_installed_selected_model(config)
     installed_package = share / "mavis"
@@ -53,6 +55,7 @@ def main() -> int:
     try:
         with shared_mavis_model(config, "installed Mavis E0 tool roundtrip") as shared:
             env["MAVIS_E0_SHARED_GPU_LEASE"] = "codex-mavis"
+            env["MAVIS_E0_TRIAL_API_KEY"] = config.api_key
             with live_log.open("wb") as stream:
                 result["tool_roundtrip_exit"] = run_monitored_observation(
                     config,
@@ -62,6 +65,7 @@ def main() -> int:
     except BaseException as error:
         result["error"] = repr(error)
     finally:
+        env.pop("MAVIS_E0_TRIAL_API_KEY", None)
         if shared is not None:
             result.update(shared)
         result["candidate_after"] = installed_candidate_fingerprint()

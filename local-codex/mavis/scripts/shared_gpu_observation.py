@@ -10,17 +10,22 @@ import subprocess
 import threading
 import time
 from typing import Iterator
+from urllib.error import HTTPError
 from urllib.parse import quote
 from uuid import uuid4
 
 from mavis.runtime import (
     RuntimeConfig,
+    _own_api,
+    _own_headers,
     _stop_spawned_process_group,
+    clear_trial_auth_settings,
     endpoint_alive,
     inventory,
     loaded_generation_models,
     load_model,
     park_mavis_server,
+    port_in_use,
     read_json,
     request_json,
     require_idle_iris_handoff,
@@ -72,7 +77,7 @@ def renew_gpu_lease() -> None:
 
 
 def _idle_mavis_server(config: RuntimeConfig) -> None:
-    status = request_json(config.endpoint, "/api/status")
+    status = request_json(config.endpoint, "/api/status", **_own_headers(config))
     if (not isinstance(status, dict) or status.get("status") != "ok"
             or any(type(status.get(key)) is not int or status[key] != 0 for key in
                    ("active_requests", "waiting_requests", "models_loading"))):
@@ -80,26 +85,62 @@ def _idle_mavis_server(config: RuntimeConfig) -> None:
 
 
 def _abort_observation_server(config: RuntimeConfig, state: dict[str, object], *,
-                              own_loading: bool = False) -> None:
-    if endpoint_alive(config.endpoint):
-        status = request_json(config.endpoint, "/api/status")
+                              own_loading: bool = False,
+                              own_generation: bool = False,
+                              own_unload: bool = False,
+                              stopped: dict[str, bool] | None = None) -> None:
+    if endpoint_alive(config.endpoint, **_own_api(config)):
+        status = request_json(config.endpoint, "/api/status", **_own_headers(config))
         if (not isinstance(status, dict) or status.get("status") != "ok"
                 or any(type(status.get(key)) is not int or status[key] < 0 for key in
                        ("active_requests", "waiting_requests", "models_loading"))):
             raise RuntimeError("Mavis server work status is untrusted before abort")
+        allowed_active = 1 if (own_loading and status["models_loading"]) else 0
+        if (own_generation or own_unload) and config.api_key and status["models_loading"] == 0:
+            settings = read_json(config.base_path / "settings.json")
+            auth = settings.get("auth") if isinstance(settings, dict) else None
+            if (not isinstance(auth, dict) or auth.get("api_key") != config.api_key or
+                    auth.get("skip_api_key_verification") is not False):
+                raise RuntimeError("Mavis trial authentication proof changed")
+            allowed_active = 1
         if (status["waiting_requests"] or
-                status["active_requests"] >
-                (1 if own_loading and status["models_loading"] else 0) or
+                status["active_requests"] > allowed_active or
                 (status["models_loading"] and not own_loading)):
             raise RuntimeError("Mavis has work outside this observation's load")
+    elif port_in_use(config.endpoint):
+        raise RuntimeError("Mavis occupied endpoint failed authenticated status check")
     stop_trial_server(config, state)
+    if stopped is not None:
+        stopped["yes"] = True
+    if config.api_key:
+        reservation = reserve_empty_mavis_port(config)
+        try:
+            clear_trial_auth_settings(config)
+        finally:
+            reservation.close()
+
+
+def _prove_trial_auth(config: RuntimeConfig) -> None:
+    if not config.api_key:
+        return
+    try:
+        request_json(config.endpoint, "/api/status", timeout=2)
+    except HTTPError as error:
+        if error.code != 401:
+            raise RuntimeError("Mavis trial unauthenticated probe had unexpected status") from error
+    else:
+        raise RuntimeError("Mavis trial server accepted a request without its key")
+    status = request_json(config.endpoint, "/api/status", timeout=2,
+                          **_own_headers(config))
+    if not isinstance(status, dict) or status.get("status") != "ok":
+        raise RuntimeError("Mavis trial authenticated status is untrusted")
 
 
 def _failure_receipt(config: RuntimeConfig, purpose: str,
                      error: BaseException, result: dict[str, object] | None = None) -> Path:
     def observed(endpoint: str) -> object:
         try:
-            return inventory(endpoint)
+            return inventory(endpoint, **(_own_api(config) if endpoint == config.endpoint else {}))
         except BaseException as failure:
             return {"inventory_error": str(failure)}
     path = config.home / "evaluations" / "shared-gpu-failures" / f"{uuid4().hex}.json"
@@ -154,16 +195,63 @@ def _monitored_load(config: RuntimeConfig, purpose: str,
                 renew_gpu_lease()
                 next_renew = time.monotonic() + 300
         except BaseException:
-            _abort_observation_server(config, server_state, own_loading=True)
-            stopped["yes"] = True
+            _abort_observation_server(config, server_state, own_loading=True,
+                                      stopped=stopped)
             done.wait(10)
             raise
     try:
         _owned_lease(purpose)
         _safe_game_state(_lease_command("status"))
     except BaseException:
-        _abort_observation_server(config, server_state)
-        stopped["yes"] = True
+        _abort_observation_server(config, server_state, stopped=stopped)
+        raise
+    if failures:
+        raise failures[0]
+
+
+def _monitored_unload(config: RuntimeConfig, purpose: str,
+                      server_state: dict[str, object], stopped: dict[str, bool],
+                      iris_models: list[str], *, own_generation: bool) -> None:
+    """Watch oMLX's shielded teardown until the model is gone or our server stops."""
+    done = threading.Event()
+    failures: list[BaseException] = []
+    def worker() -> None:
+        try:
+            request_json(
+                config.endpoint,
+                f"/v1/models/{quote(config.model, safe='')}/unload",
+                method="POST", timeout=180, **_own_headers(config),
+            )
+        except BaseException as error:
+            failures.append(error)
+        finally:
+            done.set()
+    threading.Thread(target=worker, name="mavis-observation-unload", daemon=True).start()
+    next_renew = time.monotonic() + 300
+    while not done.wait(0.5):
+        try:
+            _owned_lease(purpose)
+            _safe_game_state(_lease_command("status"))
+            if loaded_generation_models(config.iris_endpoint) != iris_models:
+                raise RuntimeError("IRIS generation inventory changed during Mavis unload")
+            if time.monotonic() >= next_renew:
+                renew_gpu_lease()
+                next_renew = time.monotonic() + 300
+        except BaseException:
+            _abort_observation_server(config, server_state,
+                                      own_generation=own_generation,
+                                      own_unload=True, stopped=stopped)
+            done.wait(10)
+            raise
+    try:
+        _owned_lease(purpose)
+        _safe_game_state(_lease_command("status"))
+        if loaded_generation_models(config.iris_endpoint) != iris_models:
+            raise RuntimeError("IRIS generation inventory changed after Mavis unload")
+    except BaseException:
+        _abort_observation_server(config, server_state,
+                                  own_generation=own_generation,
+                                  own_unload=True, stopped=stopped)
         raise
     if failures:
         raise failures[0]
@@ -249,7 +337,9 @@ def shared_mavis_model(
     server_state: dict[str, object] | None = None
     load_attempted = False
     stopped = {"yes": False}
+    server_stopped = False
     unsafe_startup = False
+    start_attempted = False
     iris_models: list[str] | None = None
     primary_error: BaseException | None = None
     try:
@@ -266,6 +356,7 @@ def shared_mavis_model(
         reservation = reserve_empty_mavis_port(config)
         reservation.close()
         try:
+            start_attempted = True
             server_state = start_server(config, require_new=True)
         except BaseException as error:
             unsafe_startup = bool(getattr(error, "unsafe_gpu_work", False))
@@ -273,9 +364,11 @@ def shared_mavis_model(
         server_pid = int(server_state["pid"])
         if read_json(config.state_path) != server_state:
             raise RuntimeError("Mavis server state changed during startup")
-        if not any(row.get("id") == config.model for row in inventory(config.endpoint)):
+        _prove_trial_auth(config)
+        if not any(row.get("id") == config.model for row in
+                   inventory(config.endpoint, **_own_api(config))):
             raise RuntimeError("Mavis selected model is absent from the new server")
-        if loaded_generation_models(config.endpoint):
+        if loaded_generation_models(config.endpoint, **_own_api(config)):
             raise RuntimeError("new Mavis server already has a generation model")
         _idle_mavis_server(config)
         _owned_lease(purpose)
@@ -295,36 +388,49 @@ def shared_mavis_model(
         gpu_stopped = ((server_state is None and not unsafe_startup) or stopped["yes"])
         try:
             _owned_lease(purpose)
+            if server_state is None and start_attempted and not unsafe_startup and config.api_key:
+                reservation = reserve_empty_mavis_port(config)
+                try:
+                    clear_trial_auth_settings(config)
+                finally:
+                    reservation.close()
             _safe_game_state(_lease_command("status"))
             if server_state is not None and not stopped["yes"]:
                 if read_json(config.state_path) != server_state:
                     raise RuntimeError("Mavis server identity changed before cleanup")
-                if load_attempted and endpoint_alive(config.endpoint):
-                    status = request_json(config.endpoint, "/api/status")
+                if load_attempted and endpoint_alive(config.endpoint, **_own_api(config)):
+                    status = request_json(config.endpoint, "/api/status", **_own_headers(config))
                     if (not isinstance(status, dict) or
                             type(status.get("models_loading")) is not int):
                         raise RuntimeError("Mavis model-loading status is untrusted")
                     if status["models_loading"]:
-                        _abort_observation_server(config, server_state, own_loading=True)
-                        stopped["yes"] = True
-                    loaded = [] if stopped["yes"] else loaded_generation_models(config.endpoint)
+                        _abort_observation_server(config, server_state, own_loading=True,
+                                                  stopped=stopped)
+                    loaded = [] if stopped["yes"] else loaded_generation_models(
+                        config.endpoint, **_own_api(config))
                     if loaded:
                         if loaded != [config.model]:
                             raise RuntimeError("Mavis generation inventory changed before cleanup")
                         _idle_mavis_server(config)
-                        request_json(
-                            config.endpoint,
-                            f"/v1/models/{quote(config.model, safe='')}/unload",
-                            method="POST", timeout=180,
+                        _monitored_unload(
+                            config, purpose, server_state, stopped, iris_models or [],
+                            own_generation=(config.api_key is not None and
+                                            result.get("observation_child_pid") is not None and
+                                            result.get("observation_child_safe") is True),
                         )
-                        if loaded_generation_models(config.endpoint):
+                        if loaded_generation_models(config.endpoint, **_own_api(config)):
                             raise RuntimeError("Mavis model remained loaded after unload")
                 if not stopped["yes"]:
                     reservation = park_mavis_server(
                         config, expected_pid=server_pid, expected_state=server_state
                     )
-                    reservation.close()
-                    if endpoint_alive(config.endpoint):
+                    server_stopped = True
+                    try:
+                        if config.api_key:
+                            clear_trial_auth_settings(config)
+                    finally:
+                        reservation.close()
+                    if endpoint_alive(config.endpoint, **_own_api(config)):
                         raise RuntimeError("Mavis did not park after the observation")
             gpu_stopped = not unsafe_startup and result["observation_child_safe"] is True
             result["mavis_loaded"] = False
@@ -333,14 +439,26 @@ def shared_mavis_model(
             result["iris_stayed_loaded"] = iris_models is not None
         except BaseException as error:
             cleanup_error = error
-            if server_state is not None and not stopped["yes"]:
+            if server_stopped or stopped["yes"]:
+                gpu_stopped = result["observation_child_safe"] is True
+                result["mavis_loaded"] = False
+            if server_state is not None and not stopped["yes"] and not server_stopped:
                 try:
-                    _abort_observation_server(config, server_state)
-                    stopped["yes"] = True
+                    _abort_observation_server(
+                        config, server_state,
+                        own_generation=(config.api_key is not None and
+                                        result.get("observation_child_pid") is not None and
+                                        result.get("observation_child_safe") is True),
+                        stopped=stopped,
+                    )
                     gpu_stopped = result["observation_child_safe"] is True
                     result["mavis_loaded"] = False
                 except BaseException as stop_error:
-                    cleanup_error = RuntimeError(f"{error}; trial server abort failed: {stop_error}")
+                    detail = "authentication cleanup" if stopped["yes"] else "abort"
+                    cleanup_error = RuntimeError(f"{error}; trial server {detail} failed: {stop_error}")
+                    if stopped["yes"]:
+                        gpu_stopped = result["observation_child_safe"] is True
+                        result["mavis_loaded"] = False
         finally:
             try:
                 if cleanup_error is not None:
