@@ -90,6 +90,7 @@ class PrepareRuntimeTests(unittest.TestCase):
                 env = os.environ.copy()
                 env.update({"HOME": str(root), "LOCAL_CODEX_SHARE_DIR": str(share),
                             "LOCAL_CODEX_HOME": str(root / "codex-home"), "MAVIS_HOME": str(mavis_home),
+                            "MAVIS_MEMORY_MCP_ENABLED": "0",
                             "LOCAL_CODEX_BIN": str(core), "MAVIS_GATEWAY_ROOT": str(gateway.parent.parent),
                             "OMLX_BASE_URL": f"http://127.0.0.1:{server.server_port}/v1",
                             "STUB_RUNTIME_ARGS": str(root / "runtime-args.json"),
@@ -437,6 +438,55 @@ class PrepareRuntimeTests(unittest.TestCase):
             self.assertEqual(profile.count("[mcp_servers.model-gateway]"), 1)
             self.assertIn(f'command = "{script.resolve()}"', profile)
             self.assertNotIn("[mcp_servers.openrouter]", profile)
+
+    def test_profile_registers_local_memory_bridge_with_disable_path(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            home = root / "home"
+            service = root / "service"
+            service.mkdir()
+            project = root / "project"
+            project.mkdir()
+            subprocess.run(["git", "init", "-q", str(project)], check=True)
+            models = root / "models"
+            models.mkdir()
+            prepare_runtime.write_profile(
+                home, "http://127.0.0.1:8001/v1", "local",
+                mavis_home=service, project_root=project, model_dir=models,
+            )
+            parsed = tomllib.loads((home / "config.toml").read_text())
+            memory = parsed["mcp_servers"]["mavis-memory"]
+            self.assertEqual(memory["args"], ["-m", "mavis.mcp_server"])
+            self.assertEqual(memory["command"], sys.executable)
+            self.assertEqual(memory["env"]["MAVIS_HOME"], str(service.resolve()))
+            self.assertEqual(memory["env"]["MAVIS_PROJECT_ROOT"], str(project.resolve()))
+            self.assertEqual(memory["env"]["MAVIS_LIBRARIAN_MODEL_PATH"],
+                             str((models / "Mavis-Qwen3.5-4B-HF-Eval").resolve()))
+            self.assertTrue(Path(memory["env"]["PYTHONPATH"]).is_dir())
+            self.assertNotIn("sandbox_workspace_write", parsed)
+            with patch.dict(os.environ, {"MAVIS_MEMORY_MCP_ENABLED": "0"}):
+                prepare_runtime.write_profile(
+                    home, "http://127.0.0.1:8001/v1", "local",
+                    mavis_home=service, project_root=project, model_dir=models,
+                )
+            disabled = tomllib.loads((home / "config.toml").read_text())
+            self.assertNotIn("mavis-memory", disabled.get("mcp_servers", {}))
+            (home / "config.toml").write_text(
+                '[mcp_servers.mavis-memory]\ncommand = "unmanaged"\n')
+            with patch.dict(os.environ, {"MAVIS_MEMORY_MCP_ENABLED": "0"}):
+                with self.assertRaisesRegex(ValueError, "existing Mavis memory"):
+                    prepare_runtime.write_profile(
+                        home, "http://127.0.0.1:8001/v1", "local",
+                        mavis_home=service, project_root=project,
+                    )
+            (home / "config.toml").write_text(
+                '[mcp_servers."mavis-memory"]\ncommand = "unmanaged"\n')
+            with patch.dict(os.environ, {"MAVIS_MEMORY_MCP_ENABLED": "0"}):
+                with self.assertRaisesRegex(ValueError, "existing Mavis memory"):
+                    prepare_runtime.write_profile(
+                        home, "http://127.0.0.1:8001/v1", "local",
+                        mavis_home=service, project_root=project,
+                    )
 
     def test_profile_passes_gateway_environment_file_path_only(self):
         with tempfile.TemporaryDirectory() as directory:

@@ -313,6 +313,9 @@ def write_profile(
     gateway_root: Path | None = None,
     gateway_env_file: Path | None = None,
     accepted_instructions_path: Path | None = None,
+    mavis_home: Path | None = None,
+    project_root: Path | None = None,
+    model_dir: Path | None = None,
 ) -> None:
     if gateway_env_file is not None and gateway_root is None:
         raise ValueError("gateway environment file requires a trusted gateway")
@@ -397,6 +400,31 @@ supports_standalone_web_search = false
                 "\n[mcp_servers.model-gateway.env]\n"
                 f"MODEL_GATEWAY_ENV_FILE = {json.dumps(str(env_file))}\n"
             )
+    memory_enabled = os.environ.get("MAVIS_MEMORY_MCP_ENABLED", "1").lower() not in {
+        "0", "false", "no"
+    }
+    if mavis_home is not None and project_root is not None and memory_enabled:
+        import importlib.util
+
+        if importlib.util.find_spec("mcp") is None:
+            raise RuntimeError("Mavis local memory MCP requires the Python mcp package")
+        module_dir = Path(__file__).resolve().parent
+        if (module_dir / "mavis" / "mavis" / "__init__.py").is_file():
+            python_root = module_dir / "mavis"
+        elif (module_dir / "mavis" / "__init__.py").is_file():
+            python_root = module_dir
+        else:
+            raise FileNotFoundError("Mavis local memory MCP package is unavailable")
+        profile += (
+            "\n[mcp_servers.mavis-memory]\n"
+            f"command = {json.dumps(sys.executable)}\n"
+            'args = ["-m", "mavis.mcp_server"]\n'
+            "\n[mcp_servers.mavis-memory.env]\n"
+            f"MAVIS_HOME = {json.dumps(str(mavis_home.resolve()))}\n"
+            f"MAVIS_PROJECT_ROOT = {json.dumps(str(project_root.resolve(strict=True)))}\n"
+            f"MAVIS_LIBRARIAN_MODEL_PATH = {json.dumps(str(((model_dir or Path.home() / 'models/vlms') / 'Mavis-Qwen3.5-4B-HF-Eval').resolve()))}\n"
+            f"PYTHONPATH = {json.dumps(str(python_root.resolve()))}\n"
+        )
     start_marker = "# BEGIN LOCAL CODEX MANAGED CONFIG"
     end_marker = "# END LOCAL CODEX MANAGED CONFIG"
     config_path = home / "config.toml"
@@ -420,10 +448,13 @@ supports_standalone_web_search = false
             ]
             if offsets:
                 suffix = current[min(offsets) :].lstrip("\n")
-    if gateway_root is not None and "[mcp_servers.model-gateway]" in suffix:
+    preserved_servers = tomllib.loads(suffix).get("mcp_servers", {}) if suffix else {}
+    if gateway_root is not None and "model-gateway" in preserved_servers:
         raise ValueError(
             "existing Mavis gateway registration needs review before replacement"
         )
+    if mavis_home is not None and "mavis-memory" in preserved_servers:
+        raise ValueError("existing Mavis memory registration needs review before replacement")
     managed = f"{start_marker}\n{profile}{end_marker}\n"
     if suffix:
         managed += f"\n{suffix}"
@@ -442,6 +473,7 @@ def main() -> int:
     parser.add_argument("--instructions-template", type=Path)
     parser.add_argument("--gateway-root", type=Path)
     parser.add_argument("--gateway-env-file", type=Path)
+    parser.add_argument("--model-dir", type=Path)
     args = parser.parse_args()
 
     accepted = accepted_main_profile(args.mavis_home) if args.mavis_home else None
@@ -475,8 +507,9 @@ def main() -> int:
     if accepted_instructions_path is not None:
         atomic_write(accepted_instructions_path, base_instructions)
     atomic_write(args.home / "omlx-models.json", json.dumps(catalog, indent=2) + "\n")
+    project = Path(os.environ["MAVIS_PROJECT_ROOT"]) if os.environ.get("MAVIS_PROJECT_ROOT") else None
     write_profile(args.home, base_url, selected, args.gateway_root, args.gateway_env_file,
-                  accepted_instructions_path)
+                  accepted_instructions_path, args.mavis_home, project, args.model_dir)
     ensure_persona(args.home, args.persona_template)
     if accepted:
         config_path = args.home / "config.toml"

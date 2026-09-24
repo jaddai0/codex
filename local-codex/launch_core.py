@@ -260,6 +260,7 @@ def managed_launch(args: argparse.Namespace, argv: list[str]) -> int:
             "--persona-template", str(share / "persona.toml"),
             "--instructions-template", str(share / "base-instructions.md"),
             "--gateway-root", str(args.gateway_root),
+            "--model-dir", str(args.model_dir),
             "--model", model,
         ]
         if args.gateway_env_file is not None:

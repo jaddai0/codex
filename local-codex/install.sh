@@ -7,11 +7,27 @@ install_share=${LOCAL_CODEX_INSTALL_SHARE:-${HOME}/.local/share/local-codex}
 
 python3 - "$repo_root" <<'PY'
 from pathlib import Path
+from importlib.metadata import PackageNotFoundError, version
 import subprocess
 import sys
 
+try:
+    mcp_version = version("mcp")
+except PackageNotFoundError as error:
+    raise SystemExit("Mavis install requires Python mcp>=1.16,<2") from error
+parts = mcp_version.split(".")
+if len(parts) < 2 or not parts[0].isdigit() or not parts[1].isdigit() or \
+        int(parts[0]) != 1 or int(parts[1]) < 16:
+    raise SystemExit(f"Mavis install requires Python mcp>=1.16,<2; found {mcp_version}")
+
 source = Path(sys.argv[1]).resolve(strict=True)
 revision = subprocess.check_output(["git", "-C", str(source), "rev-parse", "HEAD"], text=True).strip()
+dirty = subprocess.check_output(
+    ["git", "-C", str(source), "status", "--porcelain=v1", "--untracked-files=all"],
+    text=True,
+)
+if dirty:
+    raise SystemExit("Mavis install requires a clean committed source checkout")
 base = "local-codex/mavis/mavis"
 committed = set(subprocess.check_output(
     ["git", "-C", str(source), "ls-tree", "-r", "--name-only", revision, base],
@@ -48,8 +64,12 @@ find "$install_share/mavis" -type f -name '*.pyc' -delete
 find "$install_share/mavis" -type d -exec chmod 0755 {} +
 find "$install_share/mavis" -type f -exec chmod 0644 {} +
 
-PYTHONPATH="$install_share${PYTHONPATH:+:$PYTHONPATH}" python3 - "$install_share" "$install_bin/mavis" "$repo_root" <<'PY'
+desktop_launcher=${MAVIS_DESKTOP_LAUNCHER:-${HOME}/Desktop/Mavis.command}
+install -m 0755 "$repo_root/local-codex/mavis/Mavis.command" "$desktop_launcher"
+
+PYTHONPATH="$install_share${PYTHONPATH:+:$PYTHONPATH}" python3 - "$install_share" "$install_bin/mavis" "$repo_root" "$desktop_launcher" <<'PY'
 import hashlib
+from importlib.metadata import version
 import json
 from pathlib import Path
 import subprocess
@@ -59,7 +79,14 @@ from mavis.package_provenance import package_tree_sha256
 share = Path(sys.argv[1]).resolve()
 launcher = Path(sys.argv[2]).resolve()
 source = Path(sys.argv[3]).resolve(strict=True)
+desktop_launcher = Path(sys.argv[4]).resolve(strict=True)
 revision = subprocess.check_output(["git", "-C", str(source), "rev-parse", "HEAD"], text=True).strip()
+dirty = subprocess.check_output(
+    ["git", "-C", str(source), "status", "--porcelain=v1", "--untracked-files=all"],
+    text=True,
+)
+if dirty:
+    raise SystemExit("Mavis install source changed while installing")
 committed_package = subprocess.check_output(
     ["git", "-C", str(source), "ls-tree", "-r", "--name-only", revision,
      "local-codex/mavis/mavis"], text=True,
@@ -71,6 +98,21 @@ for relative in committed_package:
     committed = subprocess.check_output(["git", "-C", str(source), "show", f"{revision}:{relative}"])
     if not installed.is_file() or installed.read_bytes() != committed:
         raise SystemExit(f"installed Mavis source differs from Git revision: {relative}")
+installed_sources = {
+    "local-codex/bin/local-codex": [launcher, launcher.with_name("local-codex")],
+    "local-codex/prepare_runtime.py": [share / "prepare_runtime.py"],
+    "local-codex/launch_core.py": [share / "launch_core.py"],
+    "local-codex/generation_lease.py": [share / "generation_lease.py"],
+    "local-codex/trial_runtime.py": [share / "trial_runtime.py"],
+    "local-codex/persona.toml": [share / "persona.toml"],
+    "codex-rs/models-manager/prompt.md": [share / "base-instructions.md"],
+    "local-codex/mavis/Mavis.command": [desktop_launcher],
+}
+for relative, destinations in installed_sources.items():
+    committed = subprocess.check_output(["git", "-C", str(source), "show", f"{revision}:{relative}"])
+    for installed in destinations:
+        if not installed.is_file() or installed.read_bytes() != committed:
+            raise SystemExit(f"installed Mavis source differs from Git revision: {relative}")
 core = share / "local-codex-core"
 manifest = {
     "schema_version": "mavis.installed-core/v1",
@@ -85,6 +127,8 @@ manifest = {
     "base_instructions_sha256": hashlib.sha256((share / "base-instructions.md").read_bytes()).hexdigest(),
     "persona_sha256": hashlib.sha256((share / "persona.toml").read_bytes()).hexdigest(),
     "mavis_package_sha256": package_tree_sha256(share / "mavis"),
+    "python_executable": sys.executable,
+    "mcp_version": version("mcp"),
     "source_repository": str(source),
     "source_revision": revision,
 }
@@ -93,8 +137,5 @@ temporary = share / ".install-manifest.json.tmp"
 temporary.write_text(json.dumps(manifest, sort_keys=True, indent=2) + "\n")
 temporary.replace(path)
 PY
-
-desktop_launcher=${MAVIS_DESKTOP_LAUNCHER:-${HOME}/Desktop/Mavis.command}
-install -m 0755 "$repo_root/local-codex/mavis/Mavis.command" "$desktop_launcher"
 
 print "Installed $install_bin/mavis and $desktop_launcher (with local-codex compatibility command)"
