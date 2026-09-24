@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 import os
 from pathlib import Path
+import secrets
 import subprocess
 import sys
 import uuid
@@ -21,7 +22,8 @@ from shared_gpu_observation import shared_mavis_model
 def main() -> int:
     home = Path.home()
     service = home / ".local-codex" / "mavis-service"
-    config = RuntimeConfig(home=service, allow_concurrent_local=True)
+    config = RuntimeConfig(home=service, allow_concurrent_local=True,
+                           api_key=secrets.token_urlsafe(48))
     task = service / "evaluations" / "e0" / f"buried-live-{uuid.uuid4().hex}"
     repo = task / "repo"
     repo.mkdir(parents=True)
@@ -67,6 +69,7 @@ def main() -> int:
                                      stdout=log, stderr=subprocess.STDOUT,
                                      env={**os.environ, "MAVIS_PROJECT_DIR": str(repo),
                                           "PYTHONDONTWRITEBYTECODE": "1",
+                                          "MAVIS_E0_TRIAL_API_KEY": config.api_key,
                                           "MAVIS_GENERATION_LEASE_FD": str(lease_fd)},
                                      pass_fds=(lease_fd,), timeout=900)
             result["mavis_exit"] = run.returncode

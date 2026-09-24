@@ -64,8 +64,11 @@ def local_base_url(raw: str) -> str:
     return f"http://{parsed.netloc}/v1"
 
 
-def read_json(url: str) -> object:
-    request = Request(url, headers={"Accept": "application/json"})
+def read_json(url: str, *, api_key: str | None = None) -> object:
+    headers = {"Accept": "application/json"}
+    if api_key:
+        headers["Authorization"] = f"Bearer {api_key}"
+    request = Request(url, headers=headers)
     with urlopen(request, timeout=10) as response:
         return json.load(response)
 
@@ -336,6 +339,8 @@ def write_profile(
     mavis_home: Path | None = None,
     project_root: Path | None = None,
     model_dir: Path | None = None,
+    *,
+    trial_auth: bool = False,
 ) -> None:
     if gateway_env_file is not None and gateway_root is None:
         raise ValueError("gateway environment file requires a trusted gateway")
@@ -348,6 +353,9 @@ def write_profile(
     )
     instructions_line = (f"model_instructions_file = {json.dumps(str(accepted_instructions_path.resolve()))}\n"
                          if accepted_instructions_path else "")
+    trial_provider_line = ('env_key = "MAVIS_E0_TRIAL_API_KEY"\n' if trial_auth else "")
+    trial_shell_policy = ('\n[shell_environment_policy]\n'
+                          'exclude = ["MAVIS_E0_TRIAL_API_KEY"]\n' if trial_auth else "")
     profile = f"""model = {json.dumps(selected)}
 model_provider = "omlx"
 model_catalog_json = {json.dumps(str(catalog_path))}
@@ -370,7 +378,7 @@ apps = false
 multi_agent = true
 plugins = false
 remote_plugin = false
-shell_snapshot = true
+shell_snapshot = {str(not trial_auth).lower()}
 tool_suggest = false
 unified_exec = true
 
@@ -399,9 +407,9 @@ name = "Local oMLX"
 base_url = {json.dumps(base_url)}
 wire_api = "responses"
 requires_openai_auth = false
-supports_websockets = false
+{trial_provider_line}supports_websockets = false
 supports_standalone_web_search = false
-"""
+{trial_shell_policy}"""
     if gateway_root is not None:
         gateway_script = gateway_root.resolve() / "bin" / "mcp-server.sh"
         if not gateway_script.is_file() or not os.access(gateway_script, os.X_OK):
@@ -509,7 +517,9 @@ def main() -> int:
 
     base_url = local_base_url(args.base_url)
     origin = base_url.removesuffix("/v1")
-    payload = read_json(f"{origin}/admin/api/models")
+    trial_key = os.environ.get("MAVIS_E0_TRIAL_API_KEY") or None
+    payload = (read_json(f"{origin}/v1/models/status", api_key=trial_key)
+               if trial_key else read_json(f"{origin}/admin/api/models"))
     records = payload.get("models", payload) if isinstance(payload, dict) else payload
     if not isinstance(records, list) or not all(
         isinstance(item, dict) for item in records
@@ -530,7 +540,8 @@ def main() -> int:
     atomic_write(args.home / "omlx-models.json", json.dumps(catalog, indent=2) + "\n")
     project = Path(os.environ["MAVIS_PROJECT_ROOT"]) if os.environ.get("MAVIS_PROJECT_ROOT") else None
     write_profile(args.home, base_url, selected, args.gateway_root, args.gateway_env_file,
-                  accepted_instructions_path, args.mavis_home, project, args.model_dir)
+                  accepted_instructions_path, args.mavis_home, project, args.model_dir,
+                  trial_auth=trial_key is not None)
     ensure_persona(args.home, args.persona_template)
     if accepted:
         config_path = args.home / "config.toml"

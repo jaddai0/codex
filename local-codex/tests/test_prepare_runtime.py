@@ -1,4 +1,5 @@
 import importlib.util
+import io
 import json
 from pathlib import Path
 import tempfile
@@ -24,6 +25,66 @@ SPEC.loader.exec_module(prepare_runtime)
 
 
 class PrepareRuntimeTests(unittest.TestCase):
+    def test_launcher_git_probe_does_not_inherit_trial_key(self):
+        import launch_core
+
+        with tempfile.TemporaryDirectory() as directory:
+            completed = subprocess.CompletedProcess(["git"], 1, stdout="")
+            with (patch.dict(os.environ, {"MAVIS_E0_TRIAL_API_KEY": "fixture-key"}),
+                  patch.object(launch_core.subprocess, "run", return_value=completed) as run):
+                self.assertIsNone(launch_core.bind_project_root(
+                    ["core", "-C", directory, "exec", "check"],
+                ))
+            self.assertNotIn("MAVIS_E0_TRIAL_API_KEY", run.call_args.kwargs["env"])
+
+    def test_private_trial_uses_authenticated_public_inventory_and_excludes_shell_key(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            home = root / "codex"
+            instructions = root / "base.md"
+            instructions.write_text("Base instructions\n")
+            persona = root / "persona.toml"
+            persona.write_text('name = "Mavis"\n')
+            argv = ["prepare_runtime.py", "--home", str(home), "--base-url",
+                    "http://127.0.0.1:8001/v1", "--persona-template", str(persona),
+                    "--instructions-template", str(instructions)]
+            records = [{"id": "model-a", "model_type": "llm", "loaded": True}]
+            with (patch.dict(os.environ, {"MAVIS_E0_TRIAL_API_KEY": "fixture-key"}),
+                  patch.object(sys, "argv", argv),
+                  patch.object(prepare_runtime, "read_json", return_value=records) as fetch):
+                self.assertEqual(prepare_runtime.main(), 0)
+            fetch.assert_called_once_with(
+                "http://127.0.0.1:8001/v1/models/status", api_key="fixture-key",
+            )
+            profile_bytes = (home / "config.toml").read_bytes()
+            self.assertNotIn(b"fixture-key", profile_bytes)
+            profile = tomllib.loads(profile_bytes.decode())
+            self.assertEqual(profile["model_providers"]["omlx"]["env_key"],
+                             "MAVIS_E0_TRIAL_API_KEY")
+            self.assertEqual(profile["shell_environment_policy"]["exclude"],
+                             ["MAVIS_E0_TRIAL_API_KEY"])
+            self.assertIs(profile["features"]["shell_snapshot"], False)
+
+            with (patch.dict(os.environ, {"MAVIS_E0_TRIAL_API_KEY": ""}),
+                  patch.object(sys, "argv", argv),
+                  patch.object(prepare_runtime, "read_json", return_value=records) as fetch):
+                self.assertEqual(prepare_runtime.main(), 0)
+            fetch.assert_called_once_with("http://127.0.0.1:8001/admin/api/models")
+            normal = tomllib.loads((home / "config.toml").read_text())
+            self.assertNotIn("env_key", normal["model_providers"]["omlx"])
+            self.assertNotIn("shell_environment_policy", normal)
+            self.assertIs(normal["features"]["shell_snapshot"], True)
+
+    def test_private_inventory_request_sends_bearer_header(self):
+        with patch.object(prepare_runtime, "urlopen",
+                          return_value=io.BytesIO(b'{"models":[]}')) as open_url:
+            self.assertEqual(prepare_runtime.read_json(
+                "http://127.0.0.1:8001/v1/models/status", api_key="fixture-key",
+            ), {"models": []})
+        request = open_url.call_args.args[0]
+        self.assertEqual(request.get_header("Authorization"), "Bearer fixture-key")
+        self.assertNotIn("fixture-key", request.full_url)
+
     def test_bootstrap_baseline_prompt_and_pointer_bound_launch_receipt(self):
         import launch_core
         from mavis.experiments import ExperimentStore

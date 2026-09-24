@@ -51,6 +51,48 @@ class FakeProcess:
 
 
 class RuntimeTests(unittest.TestCase):
+    def test_trial_key_is_absent_from_listener_process_probes(self):
+        completed = subprocess.CompletedProcess(["lsof"], 0, stdout="")
+        with (patch.dict(os.environ, {"MAVIS_E0_TRIAL_API_KEY": "fixture-key"}),
+              patch("mavis.runtime.subprocess.run", return_value=completed) as run):
+            self.assertEqual(runtime._listener_pids(8001), set())
+            self.assertEqual(runtime._process_open_paths(1234), set())
+        self.assertEqual(run.call_count, 2)
+        for call in run.call_args_list:
+            self.assertNotIn("MAVIS_E0_TRIAL_API_KEY", call.kwargs["env"])
+
+    def test_trial_accepts_omlx_null_key_default_before_own_key_is_written(self):
+        with tempfile.TemporaryDirectory() as directory:
+            config = RuntimeConfig(home=Path(directory), api_key="test-secret")
+            settings_path = config.base_path / "settings.json"
+            write_json(settings_path, {"version": "1.0", "auth": {
+                "api_key": None, "skip_api_key_verification": True,
+            }})
+            runtime.reject_residual_trial_auth(config)
+            ensure_isolated_settings(config)
+            self.assertEqual(runtime.read_json(settings_path)["auth"], {
+                "api_key": "test-secret", "skip_api_key_verification": False,
+            })
+
+    def test_trial_rejects_unsafe_null_or_residual_auth_settings(self):
+        with tempfile.TemporaryDirectory() as directory:
+            config = RuntimeConfig(home=Path(directory), api_key="test-secret")
+            settings_path = config.base_path / "settings.json"
+            for auth in (
+                {"api_key": None, "skip_api_key_verification": False},
+                {"api_key": None, "skip_api_key_verification": "true"},
+                {"api_key": None},
+                {"api_key": "", "skip_api_key_verification": True},
+                {"api_key": "another-secret", "skip_api_key_verification": True},
+                {"skip_api_key_verification": False},
+            ):
+                with self.subTest(auth=auth):
+                    write_json(settings_path, {"version": "1.0", "auth": auth})
+                    original = settings_path.read_bytes()
+                    with self.assertRaisesRegex(RuntimeError, "residual Mavis trial"):
+                        runtime.reject_residual_trial_auth(config)
+                    self.assertEqual(settings_path.read_bytes(), original)
+
     def test_trial_rejects_persisted_pinned_preload_before_spawn(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
@@ -112,6 +154,9 @@ class RuntimeTests(unittest.TestCase):
             binary.chmod(0o700)
             config = RuntimeConfig(home=root / "home", omlx_binary=binary,
                                    api_key="test-secret")
+            write_json(config.base_path / "settings.json", {"version": "1.0", "auth": {
+                "api_key": None, "skip_api_key_verification": True,
+            }})
             observed: list[int] = []
             calls = 0
             def heartbeat() -> None:

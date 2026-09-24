@@ -144,7 +144,8 @@ def bind_project_root(argv: list[str]) -> Path | None:
     if explicit_dir and selected and Path(explicit_dir).resolve(strict=True) != anchor:
         raise ValueError("MAVIS_PROJECT_DIR differs from -C/--cd")
     git_env = {name: value for name, value in os.environ.items() if name not in
-               {"GIT_DIR", "GIT_WORK_TREE", "GIT_COMMON_DIR", "GIT_INDEX_FILE", "GIT_PREFIX"}}
+               {"GIT_DIR", "GIT_WORK_TREE", "GIT_COMMON_DIR", "GIT_INDEX_FILE", "GIT_PREFIX",
+                "MAVIS_E0_TRIAL_API_KEY"}}
     git = subprocess.run(
         ["git", "rev-parse", "--show-toplevel"], cwd=anchor, text=True,
         stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, env=git_env, check=False,

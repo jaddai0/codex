@@ -1,6 +1,7 @@
 """No-GPU fault tests for the installed observation wrapper."""
 
 from pathlib import Path
+import ast
 import importlib.util
 import json
 import subprocess
@@ -49,6 +50,55 @@ class Lease:
 
 
 class SharedGpuObservationTests(unittest.TestCase):
+    def test_every_shared_model_script_creates_and_passes_a_private_trial_key(self):
+        scripts = SCRIPT.parent
+        expected = {
+            "observe_small_repository.py", "observe_buried_failure.py",
+            "observe_compaction_restart.py", "observe_heldout_e2.py",
+            "observe_phase2_repeated_compaction.py", "run_final_e0_with_handoff.py",
+        }
+        callers = {}
+        for path in scripts.glob("*.py"):
+            tree = ast.parse(path.read_text(encoding="utf-8"), filename=str(path))
+            if any(isinstance(node, ast.Call) and isinstance(node.func, ast.Name)
+                   and node.func.id == "shared_mavis_model" for node in ast.walk(tree)):
+                callers[path.name] = tree
+        self.assertEqual(set(callers), expected)
+
+        def own_key(node):
+            return (isinstance(node, ast.Attribute) and node.attr == "api_key"
+                    and isinstance(node.value, ast.Name) and node.value.id == "config")
+
+        for name, tree in callers.items():
+            with self.subTest(script=name):
+                calls = [node for node in ast.walk(tree) if isinstance(node, ast.Call)]
+                self.assertTrue(any(
+                    isinstance(call.func, ast.Name) and call.func.id == "RuntimeConfig"
+                    and any(keyword.arg == "api_key"
+                            and isinstance(keyword.value, ast.Call)
+                            and isinstance(keyword.value.func, ast.Attribute)
+                            and isinstance(keyword.value.func.value, ast.Name)
+                            and keyword.value.func.value.id == "secrets"
+                            and keyword.value.func.attr == "token_urlsafe"
+                            for keyword in call.keywords)
+                    for call in calls
+                ))
+                env_values = [
+                    value for node in ast.walk(tree) if isinstance(node, ast.Dict)
+                    for key, value in zip(node.keys, node.values)
+                    if isinstance(key, ast.Constant) and key.value == "MAVIS_E0_TRIAL_API_KEY"
+                ]
+                env_values.extend(
+                    node.value for node in ast.walk(tree) if isinstance(node, ast.Assign)
+                    and any(isinstance(target, ast.Subscript)
+                            and isinstance(target.value, ast.Name)
+                            and target.value.id == "env"
+                            and isinstance(target.slice, ast.Constant)
+                            and target.slice.value == "MAVIS_E0_TRIAL_API_KEY"
+                            for target in node.targets)
+                )
+                self.assertTrue(any(own_key(value) for value in env_values))
+
     def setUp(self):
         self.directory = tempfile.TemporaryDirectory()
         self.addCleanup(self.directory.cleanup)

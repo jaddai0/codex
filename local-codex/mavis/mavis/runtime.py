@@ -164,6 +164,8 @@ def require_installed_selected_model(config: RuntimeConfig) -> None:
     result = subprocess.run(
         [sys.executable, str(prepare), "--mavis-home", str(config.home), "--resolve-model"],
         text=True, capture_output=True, timeout=15, check=True,
+        env={key: value for key, value in os.environ.items()
+             if key != "MAVIS_E0_TRIAL_API_KEY"},
     )
     if result.stdout.strip() != config.model:
         raise RuntimeError("installed launcher selects a different Mavis model")
@@ -177,7 +179,9 @@ def omlx_runtime_fingerprint(config: RuntimeConfig) -> dict[str, Any]:
               "print(json.dumps({name:importlib.util.find_spec(name).origin "
               "for name in sys.argv[1:]}))")
     result = subprocess.run([str(python), "-c", script, *modules],
-                            text=True, capture_output=True, check=True, timeout=15)
+                            text=True, capture_output=True, check=True, timeout=15,
+                            env={key: value for key, value in os.environ.items()
+                                 if key != "MAVIS_E0_TRIAL_API_KEY"})
     paths = json.loads(result.stdout)
     if set(paths) != set(modules):
         raise RuntimeError("oMLX runtime source mapping is incomplete")
@@ -254,7 +258,8 @@ def omlx_live_process_binding(config: RuntimeConfig, endpoint: str,
         raise RuntimeError("live oMLX selected model path differs from fingerprinted model")
     result = subprocess.run(["ps", "-p", str(pid), "-o", "lstart="],
                             text=True, capture_output=True, check=True, timeout=5,
-                            env={**os.environ, "LC_ALL": "C"})
+                            env={**{key: value for key, value in os.environ.items()
+                                    if key != "MAVIS_E0_TRIAL_API_KEY"}, "LC_ALL": "C"})
     started = datetime.strptime(result.stdout.strip(), "%a %b %d %H:%M:%S %Y").timestamp()
     package = Path(runtime["package_path"])
     latest_source = max(path.stat().st_mtime for path in package.rglob("*.py")
@@ -415,6 +420,8 @@ def _listener_pids(port: int) -> set[int]:
         stderr=subprocess.DEVNULL,
         timeout=1,
         check=False,
+        env={key: value for key, value in os.environ.items()
+             if key != "MAVIS_E0_TRIAL_API_KEY"},
     )
     return {
         int(line[1:])
@@ -431,6 +438,8 @@ def _process_open_paths(pid: int) -> set[Path]:
         stderr=subprocess.DEVNULL,
         timeout=1,
         check=False,
+        env={key: value for key, value in os.environ.items()
+             if key != "MAVIS_E0_TRIAL_API_KEY"},
     )
     return {
         Path(line[1:])
@@ -545,7 +554,14 @@ def reject_residual_trial_auth(config: RuntimeConfig) -> None:
     auth = settings.get("auth", {})
     if not isinstance(auth, dict):
         raise RuntimeError("Mavis trial authentication settings are malformed")
+    # oMLX persists its unauthenticated default as an explicit JSON null.
+    # Only that value with verification skipped is equivalent to no key.
     if "api_key" in auth:
+        safe_default = (auth["api_key"] is None and
+                        auth.get("skip_api_key_verification") is True)
+    else:
+        safe_default = auth.get("skip_api_key_verification", True) is True
+    if not safe_default:
         error = RuntimeError("residual Mavis trial authentication requires recovery")
         error.residual_trial_auth = True
         raise error

@@ -12,6 +12,7 @@ import json
 import os
 from pathlib import Path
 import pty
+import secrets
 import select
 import signal
 import struct
@@ -178,7 +179,8 @@ def _run_tui(command: list[str], *, repo: Path, env: dict[str, str],
 @with_mavis_handoff_lease("observe_heldout_e2")
 def main() -> int:
     service = Path.home() / ".local-codex" / "mavis-service"
-    config = RuntimeConfig(home=service, allow_concurrent_local=True)
+    config = RuntimeConfig(home=service, allow_concurrent_local=True,
+                           api_key=secrets.token_urlsafe(48))
     manifest_path = prepare_heldout(service)
     task = manifest_path.parent
     repo = task / "repo"
@@ -213,7 +215,9 @@ def main() -> int:
     shared: dict[str, object] | None = None
     try:
         with shared_mavis_model(config, "installed Mavis held-out E2") as shared:
-            env = {**os.environ, "MAVIS_PROJECT_DIR": str(repo), "PYTHONDONTWRITEBYTECODE": "1"}
+            env = {**os.environ, "MAVIS_PROJECT_DIR": str(repo),
+                   "MAVIS_E0_TRIAL_API_KEY": config.api_key,
+                   "PYTHONDONTWRITEBYTECODE": "1"}
             nonce = uuid.uuid4().hex
             result["prompt_nonce"] = nonce
             first_argv, _unused_resume = task_launch_commands(repo, "pending", nonce)

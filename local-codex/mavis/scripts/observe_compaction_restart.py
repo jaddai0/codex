@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 import os
 from pathlib import Path
+import secrets
 import signal
 import subprocess
 import sys
@@ -50,7 +51,8 @@ def events(path: Path) -> list[dict]:
 def main() -> int:
     home = Path.home()
     service = home / ".local-codex" / "mavis-service"
-    config = RuntimeConfig(home=service, allow_concurrent_local=True)
+    config = RuntimeConfig(home=service, allow_concurrent_local=True,
+                           api_key=secrets.token_urlsafe(48))
     task = service / "evaluations" / "e0" / f"compaction-live-{uuid.uuid4().hex}"
     task.mkdir(parents=True)
     workspace = Path(tempfile.mkdtemp(prefix="mavis-e0-compact-", dir="/private/tmp")).resolve()
@@ -80,6 +82,7 @@ def main() -> int:
             env = {"CODEX_HOME": str(home / ".local-codex"),
                    "MAVIS_PROJECT_DIR": str(workspace),
                    "MAVIS_PROJECT_ROOT": str(workspace),
+                   "MAVIS_E0_TRIAL_API_KEY": config.api_key,
                    "PYTHONDONTWRITEBYTECODE": "1"}
             env = {**os.environ, **env}
             _pid, rollout, rows, first_exit = _run_stage(

@@ -14,6 +14,7 @@ import os
 from pathlib import Path
 import pty
 import select
+import secrets
 import signal
 import struct
 import subprocess
@@ -295,7 +296,8 @@ def main() -> int:
 
     home = Path.home()
     service = home / ".local-codex" / "mavis-service"
-    config = RuntimeConfig(home=service, allow_concurrent_local=True)
+    config = RuntimeConfig(home=service, allow_concurrent_local=True,
+                           api_key=secrets.token_urlsafe(48))
     task = service / "evaluations" / "phase2" / f"repeated-compaction-{uuid.uuid4().hex}"
     task.mkdir(parents=True)
     workspace = Path(tempfile.mkdtemp(prefix="mavis-p2-compact-", dir="/private/tmp")).resolve()
@@ -333,6 +335,7 @@ def main() -> int:
             env = {**os.environ, "CODEX_HOME": str(home / ".local-codex"),
                    "MAVIS_PROJECT_DIR": str(workspace),
                    "MAVIS_PROJECT_ROOT": str(workspace),
+                   "MAVIS_E0_TRIAL_API_KEY": config.api_key,
                    "PYTHONDONTWRITEBYTECODE": "1"}
             commands = [
                 [launcher, "--no-daemon", "--no-alt-screen", "-C", str(workspace), prompts[0]],
