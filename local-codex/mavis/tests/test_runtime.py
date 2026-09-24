@@ -147,6 +147,27 @@ class RuntimeTests(unittest.TestCase):
             ), self.assertRaisesRegex(RuntimeError, "handoff refused"):
                 require_idle_iris_handoff(config, interval_seconds=0)
 
+    def test_handoff_preserves_a_distinct_iris_generation_model(self):
+        config = RuntimeConfig(home=Path("/tmp/mavis-handoff-test"), model="mavis-model")
+        idle = {"status": "ok", "loaded_models": ["iris-qwen"], "models_loading": 0,
+                "active_requests": 0, "waiting_requests": 0}
+        with patch("mavis.runtime.request_json", return_value=idle), patch(
+            "mavis.runtime.loaded_generation_models", return_value=["iris-qwen"]
+        ), patch("mavis.runtime.time.sleep"):
+            require_idle_iris_handoff(config, expected_models=["iris-qwen"])
+        with patch("mavis.runtime.request_json", return_value=idle), patch(
+            "mavis.runtime.loaded_generation_models", return_value=["changed"]
+        ), patch("mavis.runtime.time.sleep"), self.assertRaisesRegex(
+            RuntimeError, "inventory changed"
+        ):
+            require_idle_iris_handoff(config, expected_models=["iris-qwen"])
+        with patch("mavis.runtime.request_json", side_effect=[
+            idle, {**idle, "loaded_models": ["iris-qwen", "new-model"]}
+        ]), patch("mavis.runtime.time.sleep"), self.assertRaisesRegex(
+            RuntimeError, "status changed"
+        ):
+            require_idle_iris_handoff(config, expected_models=["iris-qwen"])
+
     def test_handoff_requires_installed_launcher_model_match(self):
         config = RuntimeConfig(home=Path("/tmp/mavis-handoff-test"))
         with patch("mavis.runtime.subprocess.run") as run:
@@ -276,6 +297,19 @@ class RuntimeTests(unittest.TestCase):
                 result = admission(config, now=10000)
             self.assertFalse(result["allowed"])
             self.assertIn("not proven idle", result["reasons"][0])
+
+    def test_concurrent_override_accepts_distinct_iris_model_after_fifteen_minutes(self):
+        with tempfile.TemporaryDirectory() as directory:
+            config = RuntimeConfig(home=Path(directory), model="mavis-model",
+                                   reserve_bytes=10, allow_concurrent_local=True)
+            own = [{"id": "mavis-model", "estimated_size": 100}]
+            iris = [{"id": "iris-qwen", "model_type": "llm", "loaded": True,
+                     "last_access": 9099}]
+            with patch("mavis.runtime.inventory", side_effect=[own, iris]), patch(
+                "mavis.runtime.available_memory_bytes", return_value=1000
+            ), patch("mavis.runtime.endpoint_alive", return_value=True):
+                decision = admission(config, now=10000)
+            self.assertTrue(decision["allowed"])
 
     def test_admission_requires_model_plus_reserve(self):
         with tempfile.TemporaryDirectory() as directory:

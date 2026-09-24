@@ -11,6 +11,7 @@ import subprocess
 import sys
 import os
 import time
+from typing import Callable
 
 from prepare_runtime import accepted_main_profile, atomic_write
 from generation_lease import generation_lease
@@ -361,23 +362,26 @@ def _launch_unlocked(receipt_path: Path | None, argv: list[str]) -> int:
 
 
 def launch_trial(
-    receipt_path: Path, argv: list[str], *, lease_held: bool = False
+    receipt_path: Path, argv: list[str], *, lease_held: bool = False,
+    heartbeat: Callable[[], None] | None = None,
 ) -> int:
     """Run a frozen E1 arm; process exit alone never establishes trial success."""
     if not lease_held:
         receipt = json.loads(receipt_path.read_text(encoding="utf-8"))
         with generation_lease(Path(receipt["mavis_home"]), purpose="e1-trial"):
-            return _launch_trial_unlocked(receipt_path, argv)
-    return _launch_trial_unlocked(receipt_path, argv)
+            return _launch_trial_unlocked(receipt_path, argv, heartbeat=heartbeat)
+    return _launch_trial_unlocked(receipt_path, argv, heartbeat=heartbeat)
 
 
-def _launch_trial_unlocked(receipt_path: Path, argv: list[str]) -> int:
+def _launch_trial_unlocked(receipt_path: Path, argv: list[str], *,
+                           heartbeat: Callable[[], None] | None = None) -> int:
     with TrialSignalGuard() as guard:
-        return _launch_trial_guarded(receipt_path, argv, guard)
+        return _launch_trial_guarded(receipt_path, argv, guard, heartbeat=heartbeat)
 
 
 def _launch_trial_guarded(
-    receipt_path: Path, argv: list[str], guard: TrialSignalGuard
+    receipt_path: Path, argv: list[str], guard: TrialSignalGuard, *,
+    heartbeat: Callable[[], None] | None = None,
 ) -> int:
     from trial_runtime import validate_trial_receipt
 
@@ -429,6 +433,8 @@ def _launch_trial_guarded(
         Path(receipt["stdout_path"]).open("xb") as stdout,
         Path(receipt["stderr_path"]).open("xb") as stderr,
     ):
+        if heartbeat is not None:
+            heartbeat()
         if guard.signal is not None:
             receipt.update(
                 {
@@ -467,6 +473,8 @@ def _launch_trial_guarded(
             raise
         try:
             while True:
+                if heartbeat is not None:
+                    heartbeat()
                 try:
                     exit_code = child.wait(timeout=0.2)
                     break

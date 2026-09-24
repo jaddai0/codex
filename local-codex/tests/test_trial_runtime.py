@@ -1,4 +1,5 @@
 # ruff: noqa: E402
+from contextlib import contextmanager
 import os
 from pathlib import Path
 import signal
@@ -134,11 +135,11 @@ class TrialRuntimeTests(unittest.TestCase):
                     "LOCAL_CODEX_BIN": str(self.core),
                 },
             ),
-            patch.object(trial_runtime, "ensure_runtime") as ensure,
+            patch.object(trial_runtime, "admitted_e1_model") as admission,
         ):
             with self.assertRaisesRegex(ValueError, "baseline no longer matches"):
                 trial_runtime.run_trial("repair", "candidate", "regression", "task")
-        ensure.assert_not_called()
+        admission.assert_not_called()
 
     def test_changed_snapshot_and_wrong_case_fail_closed(self):
         with self.assertRaisesRegex(ValueError, "unknown E1 case"):
@@ -202,6 +203,31 @@ class TrialRuntimeTests(unittest.TestCase):
         self.assertEqual(receipt["state"], "exited")
         self.assertEqual(self.pointer.read_bytes(), self.pointer_before)
 
+    def test_lost_gpu_lease_heartbeat_reaps_native_core(self):
+        self.core.write_text("#!/bin/sh\nsleep 30\n")
+        binding = self._binding("candidate")
+        path = trial_runtime.prepare_trial(
+            binding, mavis_home=self.fixture.home, share=self.share,
+            core_binary=self.core, base_url="http://127.0.0.1:8001/v1",
+            records=self.records,
+        )
+        calls = 0
+
+        def heartbeat():
+            nonlocal calls
+            calls += 1
+            if calls >= 2:
+                raise RuntimeError("GPU lease was lost")
+
+        with patch.object(trial_runtime, "accepted_main_profile", return_value=self.profile):
+            with self.assertRaisesRegex(RuntimeError, "GPU lease was lost"):
+                launch_trial(path, read_json(path)["core_argv"], heartbeat=heartbeat)
+        receipt = read_json(path)
+        self.assertEqual(receipt["state"], "spawned")
+        self.assertGreaterEqual(calls, 2)
+        with self.assertRaises(ProcessLookupError):
+            os.kill(receipt["core_pid"], 0)
+
     def test_installed_launcher_routes_trial_before_production_admission(self):
         environment = os.environ.copy()
         environment.update(
@@ -231,13 +257,13 @@ class TrialRuntimeTests(unittest.TestCase):
             patch.object(
                 trial_runtime, "accepted_main_profile", return_value=self.profile
             ),
-            patch.object(trial_runtime, "ensure_runtime") as ensure,
+            patch.object(trial_runtime, "admitted_e1_model") as admission,
         ):
             with self.assertRaisesRegex(ValueError, "task differs"):
                 trial_runtime.run_trial(
                     "repair", "candidate", "regression", "different task"
                 )
-        ensure.assert_not_called()
+        admission.assert_not_called()
 
     def test_failed_preparation_removes_only_incomplete_home(self):
         binding = self._binding("candidate")
@@ -415,13 +441,38 @@ class TrialRuntimeTests(unittest.TestCase):
             patch.object(
                 trial_runtime, "accepted_main_profile", return_value=self.profile
             ),
-            patch.object(trial_runtime, "ensure_runtime") as ensure,
+            patch.object(trial_runtime, "admitted_e1_model") as admission,
             generation_lease(self.fixture.home, purpose="foreground"),
         ):
             with self.assertRaisesRegex(RuntimeError, "owns the host lease"):
                 trial_runtime.run_trial("repair", "candidate", "regression", "task")
-        ensure.assert_not_called()
+        admission.assert_not_called()
         self.assertEqual(active_marker.read_text(), "owned by first trial")
+
+    def test_installed_trial_holds_shared_admission_through_native_launch(self):
+        environment = self._installed_trial_environment()
+        events = []
+
+        @contextmanager
+        def admitted(config, purpose):
+            events.append(("admitted", config.model, purpose))
+            yield lambda: events.append(("heartbeat",))
+            events.append(("cleanup",))
+
+        expected = self.fixture.home / "e1/repair/trials/candidate/regression.json"
+        with (
+            patch.dict(os.environ, environment),
+            patch.object(trial_runtime, "accepted_main_profile", return_value=self.profile),
+            patch.object(trial_runtime, "admitted_e1_model", side_effect=admitted),
+            patch.object(trial_runtime, "_prepare_trial_locked", return_value=expected),
+            patch.object(trial_runtime, "inventory", return_value=self.records),
+            patch("launch_core.launch_trial", return_value=0) as launch,
+        ):
+            self.assertEqual(trial_runtime.run_trial("repair", "candidate", "regression", "task"), expected)
+        self.assertEqual(events[0], ("admitted", "model-a", "e1:repair:candidate:regression"))
+        self.assertEqual(events[-1], ("cleanup",))
+        self.assertTrue(launch.call_args.kwargs["lease_held"])
+        self.assertTrue(callable(launch.call_args.kwargs["heartbeat"]))
 
     def test_second_process_cannot_recover_first_process_home(self):
         environment = self._installed_trial_environment()
@@ -487,11 +538,11 @@ with generation_lease(home, purpose='first-trial'):
                 patch.object(
                     trial_runtime, "accepted_main_profile", return_value=self.profile
                 ),
-                patch.object(trial_runtime, "ensure_runtime") as ensure,
+                patch.object(trial_runtime, "admitted_e1_model") as admission,
             ):
                 with self.assertRaisesRegex(RuntimeError, "owns the host lease"):
                     trial_runtime.run_trial("repair", "candidate", "regression", "task")
-            ensure.assert_not_called()
+            admission.assert_not_called()
             self.assertEqual(
                 (active_home / "config.toml").read_text(), "live first trial"
             )

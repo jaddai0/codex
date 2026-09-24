@@ -5,6 +5,7 @@ import copy
 import importlib.util
 import signal
 import subprocess
+import sys
 import tempfile
 import unittest
 from unittest.mock import patch
@@ -374,6 +375,95 @@ class E1RunnerTests(unittest.TestCase):
         frozen = self.home / "e1" / "repair" / "cases.json"
         frozen.write_text("{}")
         with self.assertRaisesRegex(ValueError, "manifest changed"):
+            self.runner.coverage("repair")
+
+    def test_external_host_checker_bytes_are_frozen_and_rechecked(self):
+        checker = self.root / "strict-host-check.py"
+        checker.write_text(
+            "from pathlib import Path\nimport sys\n"
+            "good = Path('result.txt').read_text().strip() == 'pass'\n"
+            "print('1 passed' if good else 'FAILED')\n"
+            "sys.exit(0 if good else 1)\n"
+        )
+        manifest = read_json(self.manifest)
+        argv = [sys.executable, str(checker)]
+        for case in manifest["cases"]:
+            case["checks"][0]["argv"] = argv
+        failure = run_command(self.root / "strict-failure", "original-failure", argv,
+                              self.repo, acceptance_check_ids=["accept"], timeout=10)
+        manifest["failure_receipt"] = {"path": str(failure), "sha256": sha256_file(failure)}
+        write_json(self.manifest, manifest)
+        self._freeze()
+        frozen = read_json(self.home / "e1/repair/cases.json")
+        files = frozen["cases"][0]["checks"][0]["external_files"]
+        self.assertIn({"path": str(checker.resolve()), "sha256": sha256_file(checker)}, files)
+        checker.write_text(checker.read_text() + "# changed at the same path\n")
+        with self.assertRaisesRegex(ValueError, "external host check file changed"):
+            self.runner.coverage("repair")
+        with self.assertRaisesRegex(ValueError, "external host check file changed"):
+            self.runner.check("repair", "baseline", "regression")
+
+    def test_active_seed_snapshot_is_bound_through_native_comparison(self):
+        self._freeze()
+        record = self.runner.store.load("repair")
+        active = self.runner.store.active("main")
+        self.assertEqual(record["baseline"], active["configuration"])
+        self.assertEqual(self.runner.store._read_snapshot(record["baseline"])["prompts"],
+                         {"system": "A"})
+        pointer = self.runner.store._active_path("main")
+        active["configuration"] = self.runner.store._snapshot(
+            {"prompts": {"system": "different"}, "tool_settings": {}, "retrieval": {}}
+        )
+        write_json(pointer, active)
+        with self.assertRaisesRegex(ValueError, "active baseline changed"):
+            self.runner.compare_native("repair", "regression")
+
+    def test_optional_input_packet_binds_external_baseline_and_checker(self):
+        checker = self.root / "protected-host-check.py"
+        checker.write_text("# host checker source\n")
+        manifest = read_json(self.manifest)
+        for case in manifest["cases"]:
+            case["checks"][0]["argv"].append(str(checker))
+        argv = manifest["cases"][0]["checks"][0]["argv"]
+        failure = run_command(self.root / "packet-failure", "original-failure", argv,
+                              self.repo, acceptance_check_ids=["accept"], timeout=10)
+        manifest["failure_receipt"] = {"path": str(failure), "sha256": sha256_file(failure)}
+        write_json(self.manifest, manifest)
+        baseline = self.root / "baseline.json"
+        write_json(baseline, {"prompts": {"system": "A"}, "tool_settings": {}, "retrieval": {}})
+        packet_path = self.root / "inputs.json"
+        write_json(packet_path, {
+            "schema_version": "mavis.e1-frozen-inputs/v1",
+            "baseline": {"path": str(baseline), "sha256": sha256_file(baseline)},
+            "candidate": {"path": str(self.candidate), "sha256": sha256_file(self.candidate)},
+            "cases": {"path": str(self.manifest), "sha256": sha256_file(self.manifest)},
+            "failure": {"path": str(failure), "sha256": sha256_file(failure)},
+            "protected_checks": {str(checker): sha256_file(checker)},
+        })
+        write_json(baseline, {"prompts": {"system": "wrong"},
+                              "tool_settings": {}, "retrieval": {}})
+        packet = read_json(packet_path)
+        packet["baseline"]["sha256"] = sha256_file(baseline)
+        write_json(packet_path, packet)
+        with self.assertRaisesRegex(ValueError, "differs from active seed"):
+            self.runner.freeze("repair", "main", "prompts", self.candidate,
+                               self.manifest, "Fix a real omission", inputs=packet_path)
+        write_json(baseline, {"prompts": {"system": "A"},
+                              "tool_settings": {}, "retrieval": {}})
+        packet["baseline"]["sha256"] = sha256_file(baseline)
+        write_json(packet_path, packet)
+        self.runner.freeze("repair", "main", "prompts", self.candidate,
+                           self.manifest, "Fix a real omission", inputs=packet_path)
+        record = self.runner.store.load("repair")
+        self.assertEqual(record["workload"]["inputs_sha256"],
+                         sha256_file(self.home / "e1/repair/inputs.json"))
+        baseline.write_text('{}\n')
+        with self.assertRaisesRegex(ValueError, "input packet baseline changed"):
+            self.runner.coverage("repair")
+        write_json(baseline, {"prompts": {"system": "A"}, "tool_settings": {}, "retrieval": {}})
+        self.assertEqual(self.runner.coverage("repair")["state"], "incomplete")
+        checker.write_text("# changed host checker source\n")
+        with self.assertRaisesRegex(ValueError, "external host check file changed"):
             self.runner.coverage("repair")
 
     def test_changed_original_failure_output_fails_closed(self):

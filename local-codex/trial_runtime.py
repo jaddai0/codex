@@ -15,8 +15,9 @@ import tomllib
 
 from mavis.e1 import E1Runner, _clean_revision
 from mavis.e1_bootstrap import _inventory_model, validate_bootstrap
+from mavis.e1_gpu import admitted_e1_model
 from mavis.package_provenance import package_tree_sha256
-from mavis.runtime import RuntimeConfig, endpoint_alive, ensure_runtime, inventory
+from mavis.runtime import RuntimeConfig, inventory
 from mavis.storage import read_json, require_safe_id, sha256_file
 from prepare_runtime import (
     accepted_main_profile,
@@ -589,45 +590,39 @@ def run_trial(experiment_id: str, arm: str, case_id: str, task: str) -> Path:
         )
         if runtime_home.exists() or receipt_path.exists():
             raise FileExistsError("E1 trial already prepared")
-        if endpoint_alive(runtime.iris_endpoint):
-            if any(
-                item.get("loaded") and item.get("model_type") != "embedding"
-                for item in inventory(runtime.iris_endpoint)
+        with admitted_e1_model(runtime, f"e1:{experiment_id}:{arm}:{case_id}") as heartbeat:
+            refreshed = trial_binding(mavis_home, experiment_id, arm, case_id)
+            if (
+                refreshed["snapshot"] != binding["snapshot"]
+                or refreshed["profile"]["_source_sha256"]
+                != binding["profile"]["_source_sha256"]
             ):
-                raise RuntimeError("IRIS has a loaded local generation model")
-        ensure_runtime(runtime)
-        refreshed = trial_binding(mavis_home, experiment_id, arm, case_id)
-        if (
-            refreshed["snapshot"] != binding["snapshot"]
-            or refreshed["profile"]["_source_sha256"]
-            != binding["profile"]["_source_sha256"]
-        ):
-            raise ValueError("E1 trial inputs changed during runtime admission")
-        binding = refreshed
-        receipt = _prepare_trial_locked(
-            binding,
-            mavis_home=mavis_home,
-            share=share,
-            core_binary=core_binary,
-            base_url=endpoint,
-            records=inventory(endpoint),
-            gateway_root=gateway_root,
-            gateway_env_file=gateway_env_file,
-            package_manifest=package_manifest,
-        )
-        argv = [
-            str(core_binary),
-            "exec",
-            "-C",
-            str(binding["checkout"].resolve()),
-            "--",
-            task,
-        ]
-        if launch_trial(receipt, argv, lease_held=True) != 0:
-            raise RuntimeError(
-                f"E1 trial did not produce a matching effective-config observation: {receipt}"
+                raise ValueError("E1 trial inputs changed during runtime admission")
+            binding = refreshed
+            receipt = _prepare_trial_locked(
+                binding,
+                mavis_home=mavis_home,
+                share=share,
+                core_binary=core_binary,
+                base_url=endpoint,
+                records=inventory(endpoint),
+                gateway_root=gateway_root,
+                gateway_env_file=gateway_env_file,
+                package_manifest=package_manifest,
             )
-        return receipt
+            argv = [
+                str(core_binary),
+                "exec",
+                "-C",
+                str(binding["checkout"].resolve()),
+                "--",
+                task,
+            ]
+            if launch_trial(receipt, argv, lease_held=True, heartbeat=heartbeat) != 0:
+                raise RuntimeError(
+                    f"E1 trial did not produce a matching effective-config observation: {receipt}"
+                )
+            return receipt
 
 
 def main() -> int:

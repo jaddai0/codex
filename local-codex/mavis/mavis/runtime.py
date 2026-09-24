@@ -106,13 +106,18 @@ def endpoint_alive(endpoint: str) -> bool:
         return False
 
 
-def require_idle_iris_handoff(config: RuntimeConfig, *, interval_seconds: float = 1.0) -> None:
+def require_idle_iris_handoff(config: RuntimeConfig, *, interval_seconds: float = 1.0,
+                              expected_models: list[str] | None = None) -> None:
     """Refuse a model handoff while IRIS has active or queued generation."""
+    expected = [config.model] if expected_models is None else expected_models
+    if not expected or len(expected) != len(set(expected)):
+        raise RuntimeError("IRIS generation model inventory is invalid")
+    status_models = None
     for sample in range(2):
         status = request_json(config.iris_endpoint, "/api/status")
         if (not isinstance(status, dict) or status.get("status") != "ok"
             or not isinstance(status.get("loaded_models"), list)
-            or config.model not in status["loaded_models"]
+            or not all(model in status["loaded_models"] for model in expected)
             or type(status.get("models_loading")) is not int
             or status["models_loading"] != 0
             or type(status.get("active_requests")) is not int
@@ -120,9 +125,12 @@ def require_idle_iris_handoff(config: RuntimeConfig, *, interval_seconds: float 
             or status["active_requests"] != 0
             or status["waiting_requests"] != 0):
             raise RuntimeError("IRIS has active or waiting work; model handoff refused")
+        if status_models is not None and status["loaded_models"] != status_models:
+            raise RuntimeError("IRIS loaded model status changed during idle handoff")
+        status_models = status["loaded_models"]
         if sample == 0:
             time.sleep(interval_seconds)
-    if loaded_generation_models(config.iris_endpoint) != [config.model]:
+    if loaded_generation_models(config.iris_endpoint) != expected:
         raise RuntimeError("IRIS generation model inventory changed before handoff")
 
 

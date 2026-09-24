@@ -1,6 +1,7 @@
 """Frozen E1 cases, native candidate dispatch, and host-recorded paired checks."""
 
 from pathlib import Path
+from copy import deepcopy
 import fcntl
 import hashlib
 import json
@@ -12,7 +13,6 @@ from typing import Any
 from .evidence import parse_test_output, run_command
 from .experiments import ExperimentStore, _digest, candidate_assignment_requirements
 from .gateway import harness_assignment_start
-from .objectives import _validate_gateway_status
 from .package_provenance import package_tree_sha256
 from .storage import read_json, require_safe_id, sha256_file, write_json
 
@@ -72,7 +72,18 @@ def _verify_host_receipt(
     return receipt
 
 
-def _manifest(path: Path) -> dict[str, Any]:
+def _external_check_files(argv: list[str]) -> list[dict[str, str]]:
+    """Bind absolute host command files that are outside the checked revision."""
+    files = {}
+    for argument in argv:
+        path = Path(argument)
+        if path.is_absolute() and path.is_file():
+            resolved = path.resolve(strict=True)
+            files[str(resolved)] = sha256_file(resolved)
+    return [{"path": path, "sha256": digest} for path, digest in sorted(files.items())]
+
+
+def _manifest(path: Path, *, allow_unbound_external: bool = False) -> dict[str, Any]:
     value = read_json(path)
     if (
         value.get("schema_version") != "mavis.e1-cases/v1"
@@ -120,6 +131,13 @@ def _manifest(path: Path) -> dict[str, Any]:
                 or not 0 < timeout <= 3600
             ):
                 raise ValueError("check needs a bounded timeout")
+            external = check.get("external_files")
+            if external is None and allow_unbound_external:
+                continue
+            if external is None and not any(Path(item).is_absolute() for item in argv):
+                continue  # legacy frozen cases with no external file arguments
+            if external != _external_check_files(argv):
+                raise ValueError("E1 external host check file changed or lacks a frozen digest")
         if len(set(check_ids)) != len(check_ids):
             raise ValueError("duplicate check id")
     if len(set(ids)) != len(ids) or value.get("regression") not in ids:
@@ -173,6 +191,64 @@ def _manifest(path: Path) -> dict[str, Any]:
 
 def _argv_hash(argv: list[str]) -> str:
     return hashlib.sha256(json.dumps(argv, separators=(",", ":")).encode()).hexdigest()
+
+
+def _verified_input_packet(packet_path: Path, *, manifest: dict[str, Any],
+                           baseline: dict[str, Any], candidate: dict[str, Any],
+                           cases_path: Path | None = None) -> dict[str, Any]:
+    """Check the optional host inventory against every E1 source it names."""
+    packet = read_json(packet_path)
+    if packet.get("schema_version") != "mavis.e1-frozen-inputs/v1":
+        raise ValueError("E1 input packet schema is invalid")
+    refs = {}
+    for name in ("baseline", "candidate", "cases", "failure"):
+        ref = packet.get(name)
+        if not isinstance(ref, dict) or not isinstance(ref.get("path"), str) or not isinstance(ref.get("sha256"), str):
+            raise ValueError(f"E1 input packet lacks {name}")
+        path = Path(ref["path"]).resolve(strict=True)
+        if not path.is_file() or str(path) != ref["path"] or sha256_file(path) != ref["sha256"]:
+            raise ValueError(f"E1 input packet {name} changed")
+        refs[name] = path
+    if (read_json(refs["baseline"]) != baseline
+            or read_json(refs["candidate"]) != candidate
+            or (cases_path is not None and refs["cases"] != cases_path.resolve(strict=True))
+            or refs["failure"] != Path(manifest["failure_receipt"]["path"]).resolve(strict=True)
+            or packet["failure"]["sha256"] != manifest["failure_receipt"]["sha256"]):
+        raise ValueError("E1 input packet differs from active seed or frozen cases")
+    source = _manifest(refs["cases"], allow_unbound_external=True)
+    expected = deepcopy(manifest)
+    for version in (source, expected):
+        for case in version["cases"]:
+            for check in case["checks"]:
+                check.pop("external_files", None)
+    if source != expected:
+        raise ValueError("E1 input packet cases differ from frozen manifest")
+    protected = packet.get("protected_checks")
+    if not isinstance(protected, dict) or not protected:
+        raise ValueError("E1 input packet needs protected host checks")
+    bound = {item["path"]: item["sha256"] for case in manifest["cases"]
+             for check in case["checks"] for item in _external_check_files(check["argv"])}
+    for source, digest in protected.items():
+        path = Path(source).resolve(strict=True)
+        if (str(path) != source or not path.is_file() or sha256_file(path) != digest
+                or bound.get(source) != digest):
+            raise ValueError("E1 protected host check differs from frozen command")
+    return packet
+
+
+def _frozen_input_hash(home: Path, root: Path, record: dict[str, Any],
+                       manifest: dict[str, Any]) -> str | None:
+    packet_hash = record["workload"].get("inputs_sha256")
+    if packet_hash is None:
+        return None
+    packet_path = root / "inputs.json"
+    if sha256_file(packet_path) != packet_hash:
+        raise ValueError("frozen E1 input packet changed")
+    store = ExperimentStore(home)
+    _verified_input_packet(packet_path, manifest=manifest,
+                           baseline=store._read_snapshot(record["baseline"]),
+                           candidate=store._read_snapshot(record["candidate"]))
+    return packet_hash
 
 
 def _trial_hashes(root: Path, home: Path, record: dict[str, Any], case: dict[str, Any],
@@ -432,6 +508,7 @@ def validate_e1_bundle(home: Path, record: dict[str, Any], *, require_trials: bo
     if sha256_file(manifest_path) != record["workload"]["manifest_sha256"]:
         raise ValueError("frozen E1 manifest changed")
     manifest = _manifest(manifest_path)
+    packet_hash = _frozen_input_hash(home, root, record, manifest)
     if manifest["held_out"] != record["evaluation_split"]["held_out"]:
         raise ValueError("frozen E1 split changed")
     failure_path = Path(manifest["failure_receipt"]["path"])
@@ -442,6 +519,8 @@ def validate_e1_bundle(home: Path, record: dict[str, Any], *, require_trials: bo
         "failure_stderr": sha256_file(failure_path.parent / "stderr.log"),
         "cases": {},
     }
+    if packet_hash is not None:
+        bundle["inputs"] = packet_hash
     scores = {}
     bootstrap_cache: dict[str, Any] = {}
     for arm in ("baseline", "candidate"):
@@ -540,6 +619,7 @@ class E1Runner:
         if sha256_file(path) != record["workload"]["manifest_sha256"]:
             raise ValueError("frozen E1 manifest changed")
         manifest = _manifest(path)
+        _frozen_input_hash(self.home, root, record, manifest)
         if record["evaluation_split"]["held_out"] != manifest["held_out"]:
             raise ValueError("frozen E1 split changed")
         return record, manifest
@@ -552,20 +632,35 @@ class E1Runner:
         candidate: Path,
         cases: Path,
         hypothesis: str,
+        inputs: Path | None = None,
     ) -> dict[str, Any]:
-        manifest = _manifest(cases)
+        manifest = _manifest(cases, allow_unbound_external=True)
+        if inputs is not None:
+            active = self.store.active(scope)
+            baseline = self.store._read_snapshot(active["configuration"])
+            _verified_input_packet(inputs, manifest=manifest, baseline=baseline,
+                                   candidate=read_json(candidate), cases_path=cases)
         root = self._root(experiment_id)
         if root.exists():
             raise FileExistsError(root)
         root.mkdir(parents=True, mode=0o700)
         frozen = root / "cases.json"
-        shutil.copyfile(cases, frozen)
+        for case in manifest["cases"]:
+            for check in case["checks"]:
+                check["external_files"] = _external_check_files(check["argv"])
+        write_json(frozen, manifest)
         frozen.chmod(0o600)
+        _manifest(frozen)
+        if inputs is not None:
+            shutil.copyfile(inputs, root / "inputs.json")
+            (root / "inputs.json").chmod(0o600)
         workload = {
             "suite": "E1",
             "manifest_sha256": sha256_file(frozen),
             "scoring": manifest["scoring"],
         }
+        if inputs is not None:
+            workload["inputs_sha256"] = sha256_file(root / "inputs.json")
         split = {
             "held_out": manifest["held_out"],
             "minimum_gain": manifest["minimum_gain"],

@@ -283,6 +283,7 @@ def build_parser() -> argparse.ArgumentParser:
     )
     freeze.add_argument("--candidate", type=Path, required=True)
     freeze.add_argument("--cases", type=Path, required=True)
+    freeze.add_argument("--inputs", type=Path)
     freeze.add_argument("--hypothesis", required=True)
     for name in ("prepare", "check"):
         entry = e1_sub.add_parser(name)
@@ -633,6 +634,7 @@ def main(argv: list[str] | None = None) -> int:
                 args.candidate,
                 args.cases,
                 args.hypothesis,
+                args.inputs,
             )
         elif args.e1_command == "prepare":
             result = runner.prepare(args.experiment_id, args.arm)
