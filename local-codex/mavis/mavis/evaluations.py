@@ -133,7 +133,7 @@ def _safe_buried_inspection(command: str) -> bool:
     normalized = command.replace("2>&1", "").replace("&&", ";")
     if "<" in normalized or ">" in normalized:
         return False
-    allowed = {"ls", "echo", "rg", "grep", "head", "tail", "cut", "cat", "wc", "pwd", "stat", "sort", "sed", "awk"}
+    allowed = {"ls", "echo", "rg", "grep", "head", "tail", "cut", "cat", "wc", "pwd", "stat", "sort", "sed", "awk", "file", "uniq"}
     for part in re.split(r"[;|]", normalized):
         try:
             args = shlex.split(part)
@@ -152,6 +152,10 @@ def _safe_buried_inspection(command: str) -> bool:
         if args[0] == "awk" and (len(args) != 3
                                   or not re.fullmatch(r"NR==\d+", args[1])
                                   or not args[2].endswith(".raw")):
+            return False
+        if args[0] == "file" and args != ["file", "produce_log.py"]:
+            return False
+        if args[0] == "uniq" and args not in (["uniq"], ["uniq", "-c"]):
             return False
     return True
 
