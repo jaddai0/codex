@@ -70,4 +70,58 @@ open; source/package tests and role canaries are narrower evidence.
 
 The shell launcher was not yet dispatching `mavis librarian ask` when these
 model calls ran. A later launcher review found that integration gap; the
-subsequent launcher checkpoint and installed canary must be checked separately.
+subsequent launcher checkpoint and installed canary are recorded separately below.
+
+## Installed shell launcher repair
+
+The installed shell entrypoint lacked `librarian` in its Python-service command
+case. The launcher now routes that command alongside `output`, and a regression
+test invokes a real project archive through the shell without loading a model.
+The first source suite after the dispatch change passed 311 tests with two
+skips; the expanded focused CLI suite passed 18 tests. The final full source
+suite, including the new regression test, passed 312 tests with two skips in
+`Mavis/evidence/phase2-librarian-launcher-final-source-tests-7ad62299b.log`.
+Terra accepted the
+narrow launcher diff in native review thread
+`01a0d24d-61f5-7523-bab1-bdf3d764be85`.
+
+Commit `7ad62299b99a48ea26fefe06b095403fa020c27e` was installed after
+backing up the previous candidate at
+`~/.local/share/local-codex-backups/mavis-before-librarian-launcher-20260924`.
+The installed Mavis package hash remained
+`8abf9ed790da2655561f6de6df1e7b3581e8ade2c7dbb22a0f232993b057ade9`;
+the shell launcher hash changed to
+`7d0ec70042ba81938b11a7a4295808c73e09c459705cfb8a56c097a17d7ed733`.
+The installed `mavis librarian ask --no-model` command returned a verified
+project-local citation. The live 4B shell command then answered both questions
+accurately. Its receipt at
+`Mavis/evidence/phase2-librarian-installed-canary-Mavis-Qwen3.5-4B-HF-Eval-launcher-hash-7ad62299b.json`
+records the shell hash matching the manifest both before and after, the same
+installed candidate fingerprint, IRIS unchanged, Mavis parked, and GPU lease
+released.
+
+The changed installation received fresh candidate-matched E0 observers. Run
+`9682efbf5d8f40ee9abe5f16ecf75ac9` passed all 10 cases with the same
+before/after candidate fingerprint, IRIS loaded, Mavis unloaded, and GPU lease
+released. E0's fingerprint covers the Desktop launcher; the shell hash is
+bound separately in the live librarian receipt and install manifest. This
+repairs the shell integration gap, while the Phase 2 completed-task benefit
+comparison remains open.
+
+Native Terra independently accepted this installed aggregate in
+`Mavis/evidence/phase2-librarian-launcher-installed-terra-review.txt`, completed
+thread `01a0d259-45fd-7a11-a015-5251669a3774`. It checked the shell bytes
+against the manifest and canary, both archive hashes and answers, E0 10/10,
+and the recorded IRIS/Mavis/GPU cleanup. This acceptance is limited to the
+installed launcher and librarian role.
+
+## Completed-work trial
+
+The next installed coding pair is recorded in
+`phase2-completed-work-canary-2026-09-24.md`. The 4B librarian arm completed
+and passed five independent host checks. The baseline passed those host checks
+but fell into a false tool-output loop and did not finish. A default-sandbox
+helper invocation failed on loopback permission; the successful 4B arm used an
+explicit network override. Native Terra accepted the narrow capability canary
+and rejected promotion from this single, unmatched pair. The helper remains
+experimental until default access and matched completed-work benefit pass.
