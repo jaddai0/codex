@@ -23,7 +23,9 @@ from mavis.runtime import (
     require_installed_selected_model,
     release_iris_model_drain,
     park_mavis_server,
+    reserve_empty_mavis_port,
     start_server,
+    stop_trial_server,
     wait_iris_model_drain,
 )
 from mavis.storage import write_json
@@ -41,8 +43,66 @@ class FakeProcess:
     def terminate(self):
         self.terminated = True
 
+    def wait(self, timeout=None):
+        self.returncode = -signal.SIGTERM
+        return self.returncode
+
 
 class RuntimeTests(unittest.TestCase):
+    def test_trial_abort_rejects_changed_launch_record_without_signal(self):
+        with tempfile.TemporaryDirectory() as directory:
+            config = RuntimeConfig(home=Path(directory))
+            write_json(config.state_path, {"pid": 2222, "command": ["other"]})
+            with patch("mavis.runtime.os.killpg") as kill, self.assertRaisesRegex(
+                RuntimeError, "launch record changed"
+            ):
+                stop_trial_server(config, {"pid": 1111, "command": ["ours"]})
+            kill.assert_not_called()
+
+    def test_new_server_requirement_refuses_even_owned_preexisting_server(self):
+        config = RuntimeConfig(home=Path("/tmp/mavis-owned-test"))
+        with patch("mavis.runtime.endpoint_alive", return_value=True), \
+                patch("mavis.runtime.owns_running_server", return_value=True), \
+                patch("mavis.runtime.subprocess.Popen") as spawn, \
+                self.assertRaisesRegex(RuntimeError, "already running"):
+            start_server(config, require_new=True)
+        spawn.assert_not_called()
+
+    def test_empty_reservation_refuses_new_listener_without_signaling(self):
+        with tempfile.TemporaryDirectory() as directory, socket.socket() as owner:
+            owner.bind(("127.0.0.1", 0))
+            port = owner.getsockname()[1]
+            owner.listen(1)
+            config = RuntimeConfig(home=Path(directory),
+                                   endpoint=f"http://127.0.0.1:{port}/v1")
+            with patch("mavis.runtime.os.killpg") as kill, self.assertRaisesRegex(
+                RuntimeError, "occupied"
+            ):
+                reserve_empty_mavis_port(config)
+            kill.assert_not_called()
+            self.assertGreaterEqual(owner.fileno(), 0)
+
+    def test_park_refuses_state_pid_change_before_signaling(self):
+        with tempfile.TemporaryDirectory() as directory:
+            config = RuntimeConfig(home=Path(directory))
+            write_json(config.state_path, {"pid": 4321})
+            with patch("mavis.runtime.os.killpg") as kill, self.assertRaisesRegex(
+                RuntimeError, "PID changed"
+            ):
+                park_mavis_server(config, expected_pid=1234)
+            kill.assert_not_called()
+
+    def test_park_refuses_same_pid_different_launch_record(self):
+        with tempfile.TemporaryDirectory() as directory:
+            config = RuntimeConfig(home=Path(directory))
+            write_json(config.state_path, {"pid": 1234, "command": ["other"]})
+            with patch("mavis.runtime.os.killpg") as kill, self.assertRaisesRegex(
+                RuntimeError, "launch record changed"
+            ):
+                park_mavis_server(config, expected_pid=1234,
+                                  expected_state={"pid": 1234, "command": ["ours"]})
+            kill.assert_not_called()
+
     def test_park_reserves_empty_port_without_starting_server(self):
         with tempfile.TemporaryDirectory() as directory:
             with socket.socket() as probe:
@@ -249,13 +309,37 @@ class RuntimeTests(unittest.TestCase):
             process = FakeProcess()
             with patch("mavis.runtime.endpoint_alive", return_value=False), patch(
                 "mavis.runtime.port_in_use", return_value=False
-            ), patch("mavis.runtime.subprocess.Popen", return_value=process) as popen:
+            ), patch("mavis.runtime.subprocess.Popen", return_value=process) as popen, \
+                    patch("mavis.runtime.os.getpgid", return_value=1234), \
+                    patch("mavis.runtime.os.killpg", side_effect=[None, ProcessLookupError]) as kill:
                 with self.assertRaises(TimeoutError):
                     start_server(config, wait_seconds=0)
-            self.assertTrue(process.terminated)
+            kill.assert_any_call(1234, signal.SIGTERM)
             child_env = popen.call_args.kwargs["env"]
             self.assertEqual(child_env["OMLX_BASE_PATH"], str(config.base_path))
             self.assertEqual(child_env["HOME"], str(config.home / "user-home"))
+
+    def test_start_state_write_failure_reaps_exact_spawned_group(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            binary = root / "omlx"
+            binary.write_text("fixture")
+            config = RuntimeConfig(home=root / "home", omlx_binary=binary)
+            process = FakeProcess()
+            def write_or_fail(path, value):
+                if path == config.state_path:
+                    raise OSError("disk full")
+                write_json(path, value)
+            with patch("mavis.runtime.endpoint_alive", return_value=False), \
+                    patch("mavis.runtime.port_in_use", return_value=False), \
+                    patch("mavis.runtime.subprocess.Popen", return_value=process), \
+                    patch("mavis.runtime.write_json", side_effect=write_or_fail), \
+                    patch("mavis.runtime.os.getpgid", return_value=1234), \
+                    patch("mavis.runtime.os.killpg", side_effect=[None, ProcessLookupError]) as kill:
+                with self.assertRaisesRegex(OSError, "disk full"):
+                    start_server(config, require_new=True)
+            kill.assert_any_call(1234, signal.SIGTERM)
+            self.assertIsNotNone(process.returncode)
 
     def test_settings_pin_auth_server_model_and_cache_to_mavis(self):
         with tempfile.TemporaryDirectory() as directory:

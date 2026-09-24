@@ -455,8 +455,11 @@ def ensure_isolated_settings(config: RuntimeConfig) -> None:
     write_json(settings_path, settings)
 
 
-def start_server(config: RuntimeConfig, wait_seconds: float = 30.0) -> dict[str, Any]:
+def start_server(config: RuntimeConfig, wait_seconds: float = 30.0, *,
+                 require_new: bool = False) -> dict[str, Any]:
     if endpoint_alive(config.endpoint):
+        if require_new:
+            raise RuntimeError("Mavis endpoint was already running before this observation")
         if not owns_running_server(config):
             raise RuntimeError("Mavis endpoint is occupied by a server Mavis does not own")
         return read_json(config.state_path)
@@ -515,22 +518,104 @@ def start_server(config: RuntimeConfig, wait_seconds: float = 30.0) -> dict[str,
         "command": command,
         "started_at_epoch": time.time(),
     }
-    write_json(config.state_path, state)
-    deadline = time.monotonic() + wait_seconds
     try:
+        write_json(config.state_path, state)
+        deadline = time.monotonic() + wait_seconds
         while time.monotonic() < deadline:
             if process.poll() is not None:
                 raise RuntimeError(
                     f"Mavis oMLX exited during startup with status {process.returncode}"
                 )
             if endpoint_alive(config.endpoint):
+                if require_new and not owns_running_server(config):
+                    raise RuntimeError("Mavis endpoint changed owner during startup")
                 return state
             time.sleep(0.25)
         raise TimeoutError("Mavis oMLX did not become healthy before the startup deadline")
     except BaseException:
-        if process.poll() is None:
-            process.terminate()
+        try:
+            _stop_spawned_process_group(process)
+        except BaseException as cleanup_error:
+            failure = RuntimeError(
+                f"Mavis launched server could not be stopped after startup failure: {cleanup_error}"
+            )
+            failure.unsafe_gpu_work = True
+            raise failure from cleanup_error
         raise
+
+
+def _stop_spawned_process_group(process: subprocess.Popen[Any], *,
+                                timeout: float = 5.0) -> None:
+    """Stop and reap the exact child group launched by this Python process."""
+    pid = process.pid
+    try:
+        group = os.getpgid(pid)
+    except ProcessLookupError:
+        group = None  # The leader may have exited while its worker group remains.
+    if group is not None and group != pid:
+        raise RuntimeError("spawned Mavis server left its dedicated process group")
+    try:
+        os.killpg(pid, signal.SIGTERM)
+    except ProcessLookupError:
+        pass
+    try:
+        process.wait(timeout=timeout)
+    except subprocess.TimeoutExpired:
+        os.killpg(pid, signal.SIGKILL)
+        process.wait(timeout=timeout)
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        try:
+            os.killpg(pid, 0)
+        except ProcessLookupError:
+            return
+        time.sleep(0.1)
+    # A worker can outlive an already reaped server leader. The dedicated
+    # process group is still the one created by this Popen call.
+    os.killpg(pid, signal.SIGKILL)
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        try:
+            os.killpg(pid, 0)
+        except ProcessLookupError:
+            return
+        time.sleep(0.1)
+    raise RuntimeError("Mavis server process group or model worker remained after stop")
+
+
+def stop_trial_server(config: RuntimeConfig, expected_state: dict[str, Any], *,
+                      timeout: float = 10.0) -> None:
+    """Abort only the server this trial launched and prove its group exited."""
+    if not config.state_path.is_file() or read_json(config.state_path) != expected_state:
+        raise RuntimeError("Mavis trial server launch record changed")
+    pid = expected_state.get("pid")
+    if type(pid) is not int or pid <= 0 or not owns_running_server(config):
+        raise RuntimeError("Mavis trial server ownership is unproven")
+    if os.getpgid(pid) != pid:
+        raise RuntimeError("Mavis trial server process group changed")
+    os.killpg(pid, signal.SIGTERM)
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        try:
+            os.waitpid(pid, os.WNOHANG)
+        except ChildProcessError:
+            pass
+        try:
+            os.killpg(pid, 0)
+        except ProcessLookupError:
+            if not _listener_pids(_port(config.endpoint)):
+                return
+        time.sleep(0.1)
+    os.killpg(pid, signal.SIGKILL)
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        try:
+            os.killpg(pid, 0)
+        except ProcessLookupError:
+            if not _listener_pids(_port(config.endpoint)):
+                return
+        time.sleep(0.1)
+    raise RuntimeError("Mavis trial server or model worker remained after abort")
 
 
 def available_memory_bytes() -> int:
@@ -620,7 +705,31 @@ def stop_server(config: RuntimeConfig) -> None:
     os.kill(pid, signal.SIGTERM)
 
 
-def park_mavis_server(config: RuntimeConfig, *, timeout: float = 30) -> socket.socket:
+def reserve_empty_mavis_port(config: RuntimeConfig, *,
+                             verify_endpoint: bool = True) -> socket.socket:
+    """Reserve only an empty port; never stop an existing server."""
+    if verify_endpoint and endpoint_alive(config.endpoint):
+        raise RuntimeError("Mavis endpoint is occupied; refusing to reserve its port")
+    parsed = urlparse(config.endpoint)
+    reservation = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    try:
+        reservation.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        try:
+            reservation.bind((parsed.hostname or "127.0.0.1", _port(config.endpoint)))
+        except OSError as error:
+            raise RuntimeError("Mavis endpoint is occupied; refusing to reserve its port") from error
+        reservation.listen(1)
+        if _listener_pids(_port(config.endpoint)) != {os.getpid()}:
+            raise RuntimeError("Mavis port reservation did not exclusively own the listener")
+        return reservation
+    except BaseException:
+        reservation.close()
+        raise
+
+
+def park_mavis_server(config: RuntimeConfig, *, timeout: float = 30,
+                      expected_pid: int | None = None,
+                      expected_state: dict[str, Any] | None = None) -> socket.socket:
     """Stop the owned server or reserve its empty port through IRIS restoration.
 
     The caller must keep the returned listening socket open until IRIS is
@@ -629,6 +738,10 @@ def park_mavis_server(config: RuntimeConfig, *, timeout: float = 30) -> socket.s
     pid = read_json(config.state_path).get("pid") if config.state_path.is_file() else None
     if pid is not None and (not isinstance(pid, int) or pid <= 0):
         raise RuntimeError("Mavis owned server PID is invalid")
+    if expected_pid is not None and pid != expected_pid:
+        raise RuntimeError("Mavis server PID changed before parking")
+    if expected_state is not None and read_json(config.state_path) != expected_state:
+        raise RuntimeError("Mavis server launch record changed before parking")
     if endpoint_alive(config.endpoint):
         status = request_json(config.endpoint, "/api/status")
         if (not isinstance(status, dict) or status.get("status") != "ok"
@@ -644,6 +757,10 @@ def park_mavis_server(config: RuntimeConfig, *, timeout: float = 30) -> socket.s
             raise RuntimeError("Mavis live server lacks owned process state")
         if os.getpgid(pid) != pid:
             raise RuntimeError("Mavis server is not in its dedicated process group")
+        if expected_pid is not None and read_json(config.state_path).get("pid") != expected_pid:
+            raise RuntimeError("Mavis server PID changed before stop")
+        if expected_state is not None and read_json(config.state_path) != expected_state:
+            raise RuntimeError("Mavis server launch record changed before stop")
         os.killpg(pid, signal.SIGTERM)
     elif _listener_pids(_port(config.endpoint)):
         raise RuntimeError("Mavis endpoint is occupied by an unidentified listener")
@@ -671,15 +788,4 @@ def park_mavis_server(config: RuntimeConfig, *, timeout: float = 30) -> socket.s
         time.sleep(0.2)
     else:
         raise TimeoutError("Mavis server or a model worker remained after stop")
-    parsed = urlparse(config.endpoint)
-    reservation = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-    try:
-        reservation.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-        reservation.bind((parsed.hostname or "127.0.0.1", _port(config.endpoint)))
-        reservation.listen(1)
-        if _listener_pids(_port(config.endpoint)) != {os.getpid()}:
-            raise RuntimeError("Mavis port reservation did not exclusively own the listener")
-        return reservation
-    except BaseException:
-        reservation.close()
-        raise
+    return reserve_empty_mavis_port(config, verify_endpoint=False)

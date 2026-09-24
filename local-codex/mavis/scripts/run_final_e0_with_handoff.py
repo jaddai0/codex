@@ -13,7 +13,7 @@ import time
 import uuid
 
 from mavis.evaluations import E0_CASES, E0Evaluator, installed_candidate_fingerprint
-from mavis.runtime import RuntimeConfig, park_mavis_server, require_installed_selected_model, with_mavis_handoff_lease
+from mavis.runtime import RuntimeConfig, reserve_empty_mavis_port, require_installed_selected_model, with_mavis_handoff_lease
 from mavis.storage import sha256_file, write_json
 from shared_gpu_observation import shared_mavis_model
 
@@ -73,7 +73,9 @@ def main() -> int:
             and result.get("candidate_after") == before):
         reservation = None
         try:
-            reservation = park_mavis_server(config)
+            # The shared context closed its own server. A different session may
+            # have taken this port in the gap; reserve only if it is still empty.
+            reservation = reserve_empty_mavis_port(config)
             env.pop("MAVIS_E0_SHARED_GPU_LEASE", None)
             with log.open("wb") as stream:
                 env["MAVIS_E0_PARK_OWNER_PID"] = str(os.getpid())
