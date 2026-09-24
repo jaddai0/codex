@@ -419,6 +419,7 @@ supports_standalone_web_search = false
             "\n[mcp_servers.mavis-memory]\n"
             f"command = {json.dumps(sys.executable)}\n"
             'args = ["-m", "mavis.mcp_server"]\n'
+            'default_tools_approval_mode = "approve"\n'
             "\n[mcp_servers.mavis-memory.env]\n"
             f"MAVIS_HOME = {json.dumps(str(mavis_home.resolve()))}\n"
             f"MAVIS_PROJECT_ROOT = {json.dumps(str(project_root.resolve(strict=True)))}\n"

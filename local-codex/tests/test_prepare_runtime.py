@@ -457,6 +457,7 @@ class PrepareRuntimeTests(unittest.TestCase):
             parsed = tomllib.loads((home / "config.toml").read_text())
             memory = parsed["mcp_servers"]["mavis-memory"]
             self.assertEqual(memory["args"], ["-m", "mavis.mcp_server"])
+            self.assertEqual(memory["default_tools_approval_mode"], "approve")
             self.assertEqual(memory["command"], sys.executable)
             self.assertEqual(memory["env"]["MAVIS_HOME"], str(service.resolve()))
             self.assertEqual(memory["env"]["MAVIS_PROJECT_ROOT"], str(project.resolve()))
