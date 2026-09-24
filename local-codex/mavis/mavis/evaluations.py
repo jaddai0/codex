@@ -89,10 +89,12 @@ def _trusted_raw_output_path(raw: Path, repo: Path, service_home: Path) -> bool:
 
 def installed_candidate_fingerprint() -> dict[str, str]:
     """Bind E0 live work to every installed executable that prepares Mavis."""
-    overrides = [name for name in E0_RUNTIME_OVERRIDES if os.environ.get(name)]
+    share = Path.home() / ".local" / "share" / "local-codex"
+    overrides = [name for name in E0_RUNTIME_OVERRIDES if os.environ.get(name)
+                 and not (name == "LOCAL_CODEX_SHARE_DIR"
+                          and Path(os.environ[name]).resolve() == share.resolve())]
     if overrides:
         raise ValueError(f"E0 requires the canonical installed runtime; overrides set: {', '.join(overrides)}")
-    share = Path.home() / ".local" / "share" / "local-codex"
     service_home = Path.home() / ".local-codex" / "mavis-service"
     if os.environ.get("MAVIS_HOME") and Path(os.environ["MAVIS_HOME"]).resolve() != service_home.resolve():
         raise ValueError("E0 requires the canonical MAVIS_HOME")

@@ -210,6 +210,8 @@ class E0EvaluationTests(unittest.TestCase):
                         installed_candidate_fingerprint()
                 with patch.dict(os.environ, {"PYTHONPATH": str(home / ".local/share/local-codex")}):
                     self.assertEqual(installed_candidate_fingerprint(), baseline)
+                with patch.dict(os.environ, {"LOCAL_CODEX_SHARE_DIR": str(home / ".local/share/local-codex")}):
+                    self.assertEqual(installed_candidate_fingerprint(), baseline)
 
     def test_native_review_accepts_completed_structured_cli_receipt_only(self):
         verdict = "ACCEPT\nExact tests passed and protected file hash matched."
