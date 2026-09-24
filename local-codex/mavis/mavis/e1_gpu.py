@@ -35,7 +35,8 @@ LEASE_MINUTES = "90"
 
 def _lease_command(*args: str) -> str:
     result = subprocess.run([str(LEASE), *args], capture_output=True, text=True,
-                            timeout=15, check=False)
+                            timeout=0.5 if args[0] == "status" else 15,
+                            check=False)
     if result.returncode:
         raise RuntimeError(f"GPU lease {args[0]} failed: {(result.stderr or result.stdout).strip()}")
     return result.stdout
@@ -65,20 +66,63 @@ class _LeaseHeartbeat:
         self.iris_models: list[str] | None = None
         self.next_status = 0.0
         self.next_renew = time.monotonic() + 300
+        self.abort_idle_server: Callable[[], None] | None = None
 
     def __call__(self, *, force: bool = False) -> None:
         now = time.monotonic()
         if force or now >= self.next_status:
             _safe_status(_lease_command("status"), purpose=self.purpose)
             if (self.iris_endpoint is not None and
-                    loaded_generation_models(self.iris_endpoint) != self.iris_models):
+                    loaded_generation_models(self.iris_endpoint, timeout=0.5)
+                    != self.iris_models):
                 raise RuntimeError("IRIS generation model inventory changed during E1")
-            self.next_status = now + 15
+            self.next_status = time.monotonic() + 0.25
         if now >= self.next_renew:
             _owned_status(_lease_command("status"), self.purpose)
             _lease_command("renew", HOLDER, LEASE_MINUTES)
             _safe_status(_lease_command("status"), purpose=self.purpose)
             self.next_renew = now + 300
+
+    def monitor_read_only(self, work: Callable[[], Any]) -> Any:
+        """Keep the loaded idle server guarded during a long file hash."""
+        self(force=True)
+        if self.abort_idle_server is None:
+            raise RuntimeError("E1 blocking-work server abort is unavailable")
+        done = threading.Event()
+        unsafe: list[BaseException] = []
+
+        def watch() -> None:
+            while not done.wait(0.2):
+                try:
+                    self(force=True)
+                except BaseException as error:
+                    try:
+                        self.abort_idle_server()
+                    except BaseException as stop_error:
+                        unsafe.append(RuntimeError(
+                            f"{error}; E1 idle server abort failed: {stop_error}"
+                        ))
+                    else:
+                        unsafe.append(error)
+                    return
+
+        watcher = threading.Thread(target=watch, name="mavis-e1-binding-watch", daemon=True)
+        watcher.start()
+        result: Any = None
+        work_error: BaseException | None = None
+        try:
+            result = work()
+        except BaseException as error:
+            work_error = error
+        finally:
+            done.set()
+            watcher.join()
+        if unsafe:
+            raise unsafe[0] from work_error
+        self(force=True)
+        if work_error is not None:
+            raise work_error
+        return result
 
 
 def _mavis_status(config: RuntimeConfig) -> dict[str, Any]:
@@ -145,7 +189,7 @@ def _monitored_load(config: RuntimeConfig, heartbeat: _LeaseHeartbeat,
         finally:
             done.set()
     threading.Thread(target=worker, name="mavis-e1-load", daemon=True).start()
-    while not done.wait(5):
+    while not done.wait(0.2):
         try:
             heartbeat(force=True)
         except BaseException:
@@ -206,6 +250,12 @@ def admitted_e1_model(config: RuntimeConfig, purpose: str) -> Iterator[Callable[
         _monitored_load(config, heartbeat, server_state, stopped)
         if loaded_generation_models(config.iris_endpoint) != iris_models:
             raise RuntimeError("IRIS changed while Mavis loaded")
+        def abort_idle_server() -> None:
+            if stopped["yes"]:
+                return
+            _abort_trial(config, server_state)
+            stopped["yes"] = True
+        heartbeat.abort_idle_server = abort_idle_server
         yield heartbeat
     except BaseException as error:
         primary_error = error

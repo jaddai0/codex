@@ -1,14 +1,18 @@
 """No-GPU fault checks for installed E1 shared GPU admission."""
 
 from pathlib import Path
+import subprocess
 import tempfile
 import threading
+import time
 import unittest
 from unittest.mock import Mock, patch
 
 from mavis import e1_gpu
 from mavis.runtime import RuntimeConfig
 from mavis.storage import read_json
+
+RAW_LEASE_COMMAND = e1_gpu._lease_command
 
 
 class E1GPUAdmissionTests(unittest.TestCase):
@@ -53,7 +57,7 @@ class E1GPUAdmissionTests(unittest.TestCase):
                 self.held = False
             return ""
 
-        def generations(endpoint):
+        def generations(endpoint, **_kwargs):
             return list(self.iris) if endpoint == self.config.iris_endpoint else (
                 [self.config.model] if self.loaded else [])
 
@@ -198,6 +202,87 @@ class E1GPUAdmissionTests(unittest.TestCase):
         ), self.state)
         self.assertFalse(self.server)
         self.assertFalse(self.held)
+
+    def test_live_trial_checks_game_within_one_second_after_prior_heartbeat(self):
+        detected = False
+        with self.assertRaisesRegex(RuntimeError, "game state is unsafe"):
+            with e1_gpu.admitted_e1_model(self.config, "e1:trial") as heartbeat:
+                heartbeat(force=True)
+                self.game = True
+                deadline = time.monotonic() + 1
+                while time.monotonic() < deadline:
+                    try:
+                        heartbeat()
+                    except RuntimeError as error:
+                        self.assertIn("game state is unsafe", str(error))
+                        detected = True
+                        raise
+                    time.sleep(0.05)
+        self.assertTrue(detected, "E1 heartbeat did not detect the game within one second")
+        self.assertFalse(self.server)
+        self.assertFalse(self.held)
+
+    def test_slow_gpu_status_is_bounded_and_fails_closed(self):
+        with patch.object(e1_gpu.subprocess, "run", side_effect=subprocess.TimeoutExpired(
+            [str(e1_gpu.LEASE), "status"], 0.5,
+        )) as run:
+            with self.assertRaises(subprocess.TimeoutExpired):
+                RAW_LEASE_COMMAND("status")
+        self.assertEqual(run.call_args.kwargs["timeout"], 0.5)
+
+    def test_game_during_post_load_hash_stops_exact_idle_server(self):
+        gate = threading.Event()
+        entered = threading.Event()
+        original_abort = self.abort.side_effect
+
+        def abort(config, state):
+            original_abort(config, state)
+            gate.set()
+
+        def hashing():
+            entered.set()
+            self.game = True
+            gate.wait(5)
+            return {"bound": True}
+
+        self.abort.side_effect = abort
+        started = time.monotonic()
+        with self.assertRaisesRegex(RuntimeError, "game state is unsafe"):
+            with e1_gpu.admitted_e1_model(self.config, "e1:trial") as heartbeat:
+                heartbeat.monitor_read_only(hashing)
+        self.assertTrue(entered.is_set())
+        self.assertLess(time.monotonic() - started, 1.5)
+        self.abort.assert_called_once()
+        self.assertFalse(self.server)
+        self.assertFalse(self.held)
+
+    def test_slow_status_during_hash_stops_server_and_retains_unverified_lease(self):
+        gate = threading.Event()
+        entered = threading.Event()
+        original_abort = self.abort.side_effect
+        original_command = self.patches[0].side_effect
+
+        def abort(config, state):
+            original_abort(config, state)
+            gate.set()
+
+        def command(*args):
+            if args[0] == "status" and entered.is_set():
+                raise subprocess.TimeoutExpired([str(e1_gpu.LEASE), "status"], 0.5)
+            return original_command(*args)
+
+        def hashing():
+            entered.set()
+            gate.wait(5)
+
+        self.abort.side_effect = abort
+        self.patches[0].side_effect = command
+        with self.assertRaisesRegex(RuntimeError, "inventory receipt"):
+            with e1_gpu.admitted_e1_model(self.config, "e1:trial") as heartbeat:
+                heartbeat.monitor_read_only(hashing)
+        self.abort.assert_called_once()
+        self.assertFalse(self.server)
+        self.assertTrue(self.held)
 
     def test_same_name_lease_takeover_stops_own_server_but_not_new_lease(self):
         with self.assertRaisesRegex(RuntimeError, "purpose changed"):

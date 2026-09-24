@@ -89,23 +89,26 @@ def _own_headers(config: RuntimeConfig) -> dict[str, dict[str, str]]:
     return {"headers": _auth_headers(config.api_key)} if config.api_key else {}
 
 
-def inventory(endpoint: str, *, api_key: str | None = None) -> list[dict[str, Any]]:
+def inventory(endpoint: str, *, api_key: str | None = None,
+              timeout: float = 10) -> list[dict[str, Any]]:
     # The admin route requires a browser session cookie. A trial key uses the
     # public, Bearer-authenticated status route with the same admission fields.
     path = "/v1/models/status" if api_key else "/admin/api/models"
     payload = request_json(endpoint, path, **(
         {"headers": _auth_headers(api_key)} if api_key else {}
-    ))
+    ), timeout=timeout)
     records = payload.get("models", payload) if isinstance(payload, dict) else payload
     if not isinstance(records, list) or not all(isinstance(item, dict) for item in records):
         raise RuntimeError("oMLX returned an invalid model inventory")
     return records
 
 
-def loaded_generation_models(endpoint: str, *, api_key: str | None = None) -> list[str]:
+def loaded_generation_models(endpoint: str, *, api_key: str | None = None,
+                             timeout: float = 10) -> list[str]:
     """Require a readable inventory and name every loaded non-embedding model."""
     models = []
-    for row in inventory(endpoint, **({"api_key": api_key} if api_key else {})):
+    for row in inventory(endpoint, timeout=timeout,
+                         **({"api_key": api_key} if api_key else {})):
         if row.get("loaded") is not True:
             continue
         if row.get("engine_type") == "embedding" or row.get("model_type") == "embedding":

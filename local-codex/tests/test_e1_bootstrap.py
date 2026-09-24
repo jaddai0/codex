@@ -203,6 +203,25 @@ class E1BootstrapTests(unittest.TestCase):
         self.assertIsNone(receipts[0]["accepted_profile_id"])
         self.assertFalse((self.home / "profiles/main/active.json").exists())
 
+    def test_loaded_first_profile_recheck_uses_heartbeat_monitor(self):
+        self._create()
+        binding = trial_runtime.trial_binding(self.home, "repair", "baseline", "regression")
+        calls = []
+
+        def monitor(work):
+            calls.append("start")
+            result = work()
+            calls.append("end")
+            return result
+
+        receipt_path = trial_runtime._prepare_trial_locked(
+            binding, mavis_home=self.home, share=self.share, core_binary=self.core,
+            base_url="http://127.0.0.1:8001/v1", records=self.records,
+            package_manifest=self.package, heartbeat_monitor=monitor,
+        )
+        self.assertTrue(receipt_path.is_file())
+        self.assertEqual(calls, ["start", "end"])
+
     def test_missing_or_stale_e0_rejects_before_first_trial(self):
         with self.assertRaises(Exception):
             trial_runtime.trial_binding(self.home, "repair", "baseline", "regression")

@@ -453,10 +453,20 @@ class TrialRuntimeTests(unittest.TestCase):
         environment = self._installed_trial_environment()
         events = []
 
+        class Heartbeat:
+            def __call__(self):
+                events.append(("heartbeat",))
+
+            def monitor_read_only(self, work):
+                events.append(("monitor-start",))
+                result = work()
+                events.append(("monitor-end",))
+                return result
+
         @contextmanager
         def admitted(config, purpose):
             events.append(("admitted", config.model, purpose))
-            yield lambda: events.append(("heartbeat",))
+            yield Heartbeat()
             events.append(("cleanup",))
 
         expected = self.fixture.home / "e1/repair/trials/candidate/regression.json"
@@ -471,6 +481,8 @@ class TrialRuntimeTests(unittest.TestCase):
             self.assertEqual(trial_runtime.run_trial("repair", "candidate", "regression", "task"), expected)
         self.assertEqual(events[0], ("admitted", "model-a", "e1:repair:candidate:regression"))
         self.assertEqual(events[-1], ("cleanup",))
+        self.assertIn(("monitor-start",), events)
+        self.assertIn(("monitor-end",), events)
         self.assertTrue(launch.call_args.kwargs["lease_held"])
         self.assertTrue(callable(launch.call_args.kwargs["heartbeat"]))
 

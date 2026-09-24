@@ -12,6 +12,7 @@ import shutil
 import subprocess
 import sys
 import tomllib
+from typing import Callable
 
 from mavis.e1 import E1Runner, _clean_revision
 from mavis.e1_bootstrap import _inventory_model, validate_bootstrap
@@ -148,10 +149,12 @@ def _prepare_trial_locked(
     gateway_root: Path | None = None,
     gateway_env_file: Path | None = None,
     package_manifest: Path | None = None,
+    heartbeat_monitor: Callable[[Callable[[], dict]], dict] | None = None,
 ) -> Path:
     if binding["profile_source"] == "e0-bootstrap":
-        refreshed = trial_binding(mavis_home, binding["record"]["experiment_id"],
-                                  binding["arm"], binding["case_id"])
+        rebind = lambda: trial_binding(mavis_home, binding["record"]["experiment_id"],
+                                       binding["arm"], binding["case_id"])
+        refreshed = heartbeat_monitor(rebind) if heartbeat_monitor is not None else rebind()
         if (refreshed["profile_source"] != "e0-bootstrap"
                 or refreshed["profile"]["_source_sha256"] != binding["profile"]["_source_sha256"]):
             raise ValueError("E1 bootstrap changed before trial preparation")
@@ -591,7 +594,9 @@ def run_trial(experiment_id: str, arm: str, case_id: str, task: str) -> Path:
         if runtime_home.exists() or receipt_path.exists():
             raise FileExistsError("E1 trial already prepared")
         with admitted_e1_model(runtime, f"e1:{experiment_id}:{arm}:{case_id}") as heartbeat:
-            refreshed = trial_binding(mavis_home, experiment_id, arm, case_id)
+            refreshed = heartbeat.monitor_read_only(
+                lambda: trial_binding(mavis_home, experiment_id, arm, case_id)
+            )
             if (
                 refreshed["snapshot"] != binding["snapshot"]
                 or refreshed["profile"]["_source_sha256"]
@@ -609,6 +614,7 @@ def run_trial(experiment_id: str, arm: str, case_id: str, task: str) -> Path:
                 gateway_root=gateway_root,
                 gateway_env_file=gateway_env_file,
                 package_manifest=package_manifest,
+                heartbeat_monitor=heartbeat.monitor_read_only,
             )
             argv = [
                 str(core_binary),
