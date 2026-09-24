@@ -149,7 +149,7 @@ def _states_failed_exit_one(answer: str) -> bool:
     if re.search(r"\b(?:command|produce_log\.py)\b.{0,60}\b(?:succeeded|passed)\b", answer, re.IGNORECASE):
         return False
     code_values = re.compile(
-        r"\b(?:exit(?:ed)?(?:\s+with)?\s+code|code)\s*(?:\*\*)?`?(\d+)\b`?(?:\*\*)?",
+        r"\b(?:exit(?:ed)?(?:\s+with)?\s+code|code)\s*[:=]?\s*(?:\*\*)?`?(\d+)\b`?(?:\*\*)?",
         re.IGNORECASE,
     )
     if any(int(match.group(1)) != 1 for match in code_values.finditer(answer)):

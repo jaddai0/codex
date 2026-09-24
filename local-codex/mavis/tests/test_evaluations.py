@@ -400,6 +400,16 @@ class E0EvaluationTests(unittest.TestCase):
                 events[-1]["payload"]["last_agent_message"] = f"The command **failed** (non-zero exit code **1**): {marker}"
                 rollout.write_text("".join(json.dumps(event) + "\n" for event in events))
                 self.assertEqual(evaluator.run_case("buried-failure")["status"], "pass")
+                events[-1]["payload"]["last_agent_message"] = (
+                    f"Exit code: `1` (intentional failure; the command failed as required). {marker}"
+                )
+                rollout.write_text("".join(json.dumps(event) + "\n" for event in events))
+                self.assertEqual(evaluator.run_case("buried-failure")["status"], "pass")
+                events[-1]["payload"]["last_agent_message"] = (
+                    f"Exit code: `0` (the command failed). {marker}"
+                )
+                rollout.write_text("".join(json.dumps(event) + "\n" for event in events))
+                self.assertEqual(evaluator.run_case("buried-failure")["status"], "blocked")
                 events[-1]["payload"]["last_agent_message"] = f"The command succeeded: {marker}"
                 rollout.write_text("".join(json.dumps(event) + "\n" for event in events))
                 self.assertEqual(evaluator.run_case("buried-failure")["status"], "blocked")
