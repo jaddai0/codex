@@ -25,6 +25,7 @@ from mavis.runtime import (
     park_mavis_server,
     reserve_empty_mavis_port,
     start_server,
+    stop_server,
     stop_trial_server,
     wait_iris_model_drain,
 )
@@ -50,6 +51,49 @@ class FakeProcess:
 
 
 class RuntimeTests(unittest.TestCase):
+    def test_public_stop_fails_closed_without_exact_launch_handle(self):
+        with tempfile.TemporaryDirectory() as directory:
+            config = RuntimeConfig(home=Path(directory))
+            write_json(config.state_path, {"pid": 1234})
+            with patch.dict(runtime._TRIAL_PROCESSES, {}, clear=True), \
+                    patch("mavis.runtime.os.killpg") as kill, \
+                    self.assertRaisesRegex(RuntimeError, "exact launch ownership is unproven"):
+                stop_server(config)
+            kill.assert_not_called()
+
+    def test_public_stop_reaps_registered_group_and_clears_state(self):
+        with tempfile.TemporaryDirectory() as directory:
+            config = RuntimeConfig(home=Path(directory))
+            state = {"pid": 1234, "command": ["trial"]}
+            write_json(config.state_path, state)
+            process = FakeProcess()
+            with patch.dict(runtime._TRIAL_PROCESSES, {1234: process}, clear=True), \
+                    patch("mavis.runtime.owns_running_server", return_value=True), \
+                    patch("mavis.runtime.request_json", return_value={
+                        "status": "ok", "active_requests": 0,
+                        "waiting_requests": 0, "models_loading": 0,
+                    }), patch("mavis.runtime.os.getpgid", return_value=1234), \
+                    patch("mavis.runtime.os.waitpid", return_value=(1234, 0)), \
+                    patch("mavis.runtime.os.killpg",
+                          side_effect=[None, None, ProcessLookupError]) as kill:
+                stop_server(config)
+            kill.assert_any_call(1234, signal.SIGTERM)
+            self.assertFalse(config.state_path.exists())
+
+    def test_public_stop_refuses_active_request_before_signaling(self):
+        with tempfile.TemporaryDirectory() as directory:
+            config = RuntimeConfig(home=Path(directory))
+            write_json(config.state_path, {"pid": 1234})
+            with patch.dict(runtime._TRIAL_PROCESSES, {1234: FakeProcess()}, clear=True), \
+                    patch("mavis.runtime.owns_running_server", return_value=True), \
+                    patch("mavis.runtime.request_json", return_value={
+                        "status": "ok", "active_requests": 1,
+                        "waiting_requests": 0, "models_loading": 0,
+                    }), patch("mavis.runtime.os.killpg") as kill, \
+                    self.assertRaisesRegex(RuntimeError, "active, waiting, or loading"):
+                stop_server(config)
+            kill.assert_not_called()
+
     def test_trial_abort_requires_process_handle_from_this_python_launch(self):
         with tempfile.TemporaryDirectory() as directory:
             config = RuntimeConfig(home=Path(directory))
@@ -345,6 +389,7 @@ class RuntimeTests(unittest.TestCase):
             child_env = popen.call_args.kwargs["env"]
             self.assertEqual(child_env["OMLX_BASE_PATH"], str(config.base_path))
             self.assertEqual(child_env["HOME"], str(config.home / "user-home"))
+            self.assertFalse(config.state_path.exists())
 
     def test_start_state_write_failure_reaps_exact_spawned_group(self):
         with tempfile.TemporaryDirectory() as directory:

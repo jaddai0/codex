@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from contextlib import contextmanager
 from contextvars import ContextVar
+import os
 from pathlib import Path
 import subprocess
 import threading
@@ -14,6 +15,7 @@ from uuid import uuid4
 
 from mavis.runtime import (
     RuntimeConfig,
+    _stop_spawned_process_group,
     endpoint_alive,
     inventory,
     loaded_generation_models,
@@ -36,7 +38,8 @@ _PURPOSE: ContextVar[str | None] = ContextVar("mavis_observation_lease_purpose",
 
 def _lease_command(*args: str) -> str:
     run = subprocess.run(
-        [str(LEASE), *args], capture_output=True, text=True, timeout=15, check=False
+        [str(LEASE), *args], capture_output=True, text=True,
+        timeout=1 if args[0] == "status" else 15, check=False,
     )
     if run.returncode:
         raise RuntimeError(
@@ -76,8 +79,24 @@ def _idle_mavis_server(config: RuntimeConfig) -> None:
         raise RuntimeError("Mavis server has active, waiting, or loading work")
 
 
+def _abort_observation_server(config: RuntimeConfig, state: dict[str, object], *,
+                              own_loading: bool = False) -> None:
+    if endpoint_alive(config.endpoint):
+        status = request_json(config.endpoint, "/api/status")
+        if (not isinstance(status, dict) or status.get("status") != "ok"
+                or any(type(status.get(key)) is not int or status[key] < 0 for key in
+                       ("active_requests", "waiting_requests", "models_loading"))):
+            raise RuntimeError("Mavis server work status is untrusted before abort")
+        if (status["waiting_requests"] or
+                status["active_requests"] >
+                (1 if own_loading and status["models_loading"] else 0) or
+                (status["models_loading"] and not own_loading)):
+            raise RuntimeError("Mavis has work outside this observation's load")
+    stop_trial_server(config, state)
+
+
 def _failure_receipt(config: RuntimeConfig, purpose: str,
-                     error: BaseException) -> Path:
+                     error: BaseException, result: dict[str, object] | None = None) -> Path:
     def observed(endpoint: str) -> object:
         try:
             return inventory(endpoint)
@@ -88,6 +107,12 @@ def _failure_receipt(config: RuntimeConfig, purpose: str,
         "schema_version": "mavis.shared-gpu-cleanup-failure/v1",
         "at_epoch": time.time(), "gpu_lease_holder": HOLDER,
         "gpu_lease_purpose": purpose, "error": str(error),
+        "observation_child": {
+            "pid": result.get("observation_child_pid"),
+            "safe": result.get("observation_child_safe"),
+            "group_remained": result.get("observation_child_group_remained", False),
+            "cleanup_error": result.get("observation_child_cleanup_error"),
+        } if result is not None else None,
         "iris_inventory": observed(config.iris_endpoint),
         "mavis_inventory": observed(config.endpoint),
     })
@@ -99,7 +124,7 @@ def _record_failure_receipt(result: dict[str, object], config: RuntimeConfig,
     if "cleanup_failure_receipt" in result:
         return
     try:
-        result["cleanup_failure_receipt"] = str(_failure_receipt(config, purpose, error))
+        result["cleanup_failure_receipt"] = str(_failure_receipt(config, purpose, error, result))
     except BaseException as receipt_error:
         result["cleanup_failure_receipt_error"] = str(receipt_error)
 
@@ -119,7 +144,7 @@ def _monitored_load(config: RuntimeConfig, purpose: str,
             done.set()
     threading.Thread(target=worker, name="mavis-observation-load", daemon=True).start()
     next_renew = time.monotonic() + 300
-    while not done.wait(5):
+    while not done.wait(0.5):
         try:
             _owned_lease(purpose)
             _safe_game_state(_lease_command("status"))
@@ -129,7 +154,7 @@ def _monitored_load(config: RuntimeConfig, purpose: str,
                 renew_gpu_lease()
                 next_renew = time.monotonic() + 300
         except BaseException:
-            stop_trial_server(config, server_state)
+            _abort_observation_server(config, server_state, own_loading=True)
             stopped["yes"] = True
             done.wait(10)
             raise
@@ -137,11 +162,67 @@ def _monitored_load(config: RuntimeConfig, purpose: str,
         _owned_lease(purpose)
         _safe_game_state(_lease_command("status"))
     except BaseException:
-        stop_trial_server(config, server_state)
+        _abort_observation_server(config, server_state)
         stopped["yes"] = True
         raise
     if failures:
         raise failures[0]
+
+
+def run_monitored_observation(config: RuntimeConfig, command: list[str], *,
+                              cwd: Path, env: dict[str, str], stdout: object,
+                              shared: dict[str, object], timeout: float = 1800) -> int:
+    """Watch an exact E0 child while its model requests can hold the GPU."""
+    purpose = _PURPOSE.get()
+    if purpose is None or shared.get("iris_generation_models") is None:
+        raise RuntimeError("E0 child has no active observation lease and IRIS snapshot")
+    expected_iris = shared["iris_generation_models"]
+    if not isinstance(expected_iris, list):
+        raise RuntimeError("E0 IRIS generation snapshot is invalid")
+    _owned_lease(purpose)
+    _safe_game_state(_lease_command("status"))
+    if loaded_generation_models(config.iris_endpoint) != expected_iris:
+        raise RuntimeError("IRIS generation inventory changed before E0 child")
+    process = subprocess.Popen(command, cwd=cwd, env=env, stdin=subprocess.DEVNULL,
+                               stdout=stdout, stderr=subprocess.STDOUT,
+                               start_new_session=True)
+    shared["observation_child_pid"] = process.pid
+    deadline = time.monotonic() + timeout
+    next_renew = time.monotonic() + 300
+    try:
+        while True:
+            try:
+                exit_status = process.wait(timeout=min(0.5, max(0.01, deadline - time.monotonic())))
+            except subprocess.TimeoutExpired:
+                exit_status = None
+            _owned_lease(purpose)
+            _safe_game_state(_lease_command("status"))
+            if loaded_generation_models(config.iris_endpoint) != expected_iris:
+                raise RuntimeError("IRIS generation inventory changed during E0 child")
+            if time.monotonic() >= next_renew:
+                renew_gpu_lease()
+                next_renew = time.monotonic() + 300
+            if exit_status is not None:
+                # The tool roundtrip must not leave a child in its dedicated
+                # process group after the observed command exits.
+                try:
+                    os.killpg(process.pid, 0)
+                except ProcessLookupError:
+                    return exit_status
+                shared["observation_child_safe"] = False
+                shared["observation_child_group_remained"] = True
+                raise RuntimeError("E0 observation child group remained after command exit")
+            if time.monotonic() >= deadline:
+                raise TimeoutError("E0 observation child exceeded its deadline")
+    except BaseException:
+        if process.poll() is None:
+            try:
+                _stop_spawned_process_group(process)
+            except BaseException as cleanup_error:
+                shared["observation_child_safe"] = False
+                shared["observation_child_cleanup_error"] = str(cleanup_error)
+                raise
+        raise
 
 
 @contextmanager
@@ -163,6 +244,7 @@ def shared_mavis_model(
         "iris_stayed_loaded": False,
         "mavis_loaded": False,
         "gpu_lease_released": False,
+        "observation_child_safe": True,
     }
     server_state: dict[str, object] | None = None
     load_attempted = False
@@ -202,6 +284,7 @@ def shared_mavis_model(
         _monitored_load(config, purpose, server_state, stopped, iris_models)
         if loaded_generation_models(config.iris_endpoint) != iris_models:
             raise RuntimeError("IRIS changed while Mavis loaded")
+        result["iris_generation_models"] = iris_models
         result["mavis_loaded"] = True
         yield result
     except BaseException as error:
@@ -209,7 +292,7 @@ def shared_mavis_model(
         raise
     finally:
         cleanup_error: BaseException | None = None
-        gpu_stopped = (server_state is None and not unsafe_startup) or stopped["yes"]
+        gpu_stopped = ((server_state is None and not unsafe_startup) or stopped["yes"])
         try:
             _owned_lease(purpose)
             _safe_game_state(_lease_command("status"))
@@ -222,7 +305,7 @@ def shared_mavis_model(
                             type(status.get("models_loading")) is not int):
                         raise RuntimeError("Mavis model-loading status is untrusted")
                     if status["models_loading"]:
-                        stop_trial_server(config, server_state)
+                        _abort_observation_server(config, server_state, own_loading=True)
                         stopped["yes"] = True
                     loaded = [] if stopped["yes"] else loaded_generation_models(config.endpoint)
                     if loaded:
@@ -243,7 +326,7 @@ def shared_mavis_model(
                     reservation.close()
                     if endpoint_alive(config.endpoint):
                         raise RuntimeError("Mavis did not park after the observation")
-            gpu_stopped = not unsafe_startup
+            gpu_stopped = not unsafe_startup and result["observation_child_safe"] is True
             result["mavis_loaded"] = False
             if iris_models is not None and loaded_generation_models(config.iris_endpoint) != iris_models:
                 raise RuntimeError("IRIS lost its generation model during the observation")
@@ -252,14 +335,16 @@ def shared_mavis_model(
             cleanup_error = error
             if server_state is not None and not stopped["yes"]:
                 try:
-                    stop_trial_server(config, server_state)
+                    _abort_observation_server(config, server_state)
                     stopped["yes"] = True
-                    gpu_stopped = True
+                    gpu_stopped = result["observation_child_safe"] is True
                     result["mavis_loaded"] = False
                 except BaseException as stop_error:
                     cleanup_error = RuntimeError(f"{error}; trial server abort failed: {stop_error}")
         finally:
             try:
+                if cleanup_error is not None:
+                    _record_failure_receipt(result, config, purpose, cleanup_error)
                 if gpu_stopped:
                     # A different Codex session may have acquired this holder name.
                     _owned_lease(purpose)

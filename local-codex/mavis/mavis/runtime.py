@@ -533,8 +533,7 @@ def start_server(config: RuntimeConfig, wait_seconds: float = 30.0, *,
             if endpoint_alive(config.endpoint):
                 if require_new and not owns_running_server(config):
                     raise RuntimeError("Mavis endpoint changed owner during startup")
-                if require_new:
-                    _TRIAL_PROCESSES[process.pid] = process
+                _TRIAL_PROCESSES[process.pid] = process
                 return state
             time.sleep(0.25)
         raise TimeoutError("Mavis oMLX did not become healthy before the startup deadline")
@@ -547,6 +546,10 @@ def start_server(config: RuntimeConfig, wait_seconds: float = 30.0, *,
             )
             failure.unsafe_gpu_work = True
             raise failure from cleanup_error
+        # A failed launch must not leave a PID-bearing record that could later
+        # alias another process. Preserve a changed record owned by someone else.
+        if config.state_path.is_file() and read_json(config.state_path) == state:
+            config.state_path.unlink()
         raise
 
 
@@ -717,10 +720,27 @@ def ensure_runtime(config: RuntimeConfig, *, load: bool = True) -> dict[str, Any
 
 
 def stop_server(config: RuntimeConfig) -> None:
+    """Stop only an exact server launched by this process, including its workers.
+
+    A separate CLI process has no launch handle, so a persisted PID and open
+    base path are not enough to authorize signaling a potentially reused PID.
+    """
+    if not config.state_path.is_file():
+        raise RuntimeError("Mavis server has no launch record")
+    state = read_json(config.state_path)
+    pid = state.get("pid")
+    if type(pid) is not int or pid not in _TRIAL_PROCESSES:
+        raise RuntimeError("Mavis server exact launch ownership is unproven")
     if not owns_running_server(config):
         raise RuntimeError("refusing to stop a process Mavis does not own")
-    pid = int(read_json(config.state_path)["pid"])
-    os.kill(pid, signal.SIGTERM)
+    status = request_json(config.endpoint, "/api/status")
+    if (not isinstance(status, dict) or status.get("status") != "ok"
+            or any(type(status.get(key)) is not int or status[key] != 0 for key in
+                   ("active_requests", "waiting_requests", "models_loading"))):
+        raise RuntimeError("Mavis server has active, waiting, or loading work")
+    stop_trial_server(config, state)
+    if config.state_path.is_file() and read_json(config.state_path) == state:
+        config.state_path.unlink()
 
 
 def reserve_empty_mavis_port(config: RuntimeConfig, *,

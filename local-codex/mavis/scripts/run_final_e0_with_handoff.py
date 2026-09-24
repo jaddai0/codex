@@ -15,7 +15,7 @@ import uuid
 from mavis.evaluations import E0_CASES, E0Evaluator, installed_candidate_fingerprint
 from mavis.runtime import RuntimeConfig, reserve_empty_mavis_port, require_installed_selected_model, with_mavis_handoff_lease
 from mavis.storage import sha256_file, write_json
-from shared_gpu_observation import shared_mavis_model
+from shared_gpu_observation import run_monitored_observation, shared_mavis_model
 
 
 @with_mavis_handoff_lease("final-e0")
@@ -54,11 +54,11 @@ def main() -> int:
         with shared_mavis_model(config, "installed Mavis E0 tool roundtrip") as shared:
             env["MAVIS_E0_SHARED_GPU_LEASE"] = "codex-mavis"
             with live_log.open("wb") as stream:
-                run = subprocess.run([sys.executable, "-m", "mavis", "eval", "e0",
-                                      "--case", "tool-roundtrip"],
-                                     cwd=home, env=env, stdin=subprocess.DEVNULL,
-                                     stdout=stream, stderr=subprocess.STDOUT, timeout=1800)
-            result["tool_roundtrip_exit"] = run.returncode
+                result["tool_roundtrip_exit"] = run_monitored_observation(
+                    config,
+                    [sys.executable, "-m", "mavis", "eval", "e0", "--case", "tool-roundtrip"],
+                    cwd=home, env=env, stdout=stream, shared=shared, timeout=1800,
+                )
     except BaseException as error:
         result["error"] = repr(error)
     finally:

@@ -2,7 +2,10 @@
 
 from pathlib import Path
 import importlib.util
+import json
+import subprocess
 import sys
+import tempfile
 import threading
 import unittest
 from unittest.mock import Mock, patch
@@ -24,10 +27,13 @@ class Lease:
         self.calls = []
         self.other_purpose = False
         self.game_live = False
+        self.status_timeout = False
 
     def __call__(self, *args):
         self.calls.append(args)
         if args[0] == "status":
+            if self.status_timeout:
+                raise subprocess.TimeoutExpired(["gpu-lease", "status"], 1)
             if self.purpose is None:
                 return "the GPU is free\nIRIS: idle\n"
             purpose = "another-session" if self.other_purpose else self.purpose
@@ -45,6 +51,151 @@ class SharedGpuObservationTests(unittest.TestCase):
         self.config = RuntimeConfig(home=Path("/private/tmp/mavis-test"),
                                     allow_concurrent_local=True)
         self.lease = Lease()
+
+    def test_status_call_has_bounded_timeout(self):
+        with patch.object(observer.subprocess, "run",
+                          side_effect=subprocess.TimeoutExpired(["gpu-lease", "status"], 1)) as run:
+            with self.assertRaises(subprocess.TimeoutExpired):
+                observer._lease_command("status")
+        self.assertEqual(run.call_args.kwargs["timeout"], 1)
+
+    def test_slow_status_during_observation_aborts_exact_child(self):
+        child = Mock(pid=4321)
+        def wait(*, timeout):
+            self.lease.status_timeout = True
+            raise subprocess.TimeoutExpired(["e0"], timeout)
+        child.wait.side_effect = wait
+        child.poll.return_value = None
+        shared = {"iris_generation_models": ["iris-model"], "observation_child_safe": True}
+        token = observer._PURPOSE.set("our-e0")
+        self.lease.purpose = "our-e0"
+        try:
+            with (patch.object(observer, "_lease_command", side_effect=self.lease),
+                  patch.object(observer, "loaded_generation_models", return_value=["iris-model"]),
+                  patch.object(observer.subprocess, "Popen", return_value=child),
+                  patch.object(observer, "_stop_spawned_process_group") as stop,
+                  self.assertRaises(subprocess.TimeoutExpired)):
+                observer.run_monitored_observation(
+                    self.config, ["e0"], cwd=Path("/tmp"), env={}, stdout=None,
+                    shared=shared, timeout=30,
+                )
+            stop.assert_called_once_with(child)
+        finally:
+            observer._PURPOSE.reset(token)
+
+    def test_observation_child_checks_game_and_stops_only_its_own_group(self):
+        child = Mock(pid=4321)
+        def wait(*, timeout):
+            self.lease.game_live = True
+            raise __import__("subprocess").TimeoutExpired(["e0"], timeout)
+        child.wait.side_effect = wait
+        child.poll.return_value = None
+        shared = {"iris_generation_models": ["iris-model"], "observation_child_safe": True}
+        token = observer._PURPOSE.set("our-e0")
+        self.lease.purpose = "our-e0"
+        try:
+            with (patch.object(observer, "_lease_command", side_effect=self.lease),
+                  patch.object(observer, "loaded_generation_models", return_value=["iris-model"]),
+                  patch.object(observer.subprocess, "Popen", return_value=child) as spawn,
+                  patch.object(observer, "_stop_spawned_process_group") as stop,
+                  self.assertRaisesRegex(RuntimeError, "game state is unsafe")):
+                observer.run_monitored_observation(
+                    self.config, ["e0"], cwd=Path("/tmp"), env={}, stdout=None,
+                    shared=shared, timeout=30,
+                )
+            self.assertTrue(spawn.call_args.kwargs["start_new_session"])
+            self.assertLessEqual(child.wait.call_args.kwargs["timeout"], 1)
+            stop.assert_called_once_with(child)
+            self.assertTrue(shared["observation_child_safe"])
+        finally:
+            observer._PURPOSE.reset(token)
+
+    def test_unstopped_observation_child_retains_failure_state(self):
+        child = Mock(pid=4321)
+        def wait(*, timeout):
+            self.lease.game_live = True
+            raise __import__("subprocess").TimeoutExpired(["e0"], timeout)
+        child.wait.side_effect = wait
+        child.poll.return_value = None
+        shared = {"iris_generation_models": ["iris-model"], "observation_child_safe": True}
+        token = observer._PURPOSE.set("our-e0")
+        self.lease.purpose = "our-e0"
+        try:
+            with (patch.object(observer, "_lease_command", side_effect=self.lease),
+                  patch.object(observer, "loaded_generation_models", return_value=["iris-model"]),
+                  patch.object(observer.subprocess, "Popen", return_value=child),
+                  patch.object(observer, "_stop_spawned_process_group",
+                               side_effect=RuntimeError("owned child would not stop"))):
+                with self.assertRaisesRegex(RuntimeError, "owned child would not stop"):
+                    observer.run_monitored_observation(
+                        self.config, ["e0"], cwd=Path("/tmp"), env={}, stdout=None,
+                        shared=shared, timeout=30,
+                    )
+            self.assertFalse(shared["observation_child_safe"])
+        finally:
+            observer._PURPOSE.reset(token)
+
+    def test_observation_child_success_checks_group_exit(self):
+        child = Mock(pid=4321)
+        child.wait.return_value = 0
+        shared = {"iris_generation_models": ["iris-model"], "observation_child_safe": True}
+        token = observer._PURPOSE.set("our-e0")
+        self.lease.purpose = "our-e0"
+        try:
+            with (patch.object(observer, "_lease_command", side_effect=self.lease),
+                  patch.object(observer, "loaded_generation_models", return_value=["iris-model"]),
+                  patch.object(observer.subprocess, "Popen", return_value=child),
+                  patch.object(observer.os, "killpg", side_effect=ProcessLookupError)):
+                self.assertEqual(observer.run_monitored_observation(
+                    self.config, ["e0"], cwd=Path("/tmp"), env={}, stdout=None,
+                    shared=shared, timeout=30,
+                ), 0)
+        finally:
+            observer._PURPOSE.reset(token)
+
+    def test_surviving_observation_child_group_is_recorded_and_fails_closed(self):
+        child = Mock(pid=4321)
+        child.wait.return_value = 0
+        child.poll.return_value = 0
+        shared = {"iris_generation_models": ["iris-model"], "observation_child_safe": True}
+        token = observer._PURPOSE.set("our-e0")
+        self.lease.purpose = "our-e0"
+        try:
+            with (patch.object(observer, "_lease_command", side_effect=self.lease),
+                  patch.object(observer, "loaded_generation_models", return_value=["iris-model"]),
+                  patch.object(observer.subprocess, "Popen", return_value=child),
+                  patch.object(observer.os, "killpg", return_value=None),
+                  self.assertRaisesRegex(RuntimeError, "child group remained")):
+                observer.run_monitored_observation(
+                    self.config, ["e0"], cwd=Path("/tmp"), env={}, stdout=None,
+                    shared=shared, timeout=30,
+                )
+            self.assertFalse(shared["observation_child_safe"])
+            self.assertTrue(shared["observation_child_group_remained"])
+            with tempfile.TemporaryDirectory() as directory, patch.object(
+                observer, "inventory", return_value=[]
+            ):
+                receipt = observer._failure_receipt(
+                    RuntimeConfig(home=Path(directory)), "our-e0",
+                    RuntimeError("child group remained"), shared,
+                )
+                self.assertEqual(json.loads(receipt.read_text())["observation_child"], {
+                    "pid": 4321, "safe": False, "group_remained": True,
+                    "cleanup_error": None,
+                })
+        finally:
+            observer._PURPOSE.reset(token)
+
+    def test_abort_refuses_another_sessions_active_request(self):
+        with (patch.object(observer, "endpoint_alive", return_value=True),
+              patch.object(observer, "request_json", return_value={
+                  "status": "ok", "active_requests": 2,
+                  "waiting_requests": 0, "models_loading": 1,
+              }), patch.object(observer, "stop_trial_server") as stop,
+              self.assertRaisesRegex(RuntimeError, "outside this observation")):
+            observer._abort_observation_server(self.config, {"pid": 1234},
+                                               own_loading=True)
+        stop.assert_not_called()
 
     def test_preexisting_server_fails_without_stopping_it_and_releases_lease(self):
         with (patch.object(observer, "_lease_command", side_effect=self.lease),
@@ -127,11 +278,13 @@ class SharedGpuObservationTests(unittest.TestCase):
                   "active_requests": 0, "waiting_requests": 0, "models_loading": 0}),
               patch.object(observer, "park_mavis_server",
                            side_effect=RuntimeError("park failed")),
-              patch.object(observer, "stop_trial_server") as abort):
-            with self.assertRaisesRegex(RuntimeError, "park failed"):
+              patch.object(observer, "stop_trial_server") as abort,
+              patch.object(observer, "_failure_receipt", return_value=Path("/tmp/e0-cleanup.json")) as receipt):
+            with self.assertRaisesRegex(RuntimeError, "inventory receipt: /tmp/e0-cleanup.json"):
                 with observer.shared_mavis_model(self.config, "test"):
                     pass
         abort.assert_called_once()
+        receipt.assert_called_once()
         self.assertIn(("release", "codex-mavis"), self.lease.calls)
 
     def test_success_parks_only_new_server_and_reports_lease_release(self):
@@ -166,6 +319,32 @@ class SharedGpuObservationTests(unittest.TestCase):
                                      expected_state={"pid": 1234})
         self.assertIn(("renew", "codex-mavis", "90"), self.lease.calls)
         self.assertIn(("release", "codex-mavis"), self.lease.calls)
+
+    def test_observation_child_group_survival_retains_lease_after_server_stop(self):
+        reservation = Mock()
+        def generation(endpoint):
+            return ["iris-model"] if endpoint == self.config.iris_endpoint else []
+        with (patch.object(observer, "_lease_command", side_effect=self.lease),
+              patch.object(observer, "loaded_generation_models", side_effect=generation),
+              patch.object(observer, "require_idle_iris_handoff"),
+              patch.object(observer, "reserve_empty_mavis_port", return_value=reservation),
+              patch.object(observer, "start_server", return_value={"pid": 1234}),
+              patch.object(observer, "read_json", return_value={"pid": 1234}),
+              patch.object(observer, "inventory", return_value=[{"id": self.config.model}]),
+              patch.object(observer, "endpoint_alive", return_value=False),
+              patch.object(observer, "load_model"),
+              patch.object(observer, "request_json", return_value={
+                  "status": "ok", "active_requests": 0,
+                  "waiting_requests": 0, "models_loading": 0,
+              }), patch.object(observer, "park_mavis_server", return_value=Mock()),
+              patch.object(observer, "_failure_receipt",
+                           return_value=Path("/tmp/e0-child-group.json")) as receipt):
+            with self.assertRaisesRegex(RuntimeError, "lease retained"):
+                with observer.shared_mavis_model(self.config, "test") as shared:
+                    shared["observation_child_safe"] = False
+                    shared["observation_child_group_remained"] = True
+        receipt.assert_called_once()
+        self.assertNotIn(("release", "codex-mavis"), self.lease.calls)
 
     def test_same_name_lease_takeover_blocks_cleanup_and_release(self):
         reservation = Mock()
@@ -259,7 +438,7 @@ class SharedGpuObservationTests(unittest.TestCase):
               patch.object(observer, "inventory", return_value=[{"id": self.config.model}]),
               patch.object(observer, "endpoint_alive", return_value=True),
               patch.object(observer, "load_model", side_effect=RuntimeError("load response failed")),
-              patch.object(observer, "request_json", side_effect=[idle, loading]),
+              patch.object(observer, "request_json", side_effect=[idle, loading, loading]),
               patch.object(observer, "stop_trial_server") as stop,
               patch.object(observer, "park_mavis_server") as park):
             with self.assertRaisesRegex(RuntimeError, "load response failed"):
