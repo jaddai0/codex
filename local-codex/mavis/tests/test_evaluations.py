@@ -250,6 +250,10 @@ class E0EvaluationTests(unittest.TestCase):
                     ["git", "-C", str(repo), "status", "--porcelain"], text=True
                 ),
             )
+            review_prompt = small_repository_review_prompt(Path(directory) / "manifest.json")
+            self.assertIn("before Mavis ran", review_prompt)
+            self.assertIn("Git diff is expected", review_prompt)
+            self.assertIn("protected_dirty_sha256", review_prompt)
             result = subprocess.run(
                 manifest["test_command"], cwd=repo, capture_output=True, text=True
             )
