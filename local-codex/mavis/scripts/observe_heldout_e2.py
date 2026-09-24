@@ -21,6 +21,7 @@ import sys
 import termios
 import time
 import uuid
+from typing import Callable
 
 from mavis.e2_tasks import (CATALOG_TEST, FULL_TEST, _completed_prompt_turn,
                             _user_turn, codex_terra_review_completed, first_task_prompt,
@@ -34,7 +35,7 @@ from mavis.runtime import (RuntimeConfig, endpoint_alive, handoff_lease_fd,
                            require_installed_selected_model,
                            with_mavis_handoff_lease)
 from mavis.storage import sha256_file, write_json
-from shared_gpu_observation import renew_gpu_lease, shared_mavis_model
+from shared_gpu_observation import _PURPOSE, _heartbeat, renew_gpu_lease, shared_mavis_model
 
 
 def _records(path: Path) -> list[dict]:
@@ -67,7 +68,9 @@ def _live_rollout(session_root: Path, repo: Path, prompt: str, started: float) -
 
 def _run_tui(command: list[str], *, repo: Path, env: dict[str, str],
              prompt: str, session_root: Path, log_path: Path,
-             rollout: Path | None = None, compact: bool = False) -> tuple[int, int]:
+             rollout: Path | None = None, compact: bool = False,
+             heartbeat: Callable[[], None] | None = None,
+             heartbeat_seconds: float = 5) -> tuple[int, int]:
     """Send /compact and /exit only after the exact native turn completes."""
     master, slave = pty.openpty()
     fcntl.ioctl(slave, termios.TIOCSWINSZ, struct.pack("HHHH", 40, 140, 0, 0))
@@ -92,9 +95,13 @@ def _run_tui(command: list[str], *, repo: Path, env: dict[str, str],
         last_enter_at = 0.0
         enter_retries = 0
         deadline = time.monotonic() + 1800
+        next_heartbeat = time.monotonic() + heartbeat_seconds
         completed_at: int | None = None
         with log_path.open("wb") as log:
             while True:
+                if heartbeat is not None and time.monotonic() >= next_heartbeat:
+                    heartbeat()
+                    next_heartbeat = time.monotonic() + heartbeat_seconds
                 if time.monotonic() > deadline:
                     raise TimeoutError(f"installed TUI timed out waiting for {stage}")
                 readable, _, _ = select.select([master], [], [], 0.25)
@@ -215,6 +222,11 @@ def main() -> int:
     shared: dict[str, object] | None = None
     try:
         with shared_mavis_model(config, "installed Mavis held-out E2") as shared:
+            purpose = _PURPOSE.get()
+            iris_models = shared.get("iris_generation_models")
+            if purpose is None or not isinstance(iris_models, list):
+                raise RuntimeError("held-out observation lacks its shared GPU state")
+            heartbeat = lambda: _heartbeat(config, purpose, iris_models)
             env = {**os.environ, "MAVIS_PROJECT_DIR": str(repo),
                    "MAVIS_E0_TRIAL_API_KEY": config.api_key,
                    "PYTHONDONTWRITEBYTECODE": "1"}
@@ -228,7 +240,8 @@ def main() -> int:
             result["first_pid"], result["first_exit"] = _run_tui(
                 first_argv, repo=repo, env=env, prompt=first_task_prompt(nonce),
                 session_root=Path.home() / ".local-codex" / "sessions",
-                log_path=task / "terminal-first.log", compact=True)
+                log_path=task / "terminal-first.log", compact=True,
+                heartbeat=heartbeat)
             if result["first_exit"] != 0:
                 raise RuntimeError("first installed Mavis process failed")
             result["stage1_state"] = fixture_state(manifest_path, stage="catalog")
@@ -260,7 +273,7 @@ def main() -> int:
             result["resume_pid"], result["resume_exit"] = _run_tui(
                 resume_argv, repo=repo, env=env, prompt=resume_task_prompt(nonce),
                 session_root=session_root, log_path=task / "terminal-resume.log",
-                rollout=rollout)
+                rollout=rollout, heartbeat=heartbeat)
             if result["resume_exit"] != 0:
                 raise RuntimeError("resumed installed Mavis process failed")
             resumed_rows = _records(rollout)[len(first_rows):]

@@ -11,6 +11,7 @@ from unittest.mock import patch
 
 SCRIPT = Path(__file__).resolve().parent.parent / "scripts" / "observe_heldout_e2.py"
 sys.path.insert(0, str(SCRIPT.parent))
+from shared_gpu_observation import UnsafeSharedGPU
 spec = importlib.util.spec_from_file_location("observe_heldout_e2", SCRIPT)
 assert spec and spec.loader
 observer = importlib.util.module_from_spec(spec)
@@ -45,6 +46,43 @@ if sys.stdin.readline().strip():raise SystemExit('retry Enter had content')
 
 
 class HeldoutPrivateTerminalTests(unittest.TestCase):
+    def test_gpu_heartbeat_abort_stops_owned_terminal(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            repo = root / "repo"
+            repo.mkdir()
+            fake = root / "waiting_tui.py"
+            pid_path = root / "pid"
+            fake.write_text(
+                "import os,sys,time\n"
+                "from pathlib import Path\n"
+                "Path(sys.argv[1]).write_text(str(os.getpid()))\n"
+                "while True: time.sleep(1)\n"
+            )
+            lease_fd = os.open(os.devnull, os.O_RDONLY)
+            calls = 0
+
+            def unsafe_after_start():
+                nonlocal calls
+                calls += 1
+                if calls >= 2:
+                    raise UnsafeSharedGPU("IRIS game started")
+
+            try:
+                with patch.object(observer, "handoff_lease_fd", return_value=lease_fd):
+                    with self.assertRaisesRegex(UnsafeSharedGPU, "IRIS game started"):
+                        observer._run_tui(
+                            [sys.executable, str(fake), str(pid_path)],
+                            repo=repo, env=os.environ.copy(), prompt="unused",
+                            session_root=root / "sessions", log_path=root / "terminal.log",
+                            heartbeat=unsafe_after_start, heartbeat_seconds=0.05,
+                        )
+            finally:
+                os.close(lease_fd)
+            self.assertTrue(pid_path.is_file())
+            with self.assertRaises(ProcessLookupError):
+                os.kill(int(pid_path.read_text()), 0)
+
     def test_completed_turn_then_compact_and_exit(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
