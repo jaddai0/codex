@@ -2,7 +2,9 @@ import contextlib
 import io
 import json
 import os
+import sys
 import time
+from types import ModuleType
 from pathlib import Path
 import subprocess
 import tempfile
@@ -19,11 +21,12 @@ from mavis.transcripts import TranscriptArchive
 class E1TrialCliTests(unittest.TestCase):
     def test_documented_single_separator_passes_exact_task(self):
         with tempfile.TemporaryDirectory() as directory:
-            import trial_runtime
-
             output = io.StringIO()
             receipt = Path(directory) / "trial.json"
+            trial_runtime = ModuleType("trial_runtime")
+            trial_runtime.run_trial = lambda *_: receipt
             with (patch("mavis.cli.home_from_env", return_value=Path(directory)),
+                  patch.dict(sys.modules, {"trial_runtime": trial_runtime}),
                   patch.object(trial_runtime, "run_trial", return_value=receipt) as run,
                   contextlib.redirect_stdout(output)):
                 self.assertEqual(main([
