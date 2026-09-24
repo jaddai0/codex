@@ -73,7 +73,7 @@ bind_project_root() {
 bind_project_root "$@"
 
 case "${1:-}" in
-  runtime|objective|run|output|archive-search|archive-retention|storage-pressure|pre-compact|project-evidence|project-index|project-memory|eval|e1|maintenance)
+  runtime|objective|run|output|librarian|archive-search|archive-retention|storage-pressure|pre-compact|project-evidence|project-index|project-memory|eval|e1|maintenance)
   export CODEX_HOME=${CODEX_HOME:-$runtime_home}
   export MAVIS_HOME=${MAVIS_HOME:-${HOME}/.local-codex/mavis-service}
   if [[ "$MAVIS_HOME" != /* ]]; then

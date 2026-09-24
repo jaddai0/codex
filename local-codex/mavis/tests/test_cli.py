@@ -12,6 +12,7 @@ from unittest.mock import patch
 from mavis.cli import main, build_parser
 from mavis.maintenance import MaintenanceQueue
 from mavis.objectives import ObjectiveStore
+from mavis.project_evidence import project_home
 from mavis.transcripts import TranscriptArchive
 
 
@@ -394,6 +395,36 @@ class MaintenanceCliTests(unittest.TestCase):
 
 
 class LauncherRoutingTests(unittest.TestCase):
+    def test_librarian_launcher_reads_only_the_selected_project_archive(self):
+        root = Path(__file__).resolve().parents[3]
+        launcher = root / "local-codex" / "bin" / "local-codex"
+        share = root / "local-codex" / "mavis"
+        with tempfile.TemporaryDirectory() as directory:
+            base = Path(directory)
+            repo = base / "repo"
+            repo.mkdir()
+            subprocess.run(["git", "init", "-q", str(repo)], check=True)
+            archive = TranscriptArchive(project_home(repo, create=True), "conv-1")
+            archive.append_segment([
+                {"role": "user", "content": "Decision: use SQLite first."},
+            ])
+            env = {**os.environ, "LOCAL_CODEX_SHARE_DIR": str(share),
+                   "MAVIS_HOME": str(base / "service"),
+                   "CODEX_HOME": str(base / "codex")}
+            run = subprocess.run(
+                [str(launcher), "librarian", "ask", "conv-1",
+                 "Which database was chosen?", "--project", str(repo),
+                 "--search-term", "SQLite", "--no-model"],
+                cwd=repo, env=env, text=True, capture_output=True, timeout=15,
+            )
+            self.assertEqual(run.returncode, 0, run.stderr)
+            result = json.loads(run.stdout)
+            self.assertEqual(result["status"], "pass")
+            self.assertFalse(result["model_called"])
+            self.assertIn("SQLite", result["answer"])
+            self.assertEqual(len(result["citations"]), 1)
+            self.assertIn(str(repo / ".mavis"), result["citations"][0]["path"])
+
     def test_service_commands_reach_python_without_loading_a_model(self):
         root = Path(__file__).resolve().parents[3]
         launcher = root / "local-codex" / "bin" / "local-codex"
@@ -402,7 +433,7 @@ class LauncherRoutingTests(unittest.TestCase):
             env = {**os.environ, "LOCAL_CODEX_SHARE_DIR": str(share),
                    "MAVIS_HOME": str(Path(directory) / "service"),
                    "CODEX_HOME": str(Path(directory) / "codex")}
-            for command in ("objective", "archive-retention", "maintenance", "e1", "output"):
+            for command in ("objective", "archive-retention", "maintenance", "e1", "output", "librarian"):
                 with self.subTest(command=command):
                     run = subprocess.run([str(launcher), command, "--help"],
                                          env=env, text=True, capture_output=True, timeout=15)

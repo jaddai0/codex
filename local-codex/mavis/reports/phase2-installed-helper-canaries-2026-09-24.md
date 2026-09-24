@@ -14,7 +14,7 @@ loaded, Mavis unloaded, and the GPU lease released. Its receipt is
 
 ## Librarian
 
-The production `mavis librarian ask` CLI read a Git-ignored project `.mavis`
+The installed Python package's `python3 -m mavis librarian ask` route read a Git-ignored project `.mavis`
 archive. The first question asked why SQLite was chosen first; the follow-up
 asked when that choice might change. Both model runs bound the loaded model ID
 and exact local path to Mavis port 8001 and returned citations checked against
@@ -67,3 +67,7 @@ and remains available for a paired completed-work comparison. These role
 canaries do not establish a net benefit to accepted coding work or a production
 helper profile. Phase 2's completed-task comparison and full closeout remain
 open; source/package tests and role canaries are narrower evidence.
+
+The shell launcher was not yet dispatching `mavis librarian ask` when these
+model calls ran. A later launcher review found that integration gap; the
+subsequent launcher checkpoint and installed canary must be checked separately.
