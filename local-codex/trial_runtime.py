@@ -201,12 +201,10 @@ def _prepare_trial_locked(
     template = (share / "base-instructions.md").read_text(encoding="utf-8")
     if not template.strip():
         raise ValueError("Mavis base instructions are empty")
-    effective = (
-        template.rstrip()
-        + "\n\n"
-        + binding["configuration"]["prompts"]["system"]
-        + "\n"
-    )
+    prompt = binding["configuration"]["prompts"]["system"]
+    if prompt != prompt.rstrip():
+        raise ValueError("E1 prompt ends in whitespace stripped by the installed core")
+    effective = template.rstrip() + ("\n\n" + prompt if prompt else "")
     model_id = binding["profile"]["model_identity"]["model_id"]
     catalog, selected = prepare_catalog(records, model_id, effective)
     runtime_home.mkdir(parents=True, mode=0o700)
@@ -320,6 +318,8 @@ def _write_trial_home(
     core_argv = [
         str(core_binary.resolve()),
         "exec",
+        "--sandbox",
+        "workspace-write",
         "-C",
         str(binding["checkout"].resolve()),
         "--",
@@ -426,6 +426,8 @@ def validate_trial_receipt(receipt: dict) -> None:
     expected_argv = [
         receipt["core_binary"],
         "exec",
+        "--sandbox",
+        "workspace-write",
         "-C",
         receipt["checkout"],
         "--",

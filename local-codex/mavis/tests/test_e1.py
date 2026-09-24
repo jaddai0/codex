@@ -10,7 +10,7 @@ import tempfile
 import unittest
 from unittest.mock import patch
 
-from mavis import e1_bootstrap, e1_bootstrap_gateway, e1_review, e1_review_gateway
+from mavis import e1, e1_bootstrap, e1_bootstrap_gateway, e1_review, e1_review_gateway
 from mavis.e1 import E1Runner
 from mavis.evaluations import E0_CASES
 from mavis.experiments import (
@@ -284,7 +284,7 @@ class E1RunnerTests(unittest.TestCase):
         write_json(profile.parent / "active.json", {"version": 1, "path": str(profile)})
         prompt = read_json(Path(record[arm]["path"]))["prompts"]["system"]
         instructions = runtime / "accepted-model-instructions.md"
-        instructions.write_text("Base instructions\n\n" + prompt + "\n")
+        instructions.write_text("Base instructions\n\n" + prompt)
         catalog = runtime / "omlx-models.json"
         catalog.write_text("{}\n")
         config = runtime / "config.toml"
@@ -295,7 +295,13 @@ class E1RunnerTests(unittest.TestCase):
         stderr.write_text("")
         transcript = runtime / "rollout.jsonl"
         session = f"session-{arm}-{case_id}"
-        transcript.write_text(json.dumps({"type": "session_meta", "payload": {"id": session}}) + "\n")
+        transcript.write_text(
+            json.dumps({"type": "session_meta", "payload": {"id": session}}) + "\n"
+            + json.dumps({"type": "turn_context", "payload": {
+                "cwd": str(checkout.resolve()),
+                "sandbox_policy": {"type": "workspace-write"},
+            }}) + "\n"
+        )
         trial_id = f"repair-{arm}-{case_id}"
         observation = runtime / "effective-config.json"
         write_json(observation, {
@@ -305,7 +311,8 @@ class E1RunnerTests(unittest.TestCase):
             "base_instructions_sha256": sha256_file(instructions),
             "session_id": session, "rollout_path": str(transcript),
         })
-        argv = [str(core), "exec", "-C", str(checkout.resolve()), "--", case["task"]]
+        argv = [str(core), "exec", "--sandbox", "workspace-write", "-C",
+                str(checkout.resolve()), "--", case["task"]]
         overrides = [f"{key}={json.dumps(value)}" for key, value in {
             "model": "exact-model", "model_provider": "omlx",
             "model_catalog_json": str(catalog), "model_instructions_file": str(instructions),
@@ -336,11 +343,14 @@ class E1RunnerTests(unittest.TestCase):
             "catalog_path": str(catalog), "catalog_sha256": sha256_file(catalog),
             "instructions_path": str(instructions), "instructions_sha256": sha256_file(instructions),
             "effective_system_prompt_sha256": sha256_file(instructions),
+            "post_turn_source_path": str(runtime / "post-turn-source.json"),
             "observation_path": str(observation), "observation_sha256": sha256_file(observation),
             "stdout_path": str(stdout), "stdout_sha256": sha256_file(stdout),
             "stderr_path": str(stderr), "stderr_sha256": sha256_file(stderr),
             "transcript_path": str(transcript), "transcript_sha256": sha256_file(transcript),
         }
+        write_json(runtime / "post-turn-source.json", e1._source_snapshot(checkout))
+        receipt["post_turn_source_sha256"] = sha256_file(runtime / "post-turn-source.json")
         path = root / "trials" / arm / f"{case_id}.json"
         write_json(path, receipt)
         return path
@@ -829,6 +839,22 @@ class E1RunnerTests(unittest.TestCase):
         with self.assertRaises(FileNotFoundError):
             self.runner.store.review("repair", review)
         self.assertEqual(self.runner.store.load("repair")["state"], "compared")
+
+    def test_native_turn_source_can_be_committed_by_host_after_core_exit(self):
+        self._paired_trials()
+        path = self.home / "e1/repair/trials/candidate/held-a.json"
+        receipt = read_json(path)
+        receipt["resulting_revision"] = receipt["starting_revision"]
+        receipt["checkout_dirty"] = True
+        write_json(path, receipt)
+        self.assertEqual(self.runner.compare_native("repair", "regression")["state"], "compared")
+        checkout = self.home / "e1/repair/checkouts/candidate/held-a"
+        (checkout / "result.txt").write_text("tampered\n")
+        subprocess.run(["git", "-C", str(checkout), "add", "result.txt"], check=True)
+        subprocess.run(["git", "-C", str(checkout), "-c", "user.name=Test",
+                        "-c", "user.email=test@example.invalid", "commit", "-qm", "tamper"], check=True)
+        with self.assertRaisesRegex(ValueError, "checked checkout changed after host evidence"):
+            self.runner.store._check_comparison(self.runner.store.load("repair"))
 
     def test_native_trial_missing_or_swapped_receipt_fails_closed(self):
         self._paired_trials()
@@ -1470,6 +1496,22 @@ class E1RunnerTests(unittest.TestCase):
         (checkout / "cache.bin").write_bytes(b"hidden input")
         with self.assertRaisesRegex(ValueError, "checkout must be clean"):
             self.runner.check("repair", "candidate", "regression")
+
+    def test_native_raw_archive_is_allowed_but_bound_to_its_bytes(self):
+        self._freeze()
+        self.runner.prepare("repair", "baseline")
+        checkout = self.home / "e1" / "repair" / "checkouts" / "baseline" / "regression"
+        (checkout / ".git/info/exclude").write_text(".mavis/tool-output/\n")
+        archive = checkout / ".mavis/tool-output/6626ef12-a671-49fe-a97b-7a94bb1d3119.raw"
+        archive.parent.mkdir(parents=True)
+        archive.write_bytes(b"host captured output")
+        revision = next(case["revision"] for case in read_json(self.manifest)["cases"]
+                        if case["id"] == "regression")
+        self.assertEqual(e1._clean_revision(checkout), revision)
+        before = e1._source_snapshot(checkout)
+        self.assertEqual(before[archive.relative_to(checkout).as_posix()]["kind"], "archive")
+        archive.write_bytes(b"changed")
+        self.assertNotEqual(before, e1._source_snapshot(checkout))
 
     def test_comparison_rejects_checkout_change_after_host_check(self):
         self._freeze()

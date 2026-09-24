@@ -90,11 +90,14 @@ class TrialRuntimeTests(unittest.TestCase):
             baseline["instructions_sha256"], candidate["instructions_sha256"]
         )
         self.assertEqual(
-            Path(baseline["instructions_path"]).read_text(), "Base instructions\n\nA\n"
+            Path(baseline["instructions_path"]).read_text(), "Base instructions\n\nA"
         )
         self.assertEqual(
-            Path(candidate["instructions_path"]).read_text(), "Base instructions\n\nB\n"
+            Path(candidate["instructions_path"]).read_text(), "Base instructions\n\nB"
         )
+        for receipt in receipts:
+            self.assertEqual(receipt["core_argv"][1:4],
+                             ["exec", "--sandbox", "workspace-write"])
         self.assertEqual(self.pointer.read_bytes(), self.pointer_before)
         self.assertEqual(
             (self.production / "config.toml").read_bytes(), self.config_before
@@ -102,6 +105,17 @@ class TrialRuntimeTests(unittest.TestCase):
         self.assertFalse(
             (self.fixture.home / "e1/repair/runtime/baseline/held-a").exists()
         )
+
+    def test_empty_baseline_has_no_prompt_bytes_for_core_to_strip(self):
+        binding = self._binding("baseline")
+        binding["configuration"]["prompts"]["system"] = ""
+        path = trial_runtime.prepare_trial(
+            binding, mavis_home=self.fixture.home, share=self.share,
+            core_binary=self.core, base_url="http://127.0.0.1:8001/v1",
+            records=self.records,
+        )
+        receipt = read_json(path)
+        self.assertEqual(Path(receipt["instructions_path"]).read_text(), "Base instructions")
 
     def test_stale_active_baseline_blocks_trial_before_any_runtime_home(self):
         active_path = self.fixture.runner.store._active_path("main")

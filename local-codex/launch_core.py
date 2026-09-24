@@ -501,16 +501,16 @@ def _launch_trial_guarded(
             "stderr_sha256": digest(Path(receipt["stderr_path"])),
         }
     )
-    from mavis.e1 import _git
+    from mavis.e1 import _git, _source_snapshot, _unmanaged_status
 
     try:
         receipt["resulting_revision"] = _git(checkout, "rev-parse", "HEAD")
-        receipt["checkout_dirty"] = bool(
-            _git(
-                checkout, "status", "--porcelain", "--untracked-files=all", "--ignored"
-            )
-        )
-    except (OSError, subprocess.CalledProcessError) as error:
+        receipt["checkout_dirty"] = bool(_unmanaged_status(checkout))
+        snapshot_path = Path(receipt["runtime_home"]) / "post-turn-source.json"
+        atomic_write(snapshot_path, json.dumps(_source_snapshot(checkout), sort_keys=True) + "\n")
+        receipt["post_turn_source_path"] = str(snapshot_path.resolve())
+        receipt["post_turn_source_sha256"] = digest(snapshot_path)
+    except (OSError, ValueError, subprocess.CalledProcessError) as error:
         receipt["checkout_observation_error"] = str(error)
     try:
         if terminated_signal is not None:

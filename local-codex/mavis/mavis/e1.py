@@ -5,6 +5,9 @@ from copy import deepcopy
 import fcntl
 import hashlib
 import json
+import os
+import re
+import stat
 import tomllib
 import shutil
 import subprocess
@@ -25,11 +28,72 @@ def _git(path: Path, *args: str) -> str:
 
 
 def _clean_revision(checkout: Path) -> str:
-    """Bind E1 to committed content; ignored files are disallowed too."""
+    """Bind E1 to committed content, allowing only Mavis's raw-output archive."""
     revision = _git(checkout, "rev-parse", "HEAD")
-    if _git(checkout, "status", "--porcelain", "--untracked-files=all", "--ignored"):
+    if _unmanaged_status(checkout):
         raise ValueError("E1 checkout must be clean, including ignored files")
     return revision
+
+
+def _unmanaged_status(checkout: Path) -> list[str]:
+    result = subprocess.run(
+        ["git", "status", "--porcelain", "--untracked-files=all", "--ignored", "-z"],
+        cwd=checkout, capture_output=True, check=True,
+    )
+    dirty = []
+    for item in result.stdout.split(b"\0"):
+        if not item:
+            continue
+        row = os.fsdecode(item)
+        if row.startswith("!! .mavis/tool-output/"):
+            relative = row[3:]
+            if re.fullmatch(r"\.mavis/tool-output/[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}\.raw", relative):
+                target = checkout / relative
+                archive_dir = target.parent
+                if (not archive_dir.is_symlink() and not target.is_symlink()
+                        and target.is_file()):
+                    continue
+        dirty.append(row)
+    return dirty
+
+
+def _source_snapshot(checkout: Path) -> dict[str, dict[str, str | bool]]:
+    """Hash the source bytes produced by the native turn before host commit."""
+    result = subprocess.run(
+        ["git", "ls-files", "--cached", "--others", "--exclude-standard", "-z"],
+        cwd=checkout, capture_output=True, check=True,
+    )
+    files = {}
+    for raw in sorted(set(result.stdout.split(b"\0"))):
+        if not raw:
+            continue
+        relative = os.fsdecode(raw)
+        target = checkout / relative
+        try:
+            mode = target.lstat().st_mode
+        except FileNotFoundError:
+            continue
+        if stat.S_ISREG(mode):
+            files[relative] = {"kind": "file", "sha256": sha256_file(target),
+                               "executable": bool(mode & 0o111)}
+        elif stat.S_ISLNK(mode):
+            link = os.readlink(target)
+            files[relative] = {"kind": "symlink", "sha256": hashlib.sha256(
+                os.fsencode(link)).hexdigest(), "executable": False}
+        else:
+            raise ValueError("E1 source snapshot contains an irregular file")
+    archive_dir = checkout / ".mavis" / "tool-output"
+    if archive_dir.exists():
+        if archive_dir.is_symlink() or not archive_dir.is_dir():
+            raise ValueError("E1 raw output archive is irregular")
+        for target in sorted(archive_dir.iterdir()):
+            relative = target.relative_to(checkout).as_posix()
+            if (not re.fullmatch(r"\.mavis/tool-output/[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}\.raw", relative)
+                    or target.is_symlink() or not target.is_file()):
+                raise ValueError("E1 raw output archive contains an unexpected file")
+            files[relative] = {"kind": "archive", "sha256": sha256_file(target),
+                               "executable": False}
+    return files
 
 
 def _verify_host_receipt(
@@ -268,7 +332,8 @@ def _trial_hashes(root: Path, home: Path, record: dict[str, Any], case: dict[str
     if not isinstance(task, str) or not task.strip():
         raise ValueError("native E1 case needs a frozen task")
     core = Path(trial.get("core_binary", ""))
-    expected_argv = [str(core.resolve()), "exec", "-C", str(checkout.resolve()), "--", task]
+    expected_argv = [str(core.resolve()), "exec", "--sandbox", "workspace-write",
+                     "-C", str(checkout.resolve()), "--", task]
     bindings = {
         "model": trial.get("selected_model"),
         "model_provider": "omlx",
@@ -290,7 +355,7 @@ def _trial_hashes(root: Path, home: Path, record: dict[str, Any], case: dict[str
         "manifest_sha256": record["workload"]["manifest_sha256"],
         "snapshot_path": record[arm]["path"], "snapshot_sha256": record[arm]["sha256"],
         "checkout": str(checkout.resolve()), "starting_revision": case["revision"],
-        "resulting_revision": result["checked_revision"], "checkout_dirty": False,
+        "post_turn_source_path": str((runtime / "post-turn-source.json").resolve()),
         "runtime_home": str(runtime.resolve()), "mavis_home": str(Path(home).resolve()),
         "core_binary": str(core.resolve()), "core_provenance": "installed-package",
         "model_provider": "omlx",
@@ -306,6 +371,12 @@ def _trial_hashes(root: Path, home: Path, record: dict[str, Any], case: dict[str
         raise ValueError(f"native E1 trial lost its frozen command or checkout binding: {mismatched}")
     if type(trial.get("core_exit_code")) is not int or type(trial.get("checkout_dirty")) is not bool:
         raise ValueError("native E1 trial has invalid exit or checkout observation")
+    turn_revision = trial.get("resulting_revision")
+    if (not isinstance(turn_revision, str) or len(turn_revision) != 40
+            or subprocess.run(["git", "merge-base", "--is-ancestor", turn_revision,
+                               result["checked_revision"]], cwd=checkout,
+                              check=False).returncode != 0):
+        raise ValueError("native E1 checked revision does not descend from the turn")
     if any(key in trial for key in ("checkout_observation_error", "observation_error")):
         raise ValueError("native E1 trial has an inconclusive observation")
     if not isinstance(trial.get("selected_model"), str) or not trial["selected_model"]:
@@ -315,12 +386,15 @@ def _trial_hashes(root: Path, home: Path, record: dict[str, Any], case: dict[str
         "config": runtime / "config.toml",
         "catalog": runtime / "omlx-models.json",
         "instructions": runtime / "accepted-model-instructions.md",
+        "post_turn_source": runtime / "post-turn-source.json",
         "stdout": runtime / "stdout.log", "stderr": runtime / "stderr.log",
         "observation": runtime / "effective-config.json",
     }
     for name, path in paths.items():
         if sha256_file(path) != trial.get(f"{name}_sha256"):
             raise ValueError(f"native E1 trial {name} hash changed")
+    if read_json(paths["post_turn_source"]) != _source_snapshot(checkout):
+        raise ValueError("native E1 checked source differs from the native turn")
     if trial.get("instructions_sha256") != trial.get("effective_system_prompt_sha256"):
         raise ValueError("native E1 effective prompt changed")
     snapshot_path = Path(record[arm]["path"])
@@ -332,7 +406,9 @@ def _trial_hashes(root: Path, home: Path, record: dict[str, Any], case: dict[str
     if (not isinstance(prompt, str) or snapshot.get("tool_settings") != {}
             or snapshot.get("retrieval") != {} or not template_path.is_file()):
         raise ValueError("native E1 prompt configuration cannot be applied")
-    effective = template_path.read_text(encoding="utf-8").rstrip() + "\n\n" + prompt + "\n"
+    if prompt != prompt.rstrip():
+        raise ValueError("native E1 prompt ends in whitespace stripped by the core")
+    effective = template_path.read_text(encoding="utf-8").rstrip() + ("\n\n" + prompt if prompt else "")
     if (not effective.strip() or paths["instructions"].read_text(encoding="utf-8") != effective):
         raise ValueError("native E1 instruction bytes differ from frozen prompt")
     package_path = Path(trial.get("package_manifest") or "")
@@ -485,6 +561,14 @@ def _trial_hashes(root: Path, home: Path, record: dict[str, Any], case: dict[str
     if (first.get("type") != "session_meta"
             or str(first.get("payload", {}).get("id")) != session_id):
         raise ValueError("native E1 transcript session changed")
+    with transcript_path.open(encoding="utf-8") as stream:
+        turns = [entry.get("payload") for line in stream
+                 if (entry := json.loads(line)).get("type") == "turn_context"]
+    if (not turns or any(not isinstance(turn, dict)
+                         or turn.get("sandbox_policy", {}).get("type") != "workspace-write"
+                         or turn.get("cwd") != str(checkout.resolve())
+                         for turn in turns)):
+        raise ValueError("native E1 turn did not run in its writable checkout")
     for key, digest_key, path in (
         ("gateway_root", "gateway_launcher_sha256", "bin/mcp-server.sh"),
         ("gateway_env_file", "gateway_env_sha256", None),
