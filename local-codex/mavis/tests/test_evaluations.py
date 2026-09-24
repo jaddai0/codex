@@ -169,6 +169,10 @@ class E0EvaluationTests(unittest.TestCase):
 
     def test_buried_inspection_allows_stdin_sort_unique_without_file_output(self):
         self.assertTrue(_safe_buried_inspection("grep -o MAVIS_E0_FAILURE_ output.raw | sort -u | head"))
+        self.assertTrue(_safe_buried_inspection("pwd && ls"))
+        self.assertTrue(_safe_buried_inspection("sed -n '1,3p' output.raw | cut -c1-160; wc -l output.raw"))
+        self.assertFalse(_safe_buried_inspection("sed -i '1,3p' output.raw"))
+        self.assertFalse(_safe_buried_inspection("pwd && python3 produce_log.py"))
         self.assertFalse(_safe_buried_inspection("grep -o MAVIS_E0_FAILURE_ output.raw | sort -o stolen.log"))
         self.assertFalse(_safe_buried_inspection("grep -o MAVIS_E0_FAILURE_ output.raw | sort private.txt"))
 
@@ -409,6 +413,17 @@ class E0EvaluationTests(unittest.TestCase):
                 self.assertEqual(evaluator.run_case("buried-failure")["status"], "pass")
                 events[-1]["payload"]["last_agent_message"] = (
                     f"Exit code: `0` (the command failed). {marker}"
+                )
+                rollout.write_text("".join(json.dumps(event) + "\n" for event in events))
+                self.assertEqual(evaluator.run_case("buried-failure")["status"], "blocked")
+                events[-1]["payload"]["last_agent_message"] = (
+                    f"已定位到标识符：`{marker}`。该标识符出现在命令输出中，"
+                    "且命令以退出码 `1` 结束，执行失败。"
+                )
+                rollout.write_text("".join(json.dumps(event) + "\n" for event in events))
+                self.assertEqual(evaluator.run_case("buried-failure")["status"], "pass")
+                events[-1]["payload"]["last_agent_message"] = (
+                    f"已定位到标识符：`{marker}`。命令以退出码 `0` 结束，执行失败。"
                 )
                 rollout.write_text("".join(json.dumps(event) + "\n" for event in events))
                 self.assertEqual(evaluator.run_case("buried-failure")["status"], "blocked")
