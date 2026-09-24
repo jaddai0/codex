@@ -120,9 +120,11 @@ def loaded_generation_models(endpoint: str, *, api_key: str | None = None,
     return models
 
 
-def endpoint_alive(endpoint: str, *, api_key: str | None = None) -> bool:
+def endpoint_alive(endpoint: str, *, api_key: str | None = None,
+                   timeout: float = 10) -> bool:
     try:
-        inventory(endpoint, **({"api_key": api_key} if api_key else {}))
+        inventory(endpoint, timeout=timeout,
+                  **({"api_key": api_key} if api_key else {}))
         return True
     except (OSError, URLError, RuntimeError, ValueError, json.JSONDecodeError):
         return False
@@ -577,9 +579,10 @@ def start_server(config: RuntimeConfig, wait_seconds: float = 30.0, *,
         write_json(config.state_path, state)
         deadline = time.monotonic() + wait_seconds
         while time.monotonic() < deadline:
-            if process.poll() is not None:
+            exited = _child_exit_unreaped(process)
+            if exited is not None:
                 raise RuntimeError(
-                    f"Mavis oMLX exited during startup with status {process.returncode}"
+                    f"Mavis oMLX exited during startup with status {exited.si_status}"
                 )
             if endpoint_alive(config.endpoint, **_own_api(config)):
                 if require_new and not owns_running_server(config):
@@ -604,43 +607,75 @@ def start_server(config: RuntimeConfig, wait_seconds: float = 30.0, *,
         raise
 
 
+def _child_exit_unreaped(process: subprocess.Popen[Any]) -> os.waitid_result | None:
+    """Observe an exact child without freeing its PID for reuse."""
+    if process.returncode is not None:
+        raise RuntimeError("Mavis child leader was already reaped; group identity is unproven")
+    try:
+        return os.waitid(os.P_PID, process.pid, os.WEXITED | os.WNOHANG | os.WNOWAIT)
+    except ChildProcessError as error:
+        raise RuntimeError("Mavis child leader is no longer waitable") from error
+
+
+def _process_group_workers(pid: int) -> set[int]:
+    """Inspect other members while the unreaped leader reserves this group ID."""
+    probe_env = {key: value for key, value in os.environ.items()
+                 if key != "MAVIS_E0_TRIAL_API_KEY"}
+    result = subprocess.run(["ps", "-axo", "pid=,pgid=,stat="], capture_output=True,
+                            text=True, timeout=1, check=False, env=probe_env)
+    if result.returncode:
+        raise RuntimeError("Mavis process-group member probe failed")
+    workers: set[int] = set()
+    for line in result.stdout.splitlines():
+        columns = line.split(maxsplit=2)
+        if len(columns) != 3 or not columns[0].isdigit() or not columns[1].isdigit():
+            raise RuntimeError("Mavis process-group member probe is malformed")
+        member, group, state = int(columns[0]), int(columns[1]), columns[2]
+        # A zombie has already stopped all GPU and request work. The group
+        # leader remains unreaped until after the last possible group signal.
+        if group == pid and member != pid and not state.startswith("Z"):
+            workers.add(member)
+    return workers
+
+
 def _stop_spawned_process_group(process: subprocess.Popen[Any], *,
                                 timeout: float = 5.0) -> None:
-    """Stop and reap the exact child group launched by this Python process."""
+    """Signal only while this Popen's unreaped leader reserves its group ID."""
     pid = process.pid
-    try:
-        group = os.getpgid(pid)
-    except ProcessLookupError:
-        group = None  # The leader may have exited while its worker group remains.
-    if group is not None and group != pid:
-        raise RuntimeError("spawned Mavis server left its dedicated process group")
+    exited = _child_exit_unreaped(process)
+    if exited is None:
+        try:
+            group = os.getpgid(pid)
+        except ProcessLookupError:
+            # macOS can stop exposing a zombie leader through getpgid while
+            # waitid still observes it without reaping its reserved PID.
+            if _child_exit_unreaped(process) is None:
+                raise RuntimeError("spawned Mavis child group identity is unproven")
+        else:
+            if group != pid:
+                raise RuntimeError("spawned Mavis child left its dedicated process group")
     try:
         os.killpg(pid, signal.SIGTERM)
     except ProcessLookupError:
         pass
-    try:
-        process.wait(timeout=timeout)
-    except subprocess.TimeoutExpired:
-        os.killpg(pid, signal.SIGKILL)
-        process.wait(timeout=timeout)
-    deadline = time.monotonic() + timeout
-    while time.monotonic() < deadline:
-        try:
-            os.killpg(pid, 0)
-        except ProcessLookupError:
-            return
-        time.sleep(0.1)
-    # A worker can outlive an already reaped server leader. The dedicated
-    # process group is still the one created by this Popen call.
-    os.killpg(pid, signal.SIGKILL)
-    deadline = time.monotonic() + timeout
-    while time.monotonic() < deadline:
-        try:
-            os.killpg(pid, 0)
-        except ProcessLookupError:
-            return
-        time.sleep(0.1)
-    raise RuntimeError("Mavis server process group or model worker remained after stop")
+    for phase in ("term", "kill"):
+        deadline = time.monotonic() + timeout
+        while time.monotonic() < deadline:
+            exited = _child_exit_unreaped(process)
+            workers = _process_group_workers(pid)
+            if exited is not None and not workers:
+                process.wait(timeout=0)
+                return
+            time.sleep(0.1)
+        if phase == "term":
+            # The leader is still unreaped, even if it has exited. Its PID
+            # cannot alias a foreign process group before this final signal.
+            _child_exit_unreaped(process)
+            try:
+                os.killpg(pid, signal.SIGKILL)
+            except ProcessLookupError:
+                pass
+    raise RuntimeError("Mavis child group or worker remained; leader kept unreaped")
 
 
 def stop_trial_server(config: RuntimeConfig, expected_state: dict[str, Any], *,
@@ -654,40 +689,10 @@ def stop_trial_server(config: RuntimeConfig, expected_state: dict[str, Any], *,
     process = _TRIAL_PROCESSES[pid]
     if process.pid != pid:
         raise RuntimeError("Mavis trial server process handle changed")
-    try:
-        os.killpg(pid, 0)
-    except ProcessLookupError:
-        _TRIAL_PROCESSES.pop(pid, None)
-        return
-    if process.poll() is not None:
-        raise RuntimeError("Mavis model worker survived its server process")
-    if not owns_running_server(config):
+    if _child_exit_unreaped(process) is None and not owns_running_server(config):
         raise RuntimeError("Mavis trial server ownership is unproven")
-    if os.getpgid(pid) != pid:
-        raise RuntimeError("Mavis trial server process group changed")
-    os.killpg(pid, signal.SIGTERM)
-    deadline = time.monotonic() + timeout
-    while time.monotonic() < deadline:
-        try:
-            os.waitpid(pid, os.WNOHANG)
-        except ChildProcessError:
-            pass
-        try:
-            os.killpg(pid, 0)
-        except ProcessLookupError:
-            _TRIAL_PROCESSES.pop(pid, None)
-            return
-        time.sleep(0.1)
-    os.killpg(pid, signal.SIGKILL)
-    deadline = time.monotonic() + timeout
-    while time.monotonic() < deadline:
-        try:
-            os.killpg(pid, 0)
-        except ProcessLookupError:
-            _TRIAL_PROCESSES.pop(pid, None)
-            return
-        time.sleep(0.1)
-    raise RuntimeError("Mavis trial server or model worker remained after abort")
+    _stop_spawned_process_group(process, timeout=timeout)
+    _TRIAL_PROCESSES.pop(pid, None)
 
 
 def available_memory_bytes() -> int:
@@ -837,8 +842,11 @@ def park_mavis_server(config: RuntimeConfig, *, timeout: float = 30,
         raise RuntimeError("Mavis server PID changed before parking")
     if expected_state is not None and read_json(config.state_path) != expected_state:
         raise RuntimeError("Mavis server launch record changed before parking")
-    if expected_state is not None and pid not in _TRIAL_PROCESSES:
+    if pid is not None and pid not in _TRIAL_PROCESSES:
         raise RuntimeError("Mavis server has no process handle from this launch")
+    state = expected_state if expected_state is not None else (
+        read_json(config.state_path) if pid is not None else None
+    )
     if endpoint_alive(config.endpoint, **_own_api(config)):
         status = request_json(config.endpoint, "/api/status", **_own_headers(config))
         if (not isinstance(status, dict) or status.get("status") != "ok"
@@ -848,44 +856,14 @@ def park_mavis_server(config: RuntimeConfig, *, timeout: float = 30,
                 or any(status[key] != 0 for key in
                        ("active_requests", "waiting_requests", "models_loading"))):
             raise RuntimeError("Mavis server has active, queued, or loading work")
-        if not owns_running_server(config):
-            raise RuntimeError("refusing to park a server Mavis does not own")
-        if pid is None:
+        if pid is None or state is None:
             raise RuntimeError("Mavis live server lacks owned process state")
-        if os.getpgid(pid) != pid:
-            raise RuntimeError("Mavis server is not in its dedicated process group")
-        if expected_pid is not None and read_json(config.state_path).get("pid") != expected_pid:
-            raise RuntimeError("Mavis server PID changed before stop")
-        if expected_state is not None and read_json(config.state_path) != expected_state:
-            raise RuntimeError("Mavis server launch record changed before stop")
-        os.killpg(pid, signal.SIGTERM)
+        stop_trial_server(config, state, timeout=timeout)
     elif _listener_pids(_port(config.endpoint)):
         raise RuntimeError("Mavis endpoint is occupied by an unidentified listener")
-    deadline = time.monotonic() + timeout
-    while time.monotonic() < deadline:
-        if pid is None:
-            if not _listener_pids(_port(config.endpoint)):
-                break
-        else:
-            try:
-                # A server started by this process remains a zombie until
-                # reaped. On macOS, probing its group can then return EPERM
-                # even though the server has exited.
-                os.waitpid(pid, os.WNOHANG)
-            except ChildProcessError:
-                pass
-            try:
-                os.killpg(pid, 0)
-            except ProcessLookupError:
-                if not _listener_pids(_port(config.endpoint)):
-                    break
-            except PermissionError:
-                # A denied probe is not proof that the port is safe.
-                pass
-        time.sleep(0.2)
-    else:
-        raise TimeoutError("Mavis server or a model worker remained after stop")
+    elif state is not None:
+        # The server may have exited while an owned worker remains. Its
+        # unreaped leader still reserves the process-group number.
+        stop_trial_server(config, state, timeout=timeout)
     reservation = reserve_empty_mavis_port(config, verify_endpoint=False)
-    if expected_state is not None:
-        _TRIAL_PROCESSES.pop(pid, None)
     return reservation

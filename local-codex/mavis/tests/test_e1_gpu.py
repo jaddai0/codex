@@ -111,7 +111,7 @@ class E1GPUAdmissionTests(unittest.TestCase):
             patch.object(e1_gpu, "_lease_command", side_effect=command),
             patch.object(e1_gpu, "require_idle_iris_handoff"),
             patch.object(e1_gpu, "loaded_generation_models", side_effect=generations),
-            patch.object(e1_gpu, "endpoint_alive", side_effect=lambda _: self.server),
+            patch.object(e1_gpu, "endpoint_alive", side_effect=lambda _, **__: self.server),
             patch.object(e1_gpu, "reserve_empty_mavis_port", return_value=Mock()),
             patch.object(e1_gpu, "start_server", side_effect=start),
             patch.object(e1_gpu, "read_json", return_value=self.state),
@@ -308,6 +308,25 @@ class E1GPUAdmissionTests(unittest.TestCase):
         receipts = list((self.config.home / "e1/admission-failures").glob("*.json"))
         self.assertEqual(len(receipts), 1)
         self.assertFalse(read_json(receipts[0])["gpu_work_stopped"])
+
+    def test_native_request_drains_after_disconnect_before_server_stop(self):
+        original_request = self.patches[10].side_effect
+        observed = {"active": 0}
+
+        def request(endpoint, path, **kwargs):
+            if path == "/api/status" and self.game:
+                observed["active"] += 1
+                self.active_requests = 1 if observed["active"] == 1 else 0
+            return original_request(endpoint, path, **kwargs)
+
+        self.patches[10].side_effect = request
+        with self.assertRaisesRegex(RuntimeError, "game state is unsafe"):
+            with e1_gpu.admitted_e1_model(self.config, "e1:trial"):
+                self.game = True
+        self.assertGreaterEqual(observed["active"], 2)
+        self.abort.assert_called_once()
+        self.assertFalse(self.server)
+        self.assertFalse(self.held)
 
     def test_failed_abort_retains_lease_and_writes_receipt(self):
         self.fail_unload = True

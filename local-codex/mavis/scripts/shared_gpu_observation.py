@@ -18,6 +18,8 @@ from mavis.runtime import (
     RuntimeConfig,
     _own_api,
     _own_headers,
+    _child_exit_unreaped,
+    _process_group_workers,
     _stop_spawned_process_group,
     clear_trial_auth_settings,
     endpoint_alive,
@@ -44,7 +46,7 @@ _PURPOSE: ContextVar[str | None] = ContextVar("mavis_observation_lease_purpose",
 def _lease_command(*args: str) -> str:
     run = subprocess.run(
         [str(LEASE), *args], capture_output=True, text=True,
-        timeout=1 if args[0] == "status" else 15, check=False,
+        timeout=0.5 if args[0] == "status" else 15, check=False,
     )
     if run.returncode:
         raise RuntimeError(
@@ -77,11 +79,42 @@ def renew_gpu_lease() -> None:
 
 
 def _idle_mavis_server(config: RuntimeConfig) -> None:
-    status = request_json(config.endpoint, "/api/status", **_own_headers(config))
+    status = request_json(config.endpoint, "/api/status", timeout=1,
+                          **_own_headers(config))
     if (not isinstance(status, dict) or status.get("status") != "ok"
             or any(type(status.get(key)) is not int or status[key] != 0 for key in
                    ("active_requests", "waiting_requests", "models_loading"))):
         raise RuntimeError("Mavis server has active, waiting, or loading work")
+
+
+def _drained_request_status(config: RuntimeConfig, *, wait_seconds: float) -> dict[str, object]:
+    """Give a disconnected client a bounded chance to cancel its own request."""
+    deadline = time.monotonic() + wait_seconds
+    first_zero: float | None = None
+    while True:
+        status = request_json(config.endpoint, "/api/status", timeout=1,
+                              **_own_headers(config))
+        if (not isinstance(status, dict) or status.get("status") != "ok"
+                or any(type(status.get(key)) is not int or status[key] < 0 for key in
+                       ("active_requests", "waiting_requests", "models_loading"))):
+            raise RuntimeError("Mavis server work status is untrusted before abort")
+        now = time.monotonic()
+        if status["active_requests"] == status["waiting_requests"] == 0:
+            if wait_seconds == 0 or (first_zero is not None and now - first_zero >= 0.2):
+                return status
+            first_zero = now
+        else:
+            first_zero = None
+        purpose = _PURPOSE.get()
+        if purpose is None:
+            raise RuntimeError("Mavis observation lease is absent while requests drain")
+        _owned_lease(purpose)
+        if now >= deadline:
+            raise RuntimeError(
+                "Mavis active or waiting requests did not drain after observation child disconnect; "
+                "foreign work cannot be excluded"
+            )
+        time.sleep(min(0.2, max(0, deadline - time.monotonic())))
 
 
 def _abort_observation_server(config: RuntimeConfig, state: dict[str, object], *,
@@ -89,24 +122,18 @@ def _abort_observation_server(config: RuntimeConfig, state: dict[str, object], *
                               own_generation: bool = False,
                               own_unload: bool = False,
                               stopped: dict[str, bool] | None = None) -> None:
-    if endpoint_alive(config.endpoint, **_own_api(config)):
-        status = request_json(config.endpoint, "/api/status", **_own_headers(config))
-        if (not isinstance(status, dict) or status.get("status") != "ok"
-                or any(type(status.get(key)) is not int or status[key] < 0 for key in
-                       ("active_requests", "waiting_requests", "models_loading"))):
-            raise RuntimeError("Mavis server work status is untrusted before abort")
-        allowed_active = 1 if (own_loading and status["models_loading"]) else 0
-        if (own_generation or own_unload) and config.api_key and status["models_loading"] == 0:
+    if endpoint_alive(config.endpoint, timeout=1, **_own_api(config)):
+        if config.api_key:
             settings = read_json(config.base_path / "settings.json")
             auth = settings.get("auth") if isinstance(settings, dict) else None
             if (not isinstance(auth, dict) or auth.get("api_key") != config.api_key or
                     auth.get("skip_api_key_verification") is not False):
                 raise RuntimeError("Mavis trial authentication proof changed")
-            allowed_active = 1
-        if (status["waiting_requests"] or
-                status["active_requests"] > allowed_active or
-                (status["models_loading"] and not own_loading)):
-            raise RuntimeError("Mavis has work outside this observation's load")
+        status = _drained_request_status(
+            config, wait_seconds=2.5 if (own_generation or own_unload) else 0,
+        )
+        if status["models_loading"] > (1 if own_loading else 0):
+            raise RuntimeError("Mavis has a model load outside this observation")
     elif port_in_use(config.endpoint):
         raise RuntimeError("Mavis occupied endpoint failed authenticated status check")
     stop_trial_server(config, state)
@@ -185,11 +212,11 @@ def _monitored_load(config: RuntimeConfig, purpose: str,
             done.set()
     threading.Thread(target=worker, name="mavis-observation-load", daemon=True).start()
     next_renew = time.monotonic() + 300
-    while not done.wait(0.5):
+    while not done.wait(0.2):
         try:
             _owned_lease(purpose)
             _safe_game_state(_lease_command("status"))
-            if loaded_generation_models(config.iris_endpoint) != iris_models:
+            if loaded_generation_models(config.iris_endpoint, timeout=0.5) != iris_models:
                 raise RuntimeError("IRIS generation inventory changed during Mavis load")
             if time.monotonic() >= next_renew:
                 renew_gpu_lease()
@@ -228,11 +255,11 @@ def _monitored_unload(config: RuntimeConfig, purpose: str,
             done.set()
     threading.Thread(target=worker, name="mavis-observation-unload", daemon=True).start()
     next_renew = time.monotonic() + 300
-    while not done.wait(0.5):
+    while not done.wait(0.2):
         try:
             _owned_lease(purpose)
             _safe_game_state(_lease_command("status"))
-            if loaded_generation_models(config.iris_endpoint) != iris_models:
+            if loaded_generation_models(config.iris_endpoint, timeout=0.5) != iris_models:
                 raise RuntimeError("IRIS generation inventory changed during Mavis unload")
             if time.monotonic() >= next_renew:
                 renew_gpu_lease()
@@ -246,7 +273,7 @@ def _monitored_unload(config: RuntimeConfig, purpose: str,
     try:
         _owned_lease(purpose)
         _safe_game_state(_lease_command("status"))
-        if loaded_generation_models(config.iris_endpoint) != iris_models:
+        if loaded_generation_models(config.iris_endpoint, timeout=0.5) != iris_models:
             raise RuntimeError("IRIS generation inventory changed after Mavis unload")
     except BaseException:
         _abort_observation_server(config, server_state,
@@ -269,7 +296,7 @@ def run_monitored_observation(config: RuntimeConfig, command: list[str], *,
         raise RuntimeError("E0 IRIS generation snapshot is invalid")
     _owned_lease(purpose)
     _safe_game_state(_lease_command("status"))
-    if loaded_generation_models(config.iris_endpoint) != expected_iris:
+    if loaded_generation_models(config.iris_endpoint, timeout=0.5) != expected_iris:
         raise RuntimeError("IRIS generation inventory changed before E0 child")
     process = subprocess.Popen(command, cwd=cwd, env=env, stdin=subprocess.DEVNULL,
                                stdout=stdout, stderr=subprocess.STDOUT,
@@ -279,31 +306,26 @@ def run_monitored_observation(config: RuntimeConfig, command: list[str], *,
     next_renew = time.monotonic() + 300
     try:
         while True:
-            try:
-                exit_status = process.wait(timeout=min(0.5, max(0.01, deadline - time.monotonic())))
-            except subprocess.TimeoutExpired:
-                exit_status = None
+            time.sleep(min(0.2, max(0.01, deadline - time.monotonic())))
+            exited = _child_exit_unreaped(process)
             _owned_lease(purpose)
             _safe_game_state(_lease_command("status"))
-            if loaded_generation_models(config.iris_endpoint) != expected_iris:
+            if loaded_generation_models(config.iris_endpoint, timeout=0.5) != expected_iris:
                 raise RuntimeError("IRIS generation inventory changed during E0 child")
             if time.monotonic() >= next_renew:
                 renew_gpu_lease()
                 next_renew = time.monotonic() + 300
-            if exit_status is not None:
+            if exited is not None:
                 # The tool roundtrip must not leave a child in its dedicated
                 # process group after the observed command exits.
-                try:
-                    os.killpg(process.pid, 0)
-                except ProcessLookupError:
-                    return exit_status
-                shared["observation_child_safe"] = False
-                shared["observation_child_group_remained"] = True
-                raise RuntimeError("E0 observation child group remained after command exit")
+                if _process_group_workers(process.pid):
+                    shared["observation_child_group_remained"] = True
+                    raise RuntimeError("E0 observation child group remained after command exit")
+                return process.wait(timeout=0)
             if time.monotonic() >= deadline:
                 raise TimeoutError("E0 observation child exceeded its deadline")
     except BaseException:
-        if process.poll() is None:
+        if process.returncode is None:
             try:
                 _stop_spawned_process_group(process)
             except BaseException as cleanup_error:

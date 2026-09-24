@@ -4,11 +4,10 @@ import signal
 import socket
 import subprocess
 import sys
-import threading
 import tempfile
 import time
 import unittest
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 
 from mavis.runtime import (
     RuntimeConfig,
@@ -52,6 +51,51 @@ class FakeProcess:
 
 
 class RuntimeTests(unittest.TestCase):
+    def test_exited_unreaped_leader_anchors_worker_group_until_stop(self):
+        child = subprocess.Popen(
+            [sys.executable, "-c", "import subprocess,sys; "
+             "subprocess.Popen(['sleep', '30']); sys.exit(7)"],
+            start_new_session=True, stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+        )
+        try:
+            deadline = time.monotonic() + 5
+            while runtime._child_exit_unreaped(child) is None and time.monotonic() < deadline:
+                time.sleep(0.02)
+            self.assertIsNotNone(runtime._child_exit_unreaped(child))
+            self.assertIsNone(child.returncode)
+            self.assertTrue(runtime._process_group_workers(child.pid))
+            runtime._stop_spawned_process_group(child, timeout=3)
+            self.assertEqual(child.returncode, 7)
+        finally:
+            if child.returncode is None:
+                try:
+                    os.killpg(child.pid, signal.SIGKILL)
+                except ProcessLookupError:
+                    pass
+                child.wait()
+
+    def test_reaped_leader_never_signals_numeric_group(self):
+        process = FakeProcess()
+        process.returncode = 7
+        with patch("mavis.runtime.os.killpg") as kill, self.assertRaisesRegex(
+            RuntimeError, "already reaped"
+        ):
+            runtime._stop_spawned_process_group(process)
+        kill.assert_not_called()
+
+    def test_leader_exits_between_waitid_and_getpgid_without_reaping(self):
+        process = FakeProcess()
+        exited = Mock(si_status=7)
+        with patch("mavis.runtime._child_exit_unreaped",
+                   side_effect=[None, exited, exited]), \
+                patch("mavis.runtime.os.getpgid", side_effect=ProcessLookupError), \
+                patch("mavis.runtime._process_group_workers", return_value=set()), \
+                patch("mavis.runtime.os.killpg") as kill:
+            runtime._stop_spawned_process_group(process, timeout=1)
+        kill.assert_called_once_with(1234, signal.SIGTERM)
+        self.assertIsNotNone(process.returncode)
+
     def test_trial_auth_settings_are_private_and_residual_key_blocks_normal_start(self):
         with tempfile.TemporaryDirectory() as directory:
             config = RuntimeConfig(home=Path(directory), api_key="test-secret")
@@ -83,6 +127,7 @@ class RuntimeTests(unittest.TestCase):
                     patch("mavis.runtime.endpoint_alive", side_effect=[False, True]) as alive, \
                     patch("mavis.runtime.port_in_use", return_value=False), \
                     patch("mavis.runtime.owns_running_server", return_value=True), \
+                    patch("mavis.runtime._child_exit_unreaped", return_value=None), \
                     patch("mavis.runtime.subprocess.Popen", return_value=process) as spawn:
                 state = start_server(config, require_new=True)
             self.assertNotIn("test-secret", str(state))
@@ -146,12 +191,11 @@ class RuntimeTests(unittest.TestCase):
                     patch("mavis.runtime.request_json", return_value={
                         "status": "ok", "active_requests": 0,
                         "waiting_requests": 0, "models_loading": 0,
-                    }), patch("mavis.runtime.os.getpgid", return_value=1234), \
-                    patch("mavis.runtime.os.waitpid", return_value=(1234, 0)), \
-                    patch("mavis.runtime.os.killpg",
-                          side_effect=[None, None, ProcessLookupError]) as kill:
+                    }), patch("mavis.runtime._child_exit_unreaped", return_value=None), \
+                    patch("mavis.runtime._stop_spawned_process_group",
+                          side_effect=lambda child, **_: child.wait()) as stop:
                 stop_server(config)
-            kill.assert_any_call(1234, signal.SIGTERM)
+            stop.assert_called_once_with(process, timeout=10.0)
             self.assertFalse(config.state_path.exists())
 
     def test_public_stop_refuses_active_request_before_signaling(self):
@@ -187,12 +231,12 @@ class RuntimeTests(unittest.TestCase):
             process = FakeProcess()
             with patch.dict(runtime._TRIAL_PROCESSES, {1234: process}, clear=True), \
                     patch("mavis.runtime.owns_running_server", return_value=True), \
-                    patch("mavis.runtime.os.getpgid", return_value=1234), \
-                    patch("mavis.runtime.os.waitpid", return_value=(1234, 0)), \
-                    patch("mavis.runtime.os.killpg", side_effect=[None, None, ProcessLookupError]) as kill:
+                    patch("mavis.runtime._child_exit_unreaped", return_value=None), \
+                    patch("mavis.runtime._stop_spawned_process_group",
+                          side_effect=lambda child, **_: child.wait()) as stop:
                 stop_trial_server(config, state)
                 self.assertNotIn(1234, runtime._TRIAL_PROCESSES)
-            kill.assert_any_call(1234, signal.SIGTERM)
+            stop.assert_called_once_with(process, timeout=10.0)
 
     def test_trial_abort_rejects_changed_launch_record_without_signal(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -288,15 +332,13 @@ class RuntimeTests(unittest.TestCase):
                     self.fail("test listener did not start")
                 idle = {"status": "ok", "active_requests": 0,
                         "waiting_requests": 0, "models_loading": 0}
-                reaper = threading.Thread(target=child.wait, daemon=True)
-                reaper.start()
-                with patch("mavis.runtime.endpoint_alive", return_value=True), \
+                with patch.dict(runtime._TRIAL_PROCESSES, {child.pid: child}, clear=True), \
+                        patch("mavis.runtime.endpoint_alive", return_value=True), \
                         patch("mavis.runtime.request_json", return_value=idle), \
                         patch("mavis.runtime.owns_running_server", return_value=True):
                     reservation = park_mavis_server(config)
                 try:
-                    reaper.join(timeout=1)
-                    self.assertIsNotNone(child.poll())
+                    self.assertIsNotNone(child.returncode)
                     with socket.socket() as probe:
                         self.assertEqual(probe.connect_ex(("127.0.0.1", port)), 0)
                     with self.assertRaises(OSError):
@@ -305,11 +347,14 @@ class RuntimeTests(unittest.TestCase):
                 finally:
                     reservation.close()
             finally:
-                if child.poll() is None:
-                    os.killpg(child.pid, signal.SIGKILL)
-                child.wait()
+                if child.returncode is None:
+                    try:
+                        os.killpg(child.pid, signal.SIGKILL)
+                    except ProcessLookupError:
+                        pass
+                    child.wait()
 
-    def test_park_retries_denied_group_probe_until_process_disappears(self):
+    def test_park_refuses_unregistered_process_without_group_signal(self):
         with tempfile.TemporaryDirectory() as directory:
             with socket.socket() as probe:
                 probe.bind(("127.0.0.1", 0))
@@ -317,15 +362,11 @@ class RuntimeTests(unittest.TestCase):
             config = RuntimeConfig(home=Path(directory),
                                    endpoint=f"http://127.0.0.1:{port}/v1")
             write_json(config.state_path, {"pid": 1234})
-            with patch("mavis.runtime.endpoint_alive", return_value=False), \
-                    patch("mavis.runtime._listener_pids", side_effect=[
-                        set(), set(), {os.getpid()}]), \
-                    patch("mavis.runtime.os.killpg", side_effect=[
-                        PermissionError(1, "Operation not permitted"),
-                        ProcessLookupError(3, "No such process")]), \
-                    patch("mavis.runtime.time.sleep"):
-                reservation = park_mavis_server(config, timeout=1)
-            reservation.close()
+            with patch.dict(runtime._TRIAL_PROCESSES, {}, clear=True), \
+                    patch("mavis.runtime.os.killpg") as kill, \
+                    self.assertRaisesRegex(RuntimeError, "no process handle"):
+                park_mavis_server(config, timeout=1)
+            kill.assert_not_called()
 
     def test_loaded_generation_inventory_keeps_unknown_models_visible(self):
         rows = [{"id": "embed", "loaded": True, "engine_type": "embedding"},
@@ -455,11 +496,11 @@ class RuntimeTests(unittest.TestCase):
             with patch("mavis.runtime.endpoint_alive", return_value=False), patch(
                 "mavis.runtime.port_in_use", return_value=False
             ), patch("mavis.runtime.subprocess.Popen", return_value=process) as popen, \
-                    patch("mavis.runtime.os.getpgid", return_value=1234), \
-                    patch("mavis.runtime.os.killpg", side_effect=[None, ProcessLookupError]) as kill:
+                    patch("mavis.runtime._stop_spawned_process_group",
+                          side_effect=lambda child: child.wait()) as stop:
                 with self.assertRaises(TimeoutError):
                     start_server(config, wait_seconds=0)
-            kill.assert_any_call(1234, signal.SIGTERM)
+            stop.assert_called_once_with(process)
             child_env = popen.call_args.kwargs["env"]
             self.assertEqual(child_env["OMLX_BASE_PATH"], str(config.base_path))
             self.assertEqual(child_env["HOME"], str(config.home / "user-home"))
@@ -480,11 +521,11 @@ class RuntimeTests(unittest.TestCase):
                     patch("mavis.runtime.port_in_use", return_value=False), \
                     patch("mavis.runtime.subprocess.Popen", return_value=process), \
                     patch("mavis.runtime.write_json", side_effect=write_or_fail), \
-                    patch("mavis.runtime.os.getpgid", return_value=1234), \
-                    patch("mavis.runtime.os.killpg", side_effect=[None, ProcessLookupError]) as kill:
+                    patch("mavis.runtime._stop_spawned_process_group",
+                          side_effect=lambda child: child.wait()) as stop:
                 with self.assertRaisesRegex(OSError, "disk full"):
                     start_server(config, require_new=True)
-            kill.assert_any_call(1234, signal.SIGTERM)
+            stop.assert_called_once_with(process)
             self.assertIsNotNone(process.returncode)
 
     def test_settings_pin_auth_server_model_and_cache_to_mavis(self):

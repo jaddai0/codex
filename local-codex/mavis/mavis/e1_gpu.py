@@ -126,7 +126,7 @@ class _LeaseHeartbeat:
 
 
 def _mavis_status(config: RuntimeConfig) -> dict[str, Any]:
-    status = request_json(config.endpoint, "/api/status")
+    status = request_json(config.endpoint, "/api/status", timeout=1)
     if (not isinstance(status, dict) or status.get("status") != "ok"
             or any(type(status.get(key)) is not int or status[key] < 0 for key in
                    ("active_requests", "waiting_requests", "models_loading"))):
@@ -143,12 +143,24 @@ def _idle_mavis_server(config: RuntimeConfig) -> None:
 
 def _abort_trial(config: RuntimeConfig, state: dict[str, Any], *,
                  own_loading: bool = False) -> None:
-    if endpoint_alive(config.endpoint):
-        status = _mavis_status(config)
-        if status["waiting_requests"] or (
-            status["active_requests"] > (1 if own_loading and status["models_loading"] else 0)
-        ):
-            raise RuntimeError("Mavis has active or waiting work outside this trial's load")
+    if endpoint_alive(config.endpoint, timeout=1):
+        deadline = time.monotonic() + 2.5
+        first_zero: float | None = None
+        while True:
+            status = _mavis_status(config)
+            now = time.monotonic()
+            if status["active_requests"] == status["waiting_requests"] == 0:
+                if first_zero is not None and now - first_zero >= 0.2:
+                    break
+                first_zero = now
+            else:
+                first_zero = None
+            if now >= deadline:
+                raise RuntimeError(
+                    "Mavis active or waiting requests did not drain after native child disconnect; "
+                    "foreign work cannot be excluded"
+                )
+            time.sleep(min(0.2, max(0, deadline - now)))
         if status["models_loading"] and not own_loading:
             raise RuntimeError("Mavis has an unowned model load")
     stop_trial_server(config, state)
