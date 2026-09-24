@@ -29,10 +29,11 @@ from .evaluations import E0_CASES, E0Evaluator
 from .maintenance import MaintenanceQueue
 from .maintenance_runtime import tick as maintenance_tick
 from .objectives import ObjectiveStore
+from .librarian_route import LibrarianAskError, ask as librarian_ask
 from .output_inspection import inspect_output
 from .project_memory import ProjectMemory, KINDS
 from .project_evidence import (active_project_home, legacy_home_for_record,
-                               migrate_legacy_objective, objective_home)
+                               migrate_legacy_objective, objective_home, project_root)
 from .retrieval import ProjectIndex
 from .runtime import (
     RuntimeConfig,
@@ -151,6 +152,25 @@ def build_parser() -> argparse.ArgumentParser:
     search.add_argument("query")
     search.add_argument("--limit", type=int, default=20)
     search.add_argument("--offset", type=int, default=0)
+
+    librarian = subcommands.add_parser("librarian")
+    librarian_sub = librarian.add_subparsers(dest="librarian_command", required=True)
+    librarian_ask_cmd = librarian_sub.add_parser("ask")
+    librarian_ask_cmd.add_argument("conversation_id")
+    librarian_ask_cmd.add_argument("question")
+    librarian_ask_cmd.add_argument("--project", type=Path)
+    librarian_ask_cmd.add_argument("--search-term", action="append", required=True,
+                                    dest="search_terms")
+    librarian_ask_cmd.add_argument("--limit", type=int, default=20)
+    librarian_ask_cmd.add_argument("--offset", type=int, default=0)
+    librarian_ask_cmd.add_argument("--followup", action="store_true")
+    librarian_ask_cmd.add_argument("--no-model", action="store_true",
+                                    dest="no_model")
+    librarian_ask_cmd.add_argument("--model-id", dest="model_id")
+    librarian_ask_cmd.add_argument("--model-path", type=Path, dest="model_path")
+    librarian_ask_cmd.add_argument("--endpoint", default="http://127.0.0.1:8001/v1",
+                                    dest="librarian_endpoint")
+    librarian_ask_cmd.add_argument("--timeout", type=float, default=90.0)
 
     project_evidence = subcommands.add_parser("project-evidence")
     project_evidence_sub = project_evidence.add_subparsers(dest="project_evidence_command", required=True)
@@ -733,6 +753,46 @@ def main(argv: list[str] | None = None) -> int:
             print_json(queue.cancel(args.job_id, reason=args.reason))
         else:
             print_json(queue.list(args.state))
+        return 0
+    if args.command == "librarian":
+        try:
+            selected_project = args.project or os.environ.get("MAVIS_PROJECT_ROOT")
+            if not selected_project:
+                raise LibrarianAskError("librarian ask requires --project or MAVIS_PROJECT_ROOT")
+            if args.project is not None:
+                project_root(args.project)
+            evidence_home = active_project_home(home, create=True,
+                                                path=Path(selected_project))
+            if evidence_home == home:
+                raise LibrarianAskError("librarian project is not a Git checkout")
+            if args.no_model:
+                if args.model_id or args.model_path:
+                    raise LibrarianAskError("--no-model cannot be combined with --model-id or --model-path")
+            elif not args.model_id or not args.model_path:
+                raise LibrarianAskError("--model-id and --model-path are required unless --no-model is set")
+            kwargs = {
+                "limit": args.limit,
+                "offset": args.offset,
+                "followup": args.followup,
+                "no_model": args.no_model,
+                "base_url": args.librarian_endpoint,
+                "timeout": args.timeout,
+            }
+            if args.no_model:
+                payload = librarian_ask(home, evidence_home,
+                                        args.conversation_id, args.question,
+                                        args.search_terms, **kwargs)
+            else:
+                payload = librarian_ask(home, evidence_home,
+                                        args.conversation_id, args.question,
+                                        args.search_terms,
+                                        model_id=args.model_id,
+                                        model_path=args.model_path, **kwargs)
+        except (LibrarianAskError, ValueError, OSError, RuntimeError) as exc:
+            print_json({"status": "fail", "reason": str(exc),
+                        "evidence": exc.evidence if isinstance(exc, LibrarianAskError) else {}})
+            return 1
+        print_json({"status": "pass", **payload})
         return 0
     evidence_home = active_project_home(home)
     archive_home = legacy_home_for_record(home, evidence_home, "transcripts", args.conversation_id)

@@ -83,7 +83,7 @@ class LibrarianEvidence:
             if not isinstance(item, dict) or set(item) != {"path", "line", "sha256"}:
                 raise ValueError("citation shape is invalid")
             line = item["line"]
-            if isinstance(line, bool):
+            if type(line) is not int or line < 1:
                 raise ValueError("citation line must be an integer")
             key = (item["path"], line, item["sha256"])
             if key not in allowed:
