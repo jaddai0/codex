@@ -6,12 +6,14 @@ from copy import deepcopy
 from datetime import datetime, timezone
 import hashlib
 import json
+import os
 from pathlib import Path
 from typing import Any, Callable
 from uuid import uuid4
 
 from .evidence import parse_test_output
 from .gateway import GatewayUnavailable, harness_job_status
+from .profile_transition import pending as profile_transition_pending
 from .storage import profile_boundary_lock, read_json, require_safe_id, sha256_file, write_json
 
 
@@ -47,13 +49,23 @@ def _now() -> str:
     return datetime.now(timezone.utc).isoformat()
 
 
+def _fsync_directory(path: Path) -> None:
+    descriptor = os.open(str(path), os.O_RDONLY)
+    try:
+        os.fsync(descriptor)
+    finally:
+        os.close(descriptor)
+
+
 class ObjectiveStore:
     def __init__(
         self,
         home: Path,
         gateway_status_reader: Callable[[str], dict[str, Any]] | None = None,
+        shared_home: Path | None = None,
     ):
         self.home = Path(home)
+        self.shared_home = Path(shared_home) if shared_home is not None else self.home
         self.root = self.home / "objectives"
         self.gateway_status_reader = gateway_status_reader or harness_job_status
 
@@ -150,14 +162,41 @@ class ObjectiveStore:
             "unknown_fields": ["accepted_decisions", "current_changes"],
         }
 
-    def save(self, record: dict[str, Any]) -> None:
+    def _activity_marker(self, record: dict[str, Any]) -> Path:
+        source = self._path(str(record["objective_id"])).resolve()
+        return self.shared_home / "active-objectives" / f"{hashlib.sha256(str(source).encode()).hexdigest()}.json"
+
+    def _save_under_boundary(self, record: dict[str, Any]) -> None:
+        if (profile_transition_pending(self.shared_home)
+                and record.get("state") not in {"queued", "accepted", "cancelled"}):
+            raise ValueError("an interrupted profile transition needs recovery")
+        marker = self._activity_marker(record)
+        if record.get("state") not in {"queued", "accepted", "cancelled"}:
+            if marker.is_symlink():
+                raise ValueError("active objective marker is a symlink")
+            write_json(marker, {"schema_version": "mavis.active-objective/v1",
+                                "objective_id": record["objective_id"],
+                                "path": str(self._path(str(record["objective_id"])).resolve())})
+            _fsync_directory(marker.parent)
         record["updated_at"] = _now()
-        write_json(self._path(str(record["objective_id"])), record)
+        source = self._path(str(record["objective_id"]))
+        write_json(source, record)
+        _fsync_directory(source.parent)
+        if record.get("state") in {"queued", "accepted", "cancelled"}:
+            if marker.is_symlink():
+                raise ValueError("active objective marker is a symlink")
+            marker.unlink(missing_ok=True)
+            if marker.parent.exists():
+                _fsync_directory(marker.parent)
+
+    def save(self, record: dict[str, Any]) -> None:
+        with profile_boundary_lock(self.shared_home):
+            self._save_under_boundary(record)
 
     def transition(self, objective_id: str, state: str, reason: str) -> dict[str, Any]:
         if state not in STATES:
             raise ValueError(f"unknown objective state: {state}")
-        with profile_boundary_lock(self.home):
+        with profile_boundary_lock(self.shared_home):
             record = self.load(objective_id)
             current = str(record["state"])
             if state not in TRANSITIONS[current]:
@@ -168,7 +207,7 @@ class ObjectiveStore:
             record.setdefault("state_history", []).append(
                 {"from": current, "to": state, "reason": reason, "at": _now()}
             )
-            self.save(record)
+            self._save_under_boundary(record)
             return record
 
     def add_assignment(

@@ -104,9 +104,9 @@ def accepted_main_profile(mavis_home: Path) -> dict[str, object] | None:
     if pointer.get("path") != str(profile_path):
         raise ValueError("active main profile pointer does not match versioned file")
     profile = json.loads(profile_path.read_text(encoding="utf-8"))
-    if (profile.get("schema_version"), profile.get("role"), profile.get("version"), profile.get("status")) != (
-        "mavis.model-profile/v1", "main", version, "active"
-    ):
+    if ((profile.get("schema_version"), profile.get("role"), profile.get("version")) != (
+        "mavis.model-profile/v1", "main", version
+    ) or profile.get("status") not in {"active", "previous"}):
         raise ValueError("active main profile has an invalid state")
     bootstrap_source = profile.get("accepted_bootstrap")
     for name in (("accepted_bootstrap", "verifier_receipt") if bootstrap_source

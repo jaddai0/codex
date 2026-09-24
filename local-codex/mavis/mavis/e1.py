@@ -298,7 +298,7 @@ def _trial_hashes(root: Path, home: Path, record: dict[str, Any], case: dict[str
         version = profile.get("version")
         if (type(version) is not int or version < 1
                 or profile_path.resolve() != (Path(home) / "profiles" / "main" / f"v{version}.json").resolve()
-                or profile.get("status") != "active" or profile.get("role") != "main"
+                or profile.get("status") not in {"active", "previous"} or profile.get("role") != "main"
                 or {"prompts": profile.get("prompts"), "tool_settings": profile.get("tool_settings"),
                     "retrieval": (profile.get("context_policy") or {}).get("retrieval")} !=
                     read_json(Path(record["baseline"]["path"]))):
@@ -318,7 +318,7 @@ def _trial_hashes(root: Path, home: Path, record: dict[str, Any], case: dict[str
                 raise ValueError("native E1 accepted main profile pointer changed")
             if record["state"] == "promoted":
                 current = read_json(expected_profile)
-                if (current.get("status") != "active"
+                if (current.get("status") not in {"active", "previous"}
                         or current.get("accepted_experiment", {}).get("path") != str(
                             (Path(home) / "experiments" / "records" / f"{record['experiment_id']}.json").resolve())
                         or current.get("accepted_experiment", {}).get("sha256") != sha256_file(

@@ -80,6 +80,13 @@ class PrepareRuntimeTests(unittest.TestCase):
                     {"id": "model-a", "model_type": "llm", "loaded": True}]):
                     self.assertEqual(prepare_runtime.main(), 0)
                 stale = next(path for path in (service / "launches").glob("*.json") if path != receipt_path)
+                pending = service / "experiments/profile-transition.json"
+                write_json(pending, {"schema_version": "mavis.profile-transition/v1", "incomplete": True})
+                with patch.object(launch_core, "accepted_main_profile", prepare_runtime.accepted_main_profile):
+                    with self.assertRaisesRegex(ValueError, "interrupted profile transition"):
+                        launch_core._launch_unlocked(stale, [str(core)])
+                self.assertFalse(marker.exists())
+                pending.unlink()
                 active_path = service / "experiments/active/main.json"
                 active = read_json(active_path)
                 active["updated_at"] = "changed after preparation"
@@ -298,6 +305,11 @@ class PrepareRuntimeTests(unittest.TestCase):
             home = Path(directory)
             self._accepted_profile(home, 1, "model-a", "A")
             self._accepted_profile(home, 2, "model-b", "B", 1)
+            legacy = home / "profiles/main/v1.json"
+            legacy_profile = json.loads(legacy.read_text())
+            legacy_profile["status"] = "previous"
+            legacy.write_text(json.dumps(legacy_profile))
+            legacy_hash = hashlib.sha256(legacy.read_bytes()).hexdigest()
             codex_home = home / "codex"
             persona = home / "persona.toml"
             instructions = home / "instructions.md"
@@ -323,6 +335,7 @@ class PrepareRuntimeTests(unittest.TestCase):
             self.assertFalse(marker.exists())
             self.assertEqual(prepare_runtime.accepted_main_profile(home)["model_identity"]["model_id"], "model-a")
             self.assertEqual(json.loads((home / "profiles/main/active.json").read_text())["version"], 1)
+            self.assertEqual(hashlib.sha256(legacy.read_bytes()).hexdigest(), legacy_hash)
 
     def test_profile_cli_overrides_are_rejected_before_core_spawn(self):
         path = MODULE_PATH.parent / "launch_core.py"

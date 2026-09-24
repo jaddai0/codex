@@ -8,6 +8,7 @@ from unittest.mock import patch
 from mavis.experiments import (ExperimentStore, _digest,
                                candidate_assignment_requirements, review_assignment_requirements)
 from mavis.profiles import ProfileStore
+from mavis.objectives import ObjectiveStore
 from mavis.storage import read_json, sha256_file, write_json
 
 
@@ -104,6 +105,40 @@ class ProfileStoreTests(unittest.TestCase):
             self.assertEqual(self.experiments.active("main"), seed)
             self.assertEqual(store.active_version("main"), 1)
 
+    def test_rollback_crash_after_profile_pointer_blocks_objective_and_launcher(self):
+        from mavis import profile_transition
+
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            seed, _, store, _ = self._first_profile(root)
+            self._promotion_evidence(root, "first-candidate", "improved instructions")
+            original_write = profile_transition.write_json
+            calls = 0
+
+            def interrupted(path, payload):
+                nonlocal calls
+                calls += 1
+                result = original_write(path, payload)
+                if calls == 4:  # Journal, experiment pointer, record, then profile pointer.
+                    raise OSError("after rollback pointer")
+                return result
+
+            with patch.object(profile_transition, "write_json", side_effect=interrupted):
+                with self.assertRaisesRegex(OSError, "after rollback pointer"):
+                    self.experiments.rollback("first-candidate", reason="regression")
+            self.assertTrue(profile_transition.pending(root))
+            objective = ObjectiveStore(root)
+            objective.create({"schema_version": "mavis.objective/v1", "objective_id": "work-1",
+                              "requirements": [{"id": "implement"}], "acceptance_checks": [{"id": "test"}]})
+            with self.assertRaisesRegex(ValueError, "interrupted profile transition"):
+                objective.transition("work-1", "running", "start")
+            with self.assertRaisesRegex(ValueError, "interrupted profile transition"):
+                store.restore("main", 1)
+            self.assertEqual(self.experiments.rollback("first-candidate", reason="regression")["state"],
+                             "rolled-back")
+            self.assertEqual(self.experiments.active("main"), seed)
+            self.assertEqual(store.active_version("main"), 1)
+
     def _gateway_status(self, worker_job_id):
         candidate = worker_job_id.startswith("candidate-")
         experiment_id = worker_job_id.removeprefix("candidate-").removeprefix("review-")
@@ -197,6 +232,70 @@ class ProfileStoreTests(unittest.TestCase):
             self.assertEqual(store.active_version("main"), 2)
             self.assertEqual(sha256_file(first), baseline_hash)
 
+    def test_promotion_recovery_waits_for_objective_and_survives_profile_writes(self):
+        from mavis import profile_transition
+
+        for crash_after in (4, 5):  # Candidate profile, then active profile pointer.
+            with self.subTest(crash_after=crash_after), tempfile.TemporaryDirectory() as directory:
+                root = Path(directory)
+                _, _, store, first = self._first_profile(root)
+                self._promotion_evidence(root, "first-candidate", "improved instructions", promote=False)
+                baseline_hash = sha256_file(first)
+                original_write = profile_transition.write_json
+                calls = 0
+
+                def interrupted(path, payload):
+                    nonlocal calls
+                    calls += 1
+                    result = original_write(path, payload)
+                    if calls == crash_after:
+                        raise OSError("after profile write")
+                    return result
+
+                with patch.object(profile_transition, "write_json", side_effect=interrupted):
+                    with self.assertRaisesRegex(OSError, "after profile write"):
+                        self.experiments.promote("first-candidate", between_objectives=True)
+                self.assertTrue(profile_transition.pending(root))
+                objective = ObjectiveStore(root)
+                objective.create({"schema_version": "mavis.objective/v1", "objective_id": "work-1",
+                                  "requirements": [{"id": "implement"}], "acceptance_checks": [{"id": "test"}]})
+                with self.assertRaisesRegex(ValueError, "interrupted profile transition"):
+                    objective.transition("work-1", "running", "start")
+                project_objective = ObjectiveStore(root / "project/.mavis", shared_home=root)
+                project_objective.create({"schema_version": "mavis.objective/v1", "objective_id": "project-work",
+                                          "requirements": [{"id": "implement"}],
+                                          "acceptance_checks": [{"id": "test"}]})
+                with self.assertRaisesRegex(ValueError, "interrupted profile transition"):
+                    project_objective.transition("project-work", "running", "start")
+                # Simulate a preexisting running objective persisted by an older host.
+                running = objective.load("work-1")
+                running["state"] = "running"
+                write_json(root / "objectives/work-1.json", running)
+                with self.assertRaisesRegex(ValueError, "between objectives"):
+                    self.experiments.promote("first-candidate", between_objectives=True)
+                running["state"] = "cancelled"
+                write_json(root / "objectives/work-1.json", running)
+                self.assertEqual(self.experiments.promote("first-candidate", between_objectives=True)["state"],
+                                 "promoted")
+                self.assertEqual(store.active_version("main"), 2)
+                self.assertEqual(sha256_file(first), baseline_hash)
+
+    def test_project_objective_marker_blocks_promotion(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            self._first_profile(root)
+            self._promotion_evidence(root, "first-candidate", "improved instructions", promote=False)
+            objective = ObjectiveStore(root / "project/.mavis", shared_home=root)
+            objective.create({"schema_version": "mavis.objective/v1", "objective_id": "work-1",
+                              "requirements": [{"id": "implement"}], "acceptance_checks": [{"id": "test"}]})
+            objective.transition("work-1", "running", "start")
+            self.assertEqual(len(list((root / "active-objectives").glob("*.json"))), 1)
+            with self.assertRaisesRegex(ValueError, "between objectives"):
+                self.experiments.promote("first-candidate", between_objectives=True)
+            objective.transition("work-1", "cancelled", "stop")
+            self.assertEqual(self.experiments.promote("first-candidate", between_objectives=True)["state"],
+                             "promoted")
+
     def test_switching_back_restores_exact_accepted_profile(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
@@ -209,13 +308,22 @@ class ProfileStoreTests(unittest.TestCase):
             store.activate("main", 1, exp_a, verify_a)
             exp_b, verify_b = self._promotion_evidence(root, "exp-b", "B")
             store.activate("main", 2, exp_b, verify_b)
+            active_before = self.experiments.active("main")
+            with self.assertRaisesRegex(ValueError, "restore the experiment and profile together"):
+                store.restore("main", 1)
+            with self.assertRaisesRegex(ValueError, "journaled experiment promotion or rollback"):
+                store.activate("main", 1, exp_a, verify_a)
+            self.assertEqual(self.experiments.active("main"), active_before)
+            self.assertEqual(store.active_version("main"), 2)
             prior = read_json(first)
             prior["status"] = "previous"  # Existing on-disk v2 behavior before immutable profiles.
             write_json(first, prior)
+            prior_hash = sha256_file(first)
             self.experiments.rollback("exp-b", reason="critical regression")
             restored = store.restore("main", 1)
             self.assertEqual(restored["profile_id"], "a")
-            self.assertEqual(restored["status"], "active")
+            self.assertEqual(restored["status"], "previous")
+            self.assertEqual(sha256_file(first), prior_hash)
             self.assertIsNone(restored["previous_version"])
             self.assertEqual(first.read_text(), (root / "profiles/main/v1.json").read_text())
             self.assertEqual(store.active_version("main"), 1)
@@ -298,7 +406,26 @@ class ProfileStoreTests(unittest.TestCase):
                 with self.assertRaisesRegex(RuntimeError, "generation owns"):
                     store.activate("main", 1, experiment, verifier)
             self.assertIsNone(store.active_version("main"))
+            from mavis import profile_transition
+            original_write = profile_transition.write_json
+            calls = 0
+
+            def interrupted(path, payload):
+                nonlocal calls
+                calls += 1
+                result = original_write(path, payload)
+                if calls == 4:  # Journal, experiment binding, profile, profile pointer.
+                    raise OSError("after first activation pointer")
+                return result
+
+            with patch.object(profile_transition, "write_json", side_effect=interrupted):
+                with self.assertRaisesRegex(OSError, "after first activation pointer"):
+                    store.activate("main", 1, experiment, verifier)
+            self.assertTrue(profile_transition.pending(root))
+            with self.assertRaisesRegex(ValueError, "interrupted profile transition"):
+                self.experiments.active("main")
             store.activate("main", 1, experiment, verifier)
+            self.assertFalse(profile_transition.pending(root))
             self.assertEqual(store.active_version("main"), 1)
 
 

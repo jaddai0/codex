@@ -115,6 +115,24 @@ class ExperimentStore:
                 raise ValueError("objective state is invalid")
             if record["state"] not in {"queued", "accepted", "cancelled"}:
                 raise ValueError("promotion or rollback is allowed only between objectives")
+        active_root = self.home / "active-objectives"
+        if active_root.is_symlink():
+            raise ValueError("active objective registry is a symlink")
+        for marker in active_root.glob("*.json"):
+            if marker.is_symlink():
+                raise ValueError("active objective marker is a symlink")
+            binding = read_json(marker)
+            source = Path(binding.get("path", ""))
+            if (binding.get("schema_version") != "mavis.active-objective/v1"
+                    or not source.is_absolute() or source.is_symlink()
+                    or not source.is_file() or marker.stem != hashlib.sha256(str(source.resolve()).encode()).hexdigest()):
+                raise ValueError("active objective marker is invalid")
+            state = read_json(source)
+            if state.get("objective_id") != binding.get("objective_id"):
+                raise ValueError("active objective marker changed")
+            if state.get("state") not in {"queued", "accepted", "cancelled"}:
+                raise ValueError("promotion or rollback is allowed only between objectives")
+            marker.unlink()
 
     def _snapshot(self, config: dict[str, Any]) -> dict[str, str]:
         if not isinstance(config, dict) or not all(key in config for key in KINDS):
@@ -424,6 +442,7 @@ class ExperimentStore:
             raise ValueError("promotion is allowed only between objectives")
         with _profile_transition_lease(self.home), profile_boundary_lock(self.home), self._locked(allow_transition=True):
             if profile_transition_pending(self.home):
+                self._assert_objective_boundary()
                 resume_profile_transition(self.home, operation="promote", experiment_id=experiment_id)
                 return self._load(experiment_id)
             self._assert_objective_boundary()
@@ -476,7 +495,8 @@ class ExperimentStore:
                 prior_config = {"prompts": prior_profile.get("prompts"),
                                 "tool_settings": prior_profile.get("tool_settings"),
                                 "retrieval": (prior_profile.get("context_policy") or {}).get("retrieval")}
-                if prior_profile.get("status") != "active" or prior_config != self._read_snapshot(record["baseline"]):
+                if (prior_profile.get("status") not in {"active", "previous"}
+                        or prior_config != self._read_snapshot(record["baseline"])):
                     raise ValueError("active profile differs from E1 baseline")
                 candidates = [(item, read_json(item)) for item in profile_root.glob("v*.json")
                               if item != prior_path]
@@ -523,6 +543,7 @@ class ExperimentStore:
             raise ValueError("rollback requires a reason")
         with _profile_transition_lease(self.home), profile_boundary_lock(self.home), self._locked(allow_transition=True):
             if profile_transition_pending(self.home):
+                self._assert_objective_boundary()
                 resume_profile_transition(self.home, operation="rollback", experiment_id=experiment_id)
                 return self._load(experiment_id)
             self._assert_objective_boundary()
@@ -594,9 +615,6 @@ class ExperimentStore:
                                 or prior_profile["accepted_experiment"].get("sha256") != sha256_file(
                                     self._record_path(prior_experiment_id))):
                             raise ValueError("previous profile differs from prior experiment")
-                    if prior_profile["status"] == "previous":
-                        prior_profile["status"] = "active"
-                        changes.append((prior_path, prior_profile))
                     changes.append((pointer, {"version": prior_version, "path": str(prior_path.resolve())}))
                 else:
                     raise ValueError("active profile differs from promoted candidate")

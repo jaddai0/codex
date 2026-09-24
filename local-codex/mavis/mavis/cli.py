@@ -504,7 +504,7 @@ def main(argv: list[str] | None = None) -> int:
         evidence_home = active_project_home(home, create=args.objective_command == "create")
         if args.objective_command != "create":
             evidence_home = objective_home(home, evidence_home, args.objective_id)
-        store = ObjectiveStore(evidence_home)
+        store = ObjectiveStore(evidence_home, shared_home=home)
         if args.objective_command == "create":
             print_json(store.create(read_json(args.path)))
         elif args.objective_command == "show":

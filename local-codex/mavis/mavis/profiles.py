@@ -7,7 +7,9 @@ from pathlib import Path
 from typing import Any, Callable
 
 from .experiments import ExperimentStore, _profile_transition_lease
+from .profile_transition import commit as commit_profile_transition
 from .profile_transition import pending as profile_transition_pending
+from .profile_transition import resume as resume_profile_transition
 from .storage import profile_boundary_lock, read_json, require_safe_id, sha256_file, write_json
 
 
@@ -96,16 +98,47 @@ class ProfileStore:
         home = self.root.parent.resolve()
         with _profile_transition_lease(home), profile_boundary_lock(home):
             if profile_transition_pending(home):
-                raise ValueError("an interrupted profile transition needs recovery")
+                experiment_path = Path(accepted_experiment).resolve()
+                experiment_id = require_safe_id(str(read_json(experiment_path).get("experiment_id") or ""),
+                                                "experiment id")
+                if experiment_path != self.experiments._record_path(experiment_id).resolve():
+                    raise ValueError("activation recovery requires the canonical experiment")
+                journal = read_json(home / "experiments/profile-transition.json")
+                target = str((self._role_root(role) / f"v{int(version)}.json").resolve())
+                expected = {"version": version, "path": target}
+                if not any(entry.get("path") == str((self._role_root(role) / "active.json").resolve())
+                           and entry.get("new") == expected for entry in journal.get("entries", [])):
+                    raise ValueError("activation recovery targets another profile")
+                if not any(entry.get("path") == target
+                           and (entry.get("new") or {}).get("accepted_experiment", {}).get("path") == str(experiment_path)
+                           and (entry.get("new") or {}).get("verifier_receipt", {}).get("path") == str(
+                               Path(verifier_receipt).resolve()) for entry in journal.get("entries", [])):
+                    raise ValueError("activation recovery has different evidence")
+                self.experiments._assert_objective_boundary()
+                resume_profile_transition(home, operation="activate", experiment_id=experiment_id)
+                return
             self.experiments._assert_objective_boundary()
             if self.active_version(role) == version:
+                pointer = read_json(self._role_root(role) / "active.json")
+                if pointer.get("path") != str((self._role_root(role) / f"v{version}.json").resolve()):
+                    raise ValueError("active profile pointer is invalid")
                 active = read_json(self._role_root(role) / f"v{version}.json")
                 if (active.get("status") == "active"
                         and active.get("accepted_experiment", {}).get("path") == str(Path(accepted_experiment).resolve())
                         and active.get("accepted_experiment", {}).get("sha256") == sha256_file(accepted_experiment)
                         and active.get("verifier_receipt", {}).get("path") == str(Path(verifier_receipt).resolve())
                         and active.get("verifier_receipt", {}).get("sha256") == sha256_file(verifier_receipt)):
+                    experiment_id = require_safe_id(str(read_json(accepted_experiment).get("experiment_id") or ""),
+                                                    "experiment id")
+                    promoted = self.experiments.assert_promoted(experiment_id)
+                    if (promoted.get("scope") != role
+                            or self.experiments._read_snapshot(promoted["candidate"]) != {
+                                "prompts": active.get("prompts"), "tool_settings": active.get("tool_settings"),
+                                "retrieval": (active.get("context_policy") or {}).get("retrieval")}):
+                        raise ValueError("active profile differs from promoted experiment")
                     return
+            if self.active_version(role) is not None:
+                raise ValueError("switch profiles through journaled experiment promotion or rollback")
             self._activate_unlocked(role, version, accepted_experiment, verifier_receipt)
 
     def _activate_unlocked(
@@ -155,6 +188,8 @@ class ProfileStore:
             if profile.get("tool_settings") != {} or profile.get("context_policy") != {"retrieval": {}}:
                 raise ValueError("main profile has settings the Codex launcher cannot apply")
         previous = self.active_version(role)
+        if previous is not None:
+            raise ValueError("switch profiles through journaled experiment promotion or rollback")
         profile["status"] = "active"
         profile["previous_version"] = previous
         profile["accepted_experiment"] = {
@@ -165,24 +200,50 @@ class ProfileStore:
             "path": str(verifier_path),
             "sha256": sha256_file(verifier_path),
         }
-        write_json(target, profile)
-        write_json(role_root / "active.json", {"version": version, "path": str(target.resolve())})
+        active_path = self.experiments._active_path(role)
+        active = read_json(active_path)
+        commit_profile_transition(home, operation="activate", experiment_id=experiment_id, changes=[
+            (active_path, active), (target, profile),
+            (role_root / "active.json", {"version": version, "path": str(target.resolve())}),
+        ])
 
     def restore(self, role: str, version: int) -> dict[str, Any]:
-        if profile_transition_pending(self.root.parent):
-            raise ValueError("an interrupted profile transition needs recovery")
-        target = self._role_root(role) / f"v{int(version)}.json"
-        profile = read_json(target)
-        if self.active_version(role) == version and profile.get("status") == "active":
+        with profile_boundary_lock(self.root.parent):
+            if profile_transition_pending(self.root.parent):
+                raise ValueError("an interrupted profile transition needs recovery")
+            if self.active_version(role) != version:
+                raise ValueError("restore the experiment and profile together with experiment rollback")
+            target = self._role_root(role) / f"v{int(version)}.json"
+            if read_json(self._role_root(role) / "active.json").get("path") != str(target.resolve()):
+                raise ValueError("active profile pointer is invalid")
+            profile = read_json(target)
+            if profile.get("status") not in {"active", "previous"}:
+                raise ValueError("only accepted profiles can be restored")
+            active = self.experiments.active(role)
+            configuration = self.experiments._read_snapshot(active["configuration"])
+            if configuration != {"prompts": profile.get("prompts"),
+                                  "tool_settings": profile.get("tool_settings"),
+                                  "retrieval": (profile.get("context_policy") or {}).get("retrieval")}:
+                raise ValueError("active profile differs from active experiment")
+            source = profile.get("accepted_bootstrap") or profile.get("accepted_experiment")
+            review = profile.get("verifier_receipt")
+            if (not isinstance(source, dict) or not source.get("path") or not source.get("sha256")
+                    or sha256_file(Path(source["path"])) != source["sha256"]
+                    or not isinstance(review, dict) or not review.get("path") or not review.get("sha256")
+                    or sha256_file(Path(review["path"])) != review["sha256"]):
+                raise ValueError("accepted profile source changed")
+            if profile.get("accepted_bootstrap"):
+                if (active.get("experiment_id") is not None
+                        or Path(source["path"]).resolve() !=
+                        (self.root.parent / "e1/bootstrap/main.json").resolve()):
+                    raise ValueError("bootstrap profile differs from active seed")
+            else:
+                if not isinstance(active.get("experiment_id"), str):
+                    raise ValueError("active profile differs from promoted experiment")
+                retained = read_json(Path(source["path"]))
+                if (source["path"] != str(self.experiments._record_path(active["experiment_id"]).resolve())
+                        or retained.get("state") != "promoted"
+                        or retained.get("review", {}).get("path") != review["path"]
+                        or retained.get("review", {}).get("sha256") != review["sha256"]):
+                    raise ValueError("active profile differs from promoted experiment")
             return profile
-        if profile.get("status") not in {"active", "previous"}:
-            raise ValueError("only accepted active or previous profiles can be restored")
-        experiment = profile.get("accepted_experiment") or {}
-        verification = profile.get("verifier_receipt") or {}
-        for retained, label in ((experiment, "experiment"), (verification, "verification")):
-            if not isinstance(retained, dict) or not retained.get("path") or not retained.get("sha256"):
-                raise ValueError(f"accepted profile is missing retained {label} evidence")
-            if sha256_file(Path(retained["path"])) != retained["sha256"]:
-                raise ValueError(f"retained {label} evidence hash changed")
-        self.activate(role, version, Path(experiment["path"]), Path(verification["path"]))
-        return read_json(target)
