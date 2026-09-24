@@ -356,7 +356,8 @@ def build_parser() -> argparse.ArgumentParser:
 
 
 def main(argv: list[str] | None = None) -> int:
-    args = build_parser().parse_args(argv)
+    raw_argv = list(sys.argv[1:] if argv is None else argv)
+    args = build_parser().parse_args(raw_argv)
     home = home_from_env()
     if args.command == "project-evidence":
         print_json({"manifest": str(migrate_legacy_objective(
@@ -588,7 +589,10 @@ def main(argv: list[str] | None = None) -> int:
         return 0 if result["status"] == "pass" else 1
     if args.command == "e1":
         if args.e1_command == "trial":
-            if args.task[:1] != ["--"] or len(args.task) != 2:
+            # argparse.REMAINDER consumes the single `--` separator rather
+            # than retaining it in args.task. Validate the original argv.
+            if (len(raw_argv) != 7 or raw_argv[5] != "--"
+                    or args.task != [raw_argv[6]]):
                 raise ValueError("E1 trial needs exactly one task after --")
             from trial_runtime import run_trial
 
@@ -596,7 +600,7 @@ def main(argv: list[str] | None = None) -> int:
                 {
                     "receipt": str(
                         run_trial(
-                            args.experiment_id, args.arm, args.case_id, args.task[1]
+                            args.experiment_id, args.arm, args.case_id, args.task[0]
                         )
                     )
                 }

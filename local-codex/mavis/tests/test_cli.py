@@ -16,6 +16,36 @@ from mavis.project_evidence import project_home
 from mavis.transcripts import TranscriptArchive
 
 
+class E1TrialCliTests(unittest.TestCase):
+    def test_documented_single_separator_passes_exact_task(self):
+        with tempfile.TemporaryDirectory() as directory:
+            import trial_runtime
+
+            output = io.StringIO()
+            receipt = Path(directory) / "trial.json"
+            with (patch("mavis.cli.home_from_env", return_value=Path(directory)),
+                  patch.object(trial_runtime, "run_trial", return_value=receipt) as run,
+                  contextlib.redirect_stdout(output)):
+                self.assertEqual(main([
+                    "e1", "trial", "experiment", "baseline", "checkout", "--",
+                    "Fix the discount test.",
+                ]), 0)
+            run.assert_called_once_with(
+                "experiment", "baseline", "checkout", "Fix the discount test."
+            )
+            self.assertEqual(json.loads(output.getvalue()), {"receipt": str(receipt)})
+
+    def test_trial_requires_one_task_after_separator(self):
+        with tempfile.TemporaryDirectory() as directory, patch(
+            "mavis.cli.home_from_env", return_value=Path(directory)
+        ):
+            for suffix in (["task"], ["--", "--", "task"], ["--"]):
+                with self.subTest(suffix=suffix), self.assertRaisesRegex(
+                    ValueError, "exactly one task after --"
+                ):
+                    main(["e1", "trial", "experiment", "baseline", "checkout", *suffix])
+
+
 class ArchiveSearchCliTests(unittest.TestCase):
     def test_archive_search_cli_returns_requested_page(self):
         with tempfile.TemporaryDirectory() as directory:
