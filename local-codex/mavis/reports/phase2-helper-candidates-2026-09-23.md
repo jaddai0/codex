@@ -38,3 +38,16 @@ These synthetic cases do not prove that either helper improves completed coding
 work. The final installed Mavis package must still exercise the librarian after
 repeated compactions, the output reader on a real long log, isolation, and a
 completed-task comparison before Phase 2 can pass.
+
+## Installed follow-up — 2026-09-24
+
+The installed candidate changed the provisional selection. On a fresh archived
+decision, 0.8B added an unsupported database rationale and missed the condition
+for revisiting PostgreSQL. On an irregular 9,848-byte host log, 0.8B exhausted
+its 768-token response limit and returned no usable observation; the host still
+reported the failed exit. The pinned 4B model answered both history questions
+accurately and cited the exact buried log line while retaining the failed host
+verdict. Native Terra independently accepted those narrow 4B results and
+classified both 0.8B failures. The 4B alias is retained for the next paired
+completed-work comparison. The full receipts and limits are in
+`phase2-installed-helper-canaries-2026-09-24.md`. Net benefit remains open.

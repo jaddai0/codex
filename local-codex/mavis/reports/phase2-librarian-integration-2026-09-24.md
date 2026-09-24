@@ -1,6 +1,6 @@
 # Phase 2 librarian integration — 2026-09-24
 
-Status: source milestone implemented; installed and completed-task benefit gates remain open.
+Status at source freeze: source milestone implemented. The later installed result is recorded in `phase2-installed-helper-canaries-2026-09-24.md`; completed-task benefit remains open.
 Owner: MiniMax M3 via OpenCode; Sol repaired review findings after two denied out-of-scope `/tmp` tool calls stopped its follow-up runs.
 
 ## Behavior
@@ -32,3 +32,5 @@ The new route, tests, and CLI change are under `local-codex/mavis/`. The prior i
 ## Evidence and limits
 
 The OpenCode worker event logs are `~/.Codex/reports/mavis-phase2-librarian-20260924.jsonl` and `~/.Codex/reports/mavis-phase2-librarian-repair-cont-20260924.jsonl`. They include the failed first tests, repair, and worker-reported full-suite output. The later `/tmp` permission denials are recorded in `~/.Codex/reports/mavis-phase2-librarian-repair-20260924.jsonl` and `~/.Codex/reports/mavis-phase2-librarian-final-repair-20260924.jsonl`; those runs made no accepted code changes. The test suite uses a stub for the local model; it does not establish live helper quality or speed.
+
+After this source freeze, Terra accepted the final source slice, the package was installed, E0 passed 10/10 on the installed candidate, and the live 4B librarian answered both archived questions with verified citations. The 0.8B librarian produced unsupported claims on the same questions. See `phase2-installed-helper-canaries-2026-09-24.md` for the candidate-bound receipts and the independent installed review. The pending entries in the table above describe the earlier source freeze, not the later installed result.
