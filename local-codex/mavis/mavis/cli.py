@@ -23,6 +23,7 @@ from .embedding_index import EmbeddingIdentity
 from .embedding_index import EmbeddingIndex
 from .embedding_provider import DEFAULT_ENDPOINT, INDEX_VERSION, LocalEmbeddingProvider
 from .experiments import ExperimentStore, review_assignment_requirements
+from .profiles import ProfileStore
 from .e0_tasks import prepare_small_repository
 from .e2_tasks import prepare_heldout, verify_heldout
 from .evaluations import E0_CASES, E0Evaluator
@@ -273,6 +274,7 @@ def build_parser() -> argparse.ArgumentParser:
     e1_sub.add_parser("bootstrap-review-import")
     bootstrap = e1_sub.add_parser("bootstrap")
     bootstrap.add_argument("--review", required=True, type=Path)
+    e1_sub.add_parser("bootstrap-activate")
     freeze = e1_sub.add_parser("freeze")
     freeze.add_argument("experiment_id")
     freeze.add_argument("--scope", required=True)
@@ -621,6 +623,8 @@ def main(argv: list[str] | None = None) -> int:
             result = {"review": str(import_bootstrap_review_report(home))}
         elif args.e1_command == "bootstrap":
             result = create_bootstrap(home, args.review)
+        elif args.e1_command == "bootstrap-activate":
+            result = {"profile": str(ProfileStore(home).activate_bootstrap_baseline())}
         elif args.e1_command == "freeze":
             result = runner.freeze(
                 args.experiment_id,

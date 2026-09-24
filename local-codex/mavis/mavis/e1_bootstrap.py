@@ -705,11 +705,12 @@ def _review(home: Path, receipt: dict[str, Any], status_reader: Callable[[str], 
 
 
 def validate_bootstrap(
-    home: Path, *, status_reader: Callable[[str], dict[str, Any]] | None = None
+    home: Path, *, status_reader: Callable[[str], dict[str, Any]] | None = None,
+    allow_active_profile: bool = False,
 ) -> dict[str, Any]:
     """Recheck every retained first-profile dependency without activating it."""
     home = Path(home).resolve()
-    if (home / "profiles/main/active.json").exists():
+    if not allow_active_profile and (home / "profiles/main/active.json").exists():
         raise ValueError("E1 bootstrap cannot override an accepted main profile")
     path = home / "e1/bootstrap/main.json"
     receipt = read_json(path)

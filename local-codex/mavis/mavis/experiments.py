@@ -21,6 +21,9 @@ from typing import Any, Callable, Iterator
 from .gateway import harness_job_status
 from .maintenance import MaintenanceQueue
 from .objectives import _validate_gateway_status
+from .profile_transition import commit as commit_profile_transition
+from .profile_transition import pending as profile_transition_pending
+from .profile_transition import resume as resume_profile_transition
 from .storage import profile_boundary_lock, read_json, require_safe_id, sha256_file, write_json
 
 
@@ -50,6 +53,10 @@ def _digest(value: Any) -> str:
     return hashlib.sha256(json.dumps(value, sort_keys=True, separators=(",", ":"), allow_nan=False).encode()).hexdigest()
 
 
+def _json_sha256(value: dict[str, Any]) -> str:
+    return hashlib.sha256((json.dumps(value, indent=2, sort_keys=True) + "\n").encode()).hexdigest()
+
+
 @contextmanager
 def _profile_transition_lease(home: Path) -> Iterator[None]:
     """Hold the same host lock as accepted main sessions and E1 trials."""
@@ -74,7 +81,7 @@ class ExperimentStore:
         self.gateway_status_reader = gateway_status_reader or harness_job_status
 
     @contextmanager
-    def _locked(self) -> Iterator[None]:
+    def _locked(self, *, allow_transition: bool = False) -> Iterator[None]:
         for path in (self.root, self.root / "records", self.root / "snapshots",
                      self.root / "active", self.root / "staged"):
             path.mkdir(parents=True, exist_ok=True, mode=0o700)
@@ -82,6 +89,8 @@ class ExperimentStore:
         with (self.root / ".lock").open("a") as handle:
             fcntl.flock(handle.fileno(), fcntl.LOCK_EX)
             try:
+                if profile_transition_pending(self.home) and not allow_transition:
+                    raise ValueError("an interrupted profile transition needs recovery")
                 yield
             finally:
                 fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
@@ -155,6 +164,8 @@ class ExperimentStore:
 
     def active(self, scope: str) -> dict[str, Any]:
         with self._locked():
+            if profile_transition_pending(self.home):
+                raise ValueError("an interrupted profile transition needs recovery")
             active = read_json(self._active_path(scope))
             self._read_snapshot(active["configuration"])
             experiment_id = active.get("experiment_id")
@@ -411,7 +422,10 @@ class ExperimentStore:
     def promote(self, experiment_id: str, *, between_objectives: bool) -> dict[str, Any]:
         if not between_objectives:
             raise ValueError("promotion is allowed only between objectives")
-        with _profile_transition_lease(self.home), profile_boundary_lock(self.home), self._locked():
+        with _profile_transition_lease(self.home), profile_boundary_lock(self.home), self._locked(allow_transition=True):
+            if profile_transition_pending(self.home):
+                resume_profile_transition(self.home, operation="promote", experiment_id=experiment_id)
+                return self._load(experiment_id)
             self._assert_objective_boundary()
             record = self._load(experiment_id)
             if record["state"] != "staged":
@@ -425,24 +439,92 @@ class ExperimentStore:
             if staged.get("experiment_id") != experiment_id:
                 raise ValueError("staged candidate or active baseline changed")
             self._read_snapshot(record["candidate"])
+            changes = []
             if active["configuration"] == record["baseline"]:
                 previous = deepcopy(active)
-                write_json(active_path, {"schema_version": "mavis.experiment-active/v1", "scope": record["scope"],
-                                         "configuration": record["candidate"], "experiment_id": experiment_id,
-                                         "previous": previous, "updated_at": _now()})
+                promoted_active = {"schema_version": "mavis.experiment-active/v1", "scope": record["scope"],
+                                   "configuration": record["candidate"], "experiment_id": experiment_id,
+                                   "previous": previous, "updated_at": _now()}
             elif active.get("experiment_id") != experiment_id or active["configuration"] != record["candidate"]:
                 raise ValueError("staged candidate or active baseline changed")
-            record["state"] = "promoted"
-            record["updated_at"] = _now()
-            record["history"].append({"event": "promoted", "at": record["updated_at"]})
-            write_json(self._record_path(experiment_id), record)
-            staged_path.unlink()
+            else:
+                promoted_active = active
+            promoted = deepcopy(record)
+            promoted["state"] = "promoted"
+            promoted["updated_at"] = _now()
+            promoted["history"].append({"event": "promoted", "at": promoted["updated_at"]})
+            changes.extend([(active_path, promoted_active), (self._record_path(experiment_id), promoted),
+                            (staged_path, None)])
+            profile_root = self.home / "profiles" / record["scope"]
+            pointer = profile_root / "active.json"
+            if record["scope"] == "main" and pointer.exists() and active["configuration"] == record["candidate"]:
+                raise ValueError("main promotion changed without its profile transition journal")
+            if record["scope"] == "main" and not pointer.exists():
+                if (self.home / "e1/bootstrap/main.json").exists():
+                    raise ValueError("activate the reviewed bootstrap baseline before first promotion")
+                if ((active.get("previous") or {}).get("experiment_id") is not None):
+                    raise ValueError("accepted main profile pointer is missing")
+            if record["scope"] == "main" and pointer.exists():
+                current_pointer = read_json(pointer)
+                current_version = current_pointer.get("version")
+                if type(current_version) is not int or current_pointer.get("path") != str(
+                    (profile_root / f"v{current_version}.json").resolve()
+                ):
+                    raise ValueError("active profile pointer is invalid")
+                prior_path = profile_root / f"v{current_version}.json"
+                prior_profile = read_json(prior_path)
+                prior_config = {"prompts": prior_profile.get("prompts"),
+                                "tool_settings": prior_profile.get("tool_settings"),
+                                "retrieval": (prior_profile.get("context_policy") or {}).get("retrieval")}
+                if prior_profile.get("status") != "active" or prior_config != self._read_snapshot(record["baseline"]):
+                    raise ValueError("active profile differs from E1 baseline")
+                candidates = [(item, read_json(item)) for item in profile_root.glob("v*.json")
+                              if item != prior_path]
+                candidates = [(item, profile) for item, profile in candidates
+                              if profile.get("status") == "candidate"
+                              and profile.get("experiments") == [experiment_id]]
+                if len(candidates) != 1:
+                    raise ValueError("main promotion needs one prepared candidate profile")
+                target_path, target = candidates[0]
+                target_config = {"prompts": target.get("prompts"), "tool_settings": target.get("tool_settings"),
+                                 "retrieval": (target.get("context_policy") or {}).get("retrieval")}
+                if (target.get("previous_version") != current_version
+                        or target.get("schema_version") != "mavis.model-profile/v1"
+                        or target.get("role") != "main"
+                        or type(target.get("version")) is not int
+                        or target["version"] <= current_version
+                        or target_path != profile_root / f"v{target['version']}.json"
+                        or not isinstance(target.get("profile_id"), str)
+                        or not target["profile_id"]
+                        or target.get("model_identity") != prior_profile.get("model_identity")
+                        or (target.get("runtime") or {}).get("name") != "omlx"
+                        or target.get("tool_settings") != {}
+                        or target.get("context_policy") != {"retrieval": {}}
+                        or target_config != self._read_snapshot(record["candidate"])):
+                    raise ValueError("prepared main profile differs from reviewed candidate")
+                target["status"] = "active"
+                target["accepted_experiment"] = {"path": str(self._record_path(experiment_id).resolve()),
+                                                 "sha256": _json_sha256(promoted)}
+                target["verifier_receipt"] = {key: record["review"][key] for key in ("path", "sha256")}
+                changes.extend([(target_path, target),
+                                (pointer, {"version": target["version"], "path": str(target_path.resolve())})])
+            if len(changes) > 3:
+                commit_profile_transition(self.home, operation="promote", experiment_id=experiment_id,
+                                          changes=changes)
+            else:
+                write_json(active_path, promoted_active)
+                write_json(self._record_path(experiment_id), promoted)
+                staged_path.unlink()
+            record = promoted
             return record
 
     def rollback(self, experiment_id: str, *, reason: str) -> dict[str, Any]:
         if not reason.strip():
             raise ValueError("rollback requires a reason")
-        with _profile_transition_lease(self.home), profile_boundary_lock(self.home), self._locked():
+        with _profile_transition_lease(self.home), profile_boundary_lock(self.home), self._locked(allow_transition=True):
+            if profile_transition_pending(self.home):
+                resume_profile_transition(self.home, operation="rollback", experiment_id=experiment_id)
+                return self._load(experiment_id)
             self._assert_objective_boundary()
             record = self._load(experiment_id)
             active_path = self._active_path(record["scope"])
@@ -454,14 +536,77 @@ class ExperimentStore:
                 if not isinstance(previous, dict) or previous.get("configuration") != record["baseline"]:
                     raise ValueError("previous accepted configuration is missing")
                 self._read_snapshot(previous["configuration"])
-                write_json(active_path, previous)
             elif active["configuration"] != record["baseline"]:
                 raise ValueError("only the current promoted candidate can be rolled back")
-            record["state"] = "rolled-back"
-            record["updated_at"] = _now()
-            record["history"].append({"event": "rolled-back", "reason": reason, "at": record["updated_at"]})
-            write_json(self._record_path(experiment_id), record)
-            return record
+            else:
+                previous = active
+            rolled_back = deepcopy(record)
+            rolled_back["state"] = "rolled-back"
+            rolled_back["updated_at"] = _now()
+            rolled_back["history"].append({"event": "rolled-back", "reason": reason,
+                                           "at": rolled_back["updated_at"]})
+            changes = [(active_path, previous), (self._record_path(experiment_id), rolled_back)]
+            profile_root = self.home / "profiles" / record["scope"]
+            pointer = profile_root / "active.json"
+            if (record["scope"] == "main" and not pointer.exists()
+                    and ((self.home / "e1/bootstrap/main.json").exists()
+                         or previous.get("experiment_id") is not None)):
+                raise ValueError("accepted main profile pointer is missing")
+            if record["scope"] == "main" and pointer.exists():
+                current_pointer = read_json(pointer)
+                current_version = current_pointer.get("version")
+                current_path = profile_root / f"v{current_version}.json"
+                if (type(current_version) is not int or current_pointer.get("path") != str(current_path.resolve())):
+                    raise ValueError("active profile pointer is invalid")
+                current_profile = read_json(current_path)
+                current_config = {"prompts": current_profile.get("prompts"),
+                                  "tool_settings": current_profile.get("tool_settings"),
+                                  "retrieval": (current_profile.get("context_policy") or {}).get("retrieval")}
+                if current_config == self._read_snapshot(record["candidate"]):
+                    prior_version = current_profile.get("previous_version")
+                    if type(prior_version) is not int:
+                        raise ValueError("promoted profile has no prior accepted version")
+                    prior_path = profile_root / f"v{prior_version}.json"
+                    prior_profile = read_json(prior_path)
+                    prior_config = {"prompts": prior_profile.get("prompts"),
+                                    "tool_settings": prior_profile.get("tool_settings"),
+                                    "retrieval": (prior_profile.get("context_policy") or {}).get("retrieval")}
+                    if (current_profile.get("status") != "active"
+                            or prior_profile.get("status") not in {"active", "previous"}
+                            or current_profile.get("accepted_experiment", {}).get("path") != str(
+                                self._record_path(experiment_id).resolve())
+                            or current_profile.get("accepted_experiment", {}).get("sha256") != sha256_file(
+                                self._record_path(experiment_id))
+                            or prior_config != self._read_snapshot(record["baseline"])):
+                        raise ValueError("previous accepted profile differs from E1 baseline")
+                    if prior_profile.get("accepted_bootstrap"):
+                        if (previous.get("experiment_id") is not None
+                                or Path(prior_profile["accepted_bootstrap"].get("path", "")).resolve() !=
+                                (self.home / "e1/bootstrap/main.json").resolve()
+                                or prior_profile["accepted_bootstrap"].get("sha256") != sha256_file(
+                                    self.home / "e1/bootstrap/main.json")):
+                            raise ValueError("bootstrap predecessor differs from seed")
+                    else:
+                        prior_experiment_id = previous.get("experiment_id")
+                        if (not isinstance(prior_experiment_id, str) or not prior_experiment_id
+                                or prior_profile.get("accepted_experiment", {}).get("path") != str(
+                                    self._record_path(prior_experiment_id).resolve())
+                                or prior_profile["accepted_experiment"].get("sha256") != sha256_file(
+                                    self._record_path(prior_experiment_id))):
+                            raise ValueError("previous profile differs from prior experiment")
+                    if prior_profile["status"] == "previous":
+                        prior_profile["status"] = "active"
+                        changes.append((prior_path, prior_profile))
+                    changes.append((pointer, {"version": prior_version, "path": str(prior_path.resolve())}))
+                else:
+                    raise ValueError("active profile differs from promoted candidate")
+            if len(changes) > 2:
+                commit_profile_transition(self.home, operation="rollback", experiment_id=experiment_id,
+                                          changes=changes)
+            else:
+                write_json(active_path, previous)
+                write_json(self._record_path(experiment_id), rolled_back)
+            return rolled_back
 
     def assert_promoted(self, experiment_id: str) -> dict[str, Any]:
         """Revalidate a promoted candidate before another store activates it."""

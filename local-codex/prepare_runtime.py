@@ -86,6 +86,10 @@ def atomic_write(path: Path, content: str) -> None:
 
 
 def accepted_main_profile(mavis_home: Path) -> dict[str, object] | None:
+    from mavis.profile_transition import pending as profile_transition_pending
+
+    if profile_transition_pending(mavis_home):
+        raise ValueError("an interrupted profile transition needs recovery")
     role_root = mavis_home / "profiles" / "main"
     pointer_path = role_root / "active.json"
     if not pointer_path.exists():
@@ -104,7 +108,9 @@ def accepted_main_profile(mavis_home: Path) -> dict[str, object] | None:
         "mavis.model-profile/v1", "main", version, "active"
     ):
         raise ValueError("active main profile has an invalid state")
-    for name in ("accepted_experiment", "verifier_receipt"):
+    bootstrap_source = profile.get("accepted_bootstrap")
+    for name in (("accepted_bootstrap", "verifier_receipt") if bootstrap_source
+                 else ("accepted_experiment", "verifier_receipt")):
         retained = profile.get(name)
         if not isinstance(retained, dict) or not retained.get("path") or not retained.get("sha256"):
             raise ValueError(f"active main profile lacks {name} evidence")
@@ -113,25 +119,39 @@ def accepted_main_profile(mavis_home: Path) -> dict[str, object] | None:
             raise ValueError(f"active main profile {name} is outside Mavis home")
         if hashlib.sha256(evidence_path.read_bytes()).hexdigest() != retained["sha256"]:
             raise ValueError(f"active main profile {name} evidence changed")
-    experiment_path = Path(profile["accepted_experiment"]["path"]).resolve()
-    verification_path = Path(profile["verifier_receipt"]["path"]).resolve()
     experiment_store = ExperimentStore(mavis_home)
     active_experiment = experiment_store.active("main")
-    experiment_id = active_experiment.get("experiment_id")
-    if not isinstance(experiment_id, str) or experiment_path != experiment_store._record_path(experiment_id).resolve():
-        raise ValueError("active main profile differs from active promoted experiment")
-    experiment = json.loads(experiment_path.read_text(encoding="utf-8"))
-    if (experiment.get("schema_version") != "mavis.experiment-lifecycle/v1"
-            or experiment.get("state") != "promoted"
-            or experiment.get("scope") != "main"
-            or experiment.get("candidate") != active_experiment["configuration"]
-            or experiment_id not in profile.get("experiments", [])):
-        raise ValueError("active main profile has no matching promoted experiment")
-    review = experiment.get("review") or {}
-    if (review.get("verdict") != "accepted" or review.get("path") != str(verification_path)
-            or review.get("sha256") != profile["verifier_receipt"]["sha256"]
-            or verification_path.parent != (mavis_home / "verifications" / "experiments").resolve()):
-        raise ValueError("active main profile verifier does not match promoted experiment")
+    if bootstrap_source:
+        from mavis.e1_bootstrap import validate_bootstrap
+
+        if (active_experiment.get("experiment_id") is not None
+                or profile.get("accepted_experiment") is not None
+                or profile.get("version") != 1):
+            raise ValueError("bootstrap profile differs from the active seed")
+        bootstrap = validate_bootstrap(mavis_home, allow_active_profile=True)
+        if (bootstrap_source != {"path": bootstrap["_source_path"],
+                                 "sha256": bootstrap["_source_sha256"]}
+                or profile["verifier_receipt"] != bootstrap["independent_review"]
+                or profile.get("model_identity") != bootstrap["model_identity"]):
+            raise ValueError("bootstrap profile evidence changed")
+    else:
+        experiment_path = Path(profile["accepted_experiment"]["path"]).resolve()
+        verification_path = Path(profile["verifier_receipt"]["path"]).resolve()
+        experiment_id = active_experiment.get("experiment_id")
+        if not isinstance(experiment_id, str) or experiment_path != experiment_store._record_path(experiment_id).resolve():
+            raise ValueError("active main profile differs from active promoted experiment")
+        experiment = json.loads(experiment_path.read_text(encoding="utf-8"))
+        if (experiment.get("schema_version") != "mavis.experiment-lifecycle/v1"
+                or experiment.get("state") != "promoted"
+                or experiment.get("scope") != "main"
+                or experiment.get("candidate") != active_experiment["configuration"]
+                or experiment_id not in profile.get("experiments", [])):
+            raise ValueError("active main profile has no matching promoted experiment")
+        review = experiment.get("review") or {}
+        if (review.get("verdict") != "accepted" or review.get("path") != str(verification_path)
+                or review.get("sha256") != profile["verifier_receipt"]["sha256"]
+                or verification_path.parent != (mavis_home / "verifications" / "experiments").resolve()):
+            raise ValueError("active main profile verifier does not match promoted experiment")
     candidate = experiment_store._read_snapshot(active_experiment["configuration"])
     if candidate != {"prompts": profile.get("prompts"), "tool_settings": profile.get("tool_settings"),
                      "retrieval": (profile.get("context_policy") or {}).get("retrieval", {})}:
@@ -515,6 +535,8 @@ def main() -> int:
     if accepted:
         config_path = args.home / "config.toml"
         catalog_path = args.home / "omlx-models.json"
+        source = accepted.get("accepted_bootstrap") or accepted.get("accepted_experiment")
+        experiment_pointer = args.mavis_home / "experiments/active/main.json"
         receipt = {
             "schema_version": "mavis.profile-launch/v1",
             "state": "prepared",
@@ -524,6 +546,10 @@ def main() -> int:
             "previous_version": accepted.get("previous_version"),
             "profile_path": accepted["_source_path"],
             "profile_sha256": accepted["_source_sha256"],
+            "accepted_source": "bootstrap" if accepted.get("accepted_bootstrap") else "experiment",
+            "accepted_source_path": source["path"],
+            "accepted_source_sha256": source["sha256"],
+            "active_experiment_sha256": hashlib.sha256(experiment_pointer.read_bytes()).hexdigest(),
             "mavis_home": str(args.mavis_home.resolve()),
             "model_identity": accepted["model_identity"],
             "selected_model": selected,

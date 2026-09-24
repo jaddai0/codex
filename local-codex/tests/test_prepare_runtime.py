@@ -16,6 +16,7 @@ from threading import Thread
 
 MODULE_PATH = Path(__file__).parents[1] / "prepare_runtime.py"
 sys.path.insert(0, str(MODULE_PATH.parent / "mavis"))
+sys.path.insert(0, str(MODULE_PATH.parent))
 SPEC = importlib.util.spec_from_file_location("prepare_runtime", MODULE_PATH)
 prepare_runtime = importlib.util.module_from_spec(SPEC)
 assert SPEC.loader is not None
@@ -23,6 +24,71 @@ SPEC.loader.exec_module(prepare_runtime)
 
 
 class PrepareRuntimeTests(unittest.TestCase):
+    def test_bootstrap_baseline_prompt_and_pointer_bound_launch_receipt(self):
+        import launch_core
+        from mavis.experiments import ExperimentStore
+        from mavis.profiles import ProfileStore
+        from mavis.storage import read_json, sha256_file, write_json
+
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            service = root / "service"
+            configuration = {"prompts": {"system": "Keep the accepted checkout rule"},
+                             "tool_settings": {}, "retrieval": {}}
+            ExperimentStore(service).seed_active("main", configuration)
+            bootstrap_path = service / "e1/bootstrap/main.json"
+            review_path = service / "verifications/e1-bootstrap/main.json"
+            write_json(bootstrap_path, {"schema_version": "mavis.e1-bootstrap/v1"})
+            write_json(review_path, {"verdict": "accepted"})
+            bootstrap = {"prompts": configuration["prompts"],
+                         "model_identity": {"model_id": "model-a", "architecture": "qwen",
+                                            "weights_fingerprint": "weights",
+                                            "tokenizer_fingerprint": "tokenizer",
+                                            "chat_template_fingerprint": "template",
+                                            "quantization": "4bit"},
+                         "_source_path": str(bootstrap_path),
+                         "_source_sha256": sha256_file(bootstrap_path),
+                         "independent_review": {"path": str(review_path),
+                                                "sha256": sha256_file(review_path)}}
+            with patch("mavis.e1_bootstrap.validate_bootstrap", return_value=bootstrap):
+                ProfileStore(service).activate_bootstrap_baseline()
+                codex_home = root / "codex"
+                instructions = root / "base.md"
+                instructions.write_text("Base instructions\n")
+                persona = root / "persona.toml"
+                persona.write_text('name = "Mavis"\n')
+                argv = ["prepare_runtime.py", "--home", str(codex_home),
+                        "--mavis-home", str(service), "--base-url", "http://127.0.0.1:8001/v1",
+                        "--persona-template", str(persona), "--instructions-template", str(instructions)]
+                with patch.object(sys, "argv", argv), patch.object(prepare_runtime, "read_json", return_value=[
+                    {"id": "model-a", "model_type": "llm", "loaded": True}]):
+                    self.assertEqual(prepare_runtime.main(), 0)
+                receipt_path = next((service / "launches").glob("*.json"))
+                receipt = read_json(receipt_path)
+                self.assertEqual(receipt["accepted_source"], "bootstrap")
+                self.assertEqual(Path(receipt["instructions_path"]).read_text(),
+                                 "Base instructions\n\nKeep the accepted checkout rule\n")
+                marker = root / "core-ran"
+                core = root / "core"
+                core.write_text(f"#!/bin/sh\ntouch '{marker}'\n")
+                core.chmod(0o755)
+                with patch.object(launch_core, "accepted_main_profile", prepare_runtime.accepted_main_profile):
+                    self.assertEqual(launch_core._launch_unlocked(receipt_path, [str(core)]), 0)
+                self.assertTrue(marker.exists())
+                marker.unlink()
+                with patch.object(sys, "argv", argv), patch.object(prepare_runtime, "read_json", return_value=[
+                    {"id": "model-a", "model_type": "llm", "loaded": True}]):
+                    self.assertEqual(prepare_runtime.main(), 0)
+                stale = next(path for path in (service / "launches").glob("*.json") if path != receipt_path)
+                active_path = service / "experiments/active/main.json"
+                active = read_json(active_path)
+                active["updated_at"] = "changed after preparation"
+                write_json(active_path, active)
+                with patch.object(launch_core, "accepted_main_profile", prepare_runtime.accepted_main_profile):
+                    with self.assertRaisesRegex(ValueError, "source changed"):
+                        launch_core._launch_unlocked(stale, [str(core)])
+                self.assertFalse(marker.exists())
+
     def test_launcher_passes_active_model_to_runtime_and_spawns_core(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
@@ -255,17 +321,8 @@ class PrepareRuntimeTests(unittest.TestCase):
                                      env={**os.environ, "PYTHONPATH": str(MODULE_PATH.parent / "mavis")})
             self.assertEqual(blocked.returncode, 2)
             self.assertFalse(marker.exists())
-            with self.assertRaisesRegex(ValueError, "evidence changed"):
-                prepare_runtime.accepted_main_profile(home)
-            profile_path = home / "profiles" / "main" / "v2.json"
-            stale = json.loads(profile_path.read_text())
-            stale["accepted_experiment"]["sha256"] = hashlib.sha256(
-                (home / "experiments" / "records" / "exp-v2.json").read_bytes()).hexdigest()
-            profile_path.write_text(json.dumps(stale))
-            with self.assertRaisesRegex(ValueError, "active promoted experiment"):
-                prepare_runtime.accepted_main_profile(home)
-            self._accepted_profile(home, 1, "model-a", "A", 2)
             self.assertEqual(prepare_runtime.accepted_main_profile(home)["model_identity"]["model_id"], "model-a")
+            self.assertEqual(json.loads((home / "profiles/main/active.json").read_text())["version"], 1)
 
     def test_profile_cli_overrides_are_rejected_before_core_spawn(self):
         path = MODULE_PATH.parent / "launch_core.py"

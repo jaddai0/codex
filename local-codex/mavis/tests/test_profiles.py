@@ -3,11 +3,12 @@ import fcntl
 from pathlib import Path
 import tempfile
 import unittest
+from unittest.mock import patch
 
 from mavis.experiments import (ExperimentStore, _digest,
                                candidate_assignment_requirements, review_assignment_requirements)
 from mavis.profiles import ProfileStore
-from mavis.storage import sha256_file, write_json
+from mavis.storage import read_json, sha256_file, write_json
 
 
 def profile(profile_id, experiments=None, prompt=""):
@@ -30,6 +31,79 @@ def profile(profile_id, experiments=None, prompt=""):
 
 
 class ProfileStoreTests(unittest.TestCase):
+    def _first_profile(self, root):
+        self.experiments = ExperimentStore(root, gateway_status_reader=self._gateway_status)
+        baseline = {"prompts": {"system": "original accepted instructions"},
+                    "tool_settings": {}, "retrieval": {}}
+        seed = self.experiments.seed_active("main", baseline)
+        bootstrap_path = root / "e1/bootstrap/main.json"
+        review_path = root / "verifications/e1-bootstrap/main.json"
+        write_json(bootstrap_path, {"schema_version": "mavis.e1-bootstrap/v1"})
+        write_json(review_path, {"verdict": "accepted"})
+        bootstrap = {"prompts": baseline["prompts"],
+                     "model_identity": profile("seed")["model_identity"],
+                     "_source_path": str(bootstrap_path),
+                     "_source_sha256": sha256_file(bootstrap_path),
+                     "independent_review": {"path": str(review_path),
+                                            "sha256": sha256_file(review_path)}}
+        store = ProfileStore(root, gateway_status_reader=self._gateway_status)
+        with patch("mavis.e1_bootstrap.validate_bootstrap", return_value=bootstrap):
+            first = store.activate_bootstrap_baseline()
+        return seed, baseline, store, first
+
+    def test_first_profile_rollback_restores_nonempty_bootstrap_baseline(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            seed, baseline, store, first = self._first_profile(root)
+            self.assertEqual(read_json(first)["prompts"], baseline["prompts"])
+            self.assertEqual(store.active_version("main"), 1)
+            exp, _ = self._promotion_evidence(root, "first-candidate", "improved instructions")
+            self.assertEqual(store.active_version("main"), 2)
+            self.assertEqual(read_json(exp)["state"], "promoted")
+            self.assertEqual(self.experiments.assert_promoted("first-candidate")["state"], "promoted")
+            baseline_hash = sha256_file(first)
+            candidate_hash = sha256_file(root / "profiles/main/v2.json")
+            self.assertEqual(self.experiments.rollback("first-candidate", reason="critical regression")["state"],
+                             "rolled-back")
+            self.assertEqual(self.experiments.active("main"), seed)
+            self.assertEqual(store.active_version("main"), 1)
+            self.assertEqual(read_json(first)["prompts"]["system"], "original accepted instructions")
+            self.assertEqual(sha256_file(first), baseline_hash)
+            self.assertEqual(sha256_file(root / "profiles/main/v2.json"), candidate_hash)
+
+    def test_interrupted_first_profile_rollback_fails_closed_and_resumes(self):
+        from mavis import profile_transition
+
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            seed, _, store, _ = self._first_profile(root)
+            self._promotion_evidence(root, "first-candidate", "improved instructions")
+            original_write = profile_transition.write_json
+            calls = 0
+
+            def interrupted(path, payload):
+                nonlocal calls
+                calls += 1
+                if calls == 3:
+                    raise OSError("injected interruption")
+                return original_write(path, payload)
+
+            with patch.object(profile_transition, "write_json", side_effect=interrupted):
+                with self.assertRaisesRegex(OSError, "injected interruption"):
+                    self.experiments.rollback("first-candidate", reason="critical regression")
+            self.assertTrue(profile_transition.pending(root))
+            with self.assertRaisesRegex(ValueError, "interrupted profile transition"):
+                self.experiments.active("main")
+            with self.assertRaisesRegex(ValueError, "interrupted profile transition"):
+                self.experiments.load("first-candidate")
+            with self.assertRaisesRegex(ValueError, "interrupted profile transition"):
+                store.restore("main", 1)
+            self.assertEqual(self.experiments.rollback("first-candidate", reason="critical regression")["state"],
+                             "rolled-back")
+            self.assertFalse(profile_transition.pending(root))
+            self.assertEqual(self.experiments.active("main"), seed)
+            self.assertEqual(store.active_version("main"), 1)
+
     def _gateway_status(self, worker_job_id):
         candidate = worker_job_id.startswith("candidate-")
         experiment_id = worker_job_id.removeprefix("candidate-").removeprefix("review-")
@@ -49,7 +123,7 @@ class ProfileStoreTests(unittest.TestCase):
                                   "report_sha256": (record["comparison"]["candidate"]["evidence"]["sha256"]
                                                     if candidate else sha256_file(review_report))}}
 
-    def _promotion_evidence(self, root: Path, experiment_id: str, prompt: str):
+    def _promotion_evidence(self, root: Path, experiment_id: str, prompt: str, *, promote=True):
         active = self.experiments.active("main")
         candidate = self.experiments._read_snapshot(active["configuration"])
         candidate["prompts"] = {"system": prompt}
@@ -81,8 +155,47 @@ class ProfileStoreTests(unittest.TestCase):
                               "verdict": "accepted"})
         self.experiments.review(experiment_id, verifier)
         self.experiments.stage(experiment_id)
-        self.experiments.promote(experiment_id, between_objectives=True)
+        if ProfileStore(root).active_version("main") is not None:
+            ProfileStore(root).create_candidate(
+                "main", profile(experiment_id, [experiment_id], prompt),
+            )
+        if promote:
+            self.experiments.promote(experiment_id, between_objectives=True)
         return self.experiments._record_path(experiment_id), verifier
+
+    def test_interrupted_first_profile_promotion_fails_closed_and_resumes(self):
+        from mavis import profile_transition
+
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            _, _, store, first = self._first_profile(root)
+            self._promotion_evidence(root, "first-candidate", "improved instructions", promote=False)
+            baseline_hash = sha256_file(first)
+            original_write = profile_transition.write_json
+            calls = 0
+
+            def interrupted(path, payload):
+                nonlocal calls
+                calls += 1
+                if calls == 3:
+                    raise OSError("injected interruption")
+                return original_write(path, payload)
+
+            with patch.object(profile_transition, "write_json", side_effect=interrupted):
+                with self.assertRaisesRegex(OSError, "injected interruption"):
+                    self.experiments.promote("first-candidate", between_objectives=True)
+            self.assertTrue(profile_transition.pending(root))
+            with self.assertRaisesRegex(ValueError, "interrupted profile transition"):
+                self.experiments.active("main")
+            with self.assertRaisesRegex(ValueError, "interrupted profile transition"):
+                self.experiments.load("first-candidate")
+            with self.assertRaisesRegex(ValueError, "interrupted profile transition"):
+                store.create_candidate("main", profile("later"))
+            self.assertEqual(self.experiments.promote("first-candidate", between_objectives=True)["state"],
+                             "promoted")
+            self.assertFalse(profile_transition.pending(root))
+            self.assertEqual(store.active_version("main"), 2)
+            self.assertEqual(sha256_file(first), baseline_hash)
 
     def test_switching_back_restores_exact_accepted_profile(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -95,12 +208,15 @@ class ProfileStoreTests(unittest.TestCase):
             first = store.create_candidate("main", profile("a", ["exp-a"], "A"))
             store.activate("main", 1, exp_a, verify_a)
             exp_b, verify_b = self._promotion_evidence(root, "exp-b", "B")
-            store.create_candidate("main", profile("b", ["exp-b"], "B"), inherited_from="a")
             store.activate("main", 2, exp_b, verify_b)
+            prior = read_json(first)
+            prior["status"] = "previous"  # Existing on-disk v2 behavior before immutable profiles.
+            write_json(first, prior)
             self.experiments.rollback("exp-b", reason="critical regression")
             restored = store.restore("main", 1)
             self.assertEqual(restored["profile_id"], "a")
-            self.assertEqual(restored["previous_version"], 2)
+            self.assertEqual(restored["status"], "active")
+            self.assertIsNone(restored["previous_version"])
             self.assertEqual(first.read_text(), (root / "profiles/main/v1.json").read_text())
             self.assertEqual(store.active_version("main"), 1)
 

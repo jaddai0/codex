@@ -300,6 +300,13 @@ def _launch_unlocked(receipt_path: Path | None, argv: list[str]) -> int:
         active = accepted_main_profile(Path(receipt["mavis_home"]))
         if active is None or active["_source_sha256"] != receipt["profile_sha256"]:
             raise ValueError("accepted main profile is no longer active")
+        source = active.get("accepted_bootstrap") or active.get("accepted_experiment")
+        active_pointer = Path(receipt["mavis_home"]) / "experiments/active/main.json"
+        if (receipt.get("accepted_source") != ("bootstrap" if active.get("accepted_bootstrap") else "experiment")
+                or receipt.get("accepted_source_path") != source["path"]
+                or receipt.get("accepted_source_sha256") != source["sha256"]
+                or receipt.get("active_experiment_sha256") != digest(active_pointer)):
+            raise ValueError("profile launch source changed after preparation")
         if receipt["selected_model"] != active["model_identity"]["model_id"]:
             raise ValueError("recorded model differs from accepted main profile")
         bindings = {

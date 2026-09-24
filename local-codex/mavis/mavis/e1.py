@@ -295,12 +295,39 @@ def _trial_hashes(root: Path, home: Path, record: dict[str, Any], case: dict[str
         if (profile.get("profile_id") != trial["accepted_profile_id"]
                 or profile.get("model_identity", {}).get("model_id") != trial["selected_model"]):
             raise ValueError("native E1 model differs from accepted profile")
-        pointer = read_json(Path(home) / "profiles" / "main" / "active.json")
-        version = pointer.get("version")
+        version = profile.get("version")
         if (type(version) is not int or version < 1
                 or profile_path.resolve() != (Path(home) / "profiles" / "main" / f"v{version}.json").resolve()
-                or pointer.get("path") != str(profile_path.resolve())
-                or profile.get("status") != "active" or profile.get("role") != "main"):
+                or profile.get("status") != "active" or profile.get("role") != "main"
+                or {"prompts": profile.get("prompts"), "tool_settings": profile.get("tool_settings"),
+                    "retrieval": (profile.get("context_policy") or {}).get("retrieval")} !=
+                    read_json(Path(record["baseline"]["path"]))):
+            raise ValueError("native E1 accepted main profile changed")
+        pointer = read_json(Path(home) / "profiles" / "main" / "active.json")
+        if record.get("state") in {"promoted", "rolled-back"}:
+            active = read_json(Path(home) / "experiments" / "active" / "main.json")
+            pointer_version = pointer.get("version")
+            if type(pointer_version) is not int or pointer_version < 1:
+                raise ValueError("native E1 accepted main profile pointer changed")
+            expected_profile = Path(home) / "profiles" / "main" / f"v{pointer_version}.json"
+            if (active.get("configuration") != record[
+                    "baseline" if record["state"] == "rolled-back" else "candidate"]
+                    or (record["state"] == "promoted" and active.get("experiment_id") != record["experiment_id"])
+                    or pointer.get("path") != str(expected_profile.resolve())
+                    or (record["state"] == "rolled-back" and pointer_version != version)):
+                raise ValueError("native E1 accepted main profile pointer changed")
+            if record["state"] == "promoted":
+                current = read_json(expected_profile)
+                if (current.get("status") != "active"
+                        or current.get("accepted_experiment", {}).get("path") != str(
+                            (Path(home) / "experiments" / "records" / f"{record['experiment_id']}.json").resolve())
+                        or current.get("accepted_experiment", {}).get("sha256") != sha256_file(
+                            Path(home) / "experiments" / "records" / f"{record['experiment_id']}.json")
+                        or {"prompts": current.get("prompts"), "tool_settings": current.get("tool_settings"),
+                            "retrieval": (current.get("context_policy") or {}).get("retrieval")} !=
+                            read_json(Path(record["candidate"]["path"]))):
+                    raise ValueError("native E1 promoted profile pointer changed")
+        elif pointer.get("version") != version or pointer.get("path") != str(profile_path.resolve()):
             raise ValueError("native E1 accepted main profile pointer changed")
         profile_hashes = {"profile": sha256_file(profile_path)}
     elif source == "e0-bootstrap":

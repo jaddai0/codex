@@ -17,6 +17,7 @@ from mavis.experiments import (
     review_assignment_requirements,
 )
 from mavis.evidence import run_command
+from mavis.profiles import ProfileStore
 from mavis.package_provenance import package_tree_sha256
 from mavis.storage import read_json, sha256_file, write_json
 
@@ -268,8 +269,15 @@ class E1RunnerTests(unittest.TestCase):
             "source_repository": str(self.repo), "source_revision": source_revision,
         })
         profile = self.home / "profiles" / "main" / "v1.json"
-        write_json(profile, {"profile_id": "accepted", "role": "main", "status": "active",
-                             "model_identity": {"model_id": "exact-model"}})
+        bootstrap = self.home / "e1/bootstrap/main.json"
+        write_json(bootstrap, {"schema_version": "mavis.e1-bootstrap/v1", "fixture": True})
+        write_json(profile, {"schema_version": "mavis.model-profile/v1",
+                             "profile_id": "accepted", "role": "main", "version": 1,
+                             "status": "active", "model_identity": {"model_id": "exact-model"},
+                             "prompts": {"system": "A"}, "tool_settings": {},
+                             "context_policy": {"retrieval": {}},
+                             "accepted_bootstrap": {"path": str(bootstrap.resolve()),
+                                                    "sha256": sha256_file(bootstrap)}})
         write_json(profile.parent / "active.json", {"version": 1, "path": str(profile)})
         prompt = read_json(Path(record[arm]["path"]))["prompts"]["system"]
         instructions = runtime / "accepted-model-instructions.md"
@@ -540,6 +548,7 @@ class E1RunnerTests(unittest.TestCase):
         """Use the real read-only bootstrap validator with local evidence fixtures."""
         self._paired_trials()
         (self.home / "profiles/main/active.json").unlink()
+        (self.home / "e1/bootstrap/main.json").unlink()
         package = self.root / "installed-share/install-manifest.json"
         fingerprint = {
             "core_sha256": read_json(package)["core_sha256"],
@@ -876,6 +885,12 @@ class E1RunnerTests(unittest.TestCase):
 
     def test_native_review_stage_promote_and_rollback(self):
         record, assignment_path, review, _ = self._native_review()
+        ProfileStore(self.home).create_candidate("main", {
+            "profile_id": "candidate", "model_identity": {"model_id": "exact-model"},
+            "runtime": {"name": "omlx"}, "prompts": {"system": "B"},
+            "tool_settings": {}, "context_policy": {"retrieval": {}},
+            "experiments": ["repair"],
+        })
         original = self.runner.store.active("main")
         self.assertEqual(self.runner.store.review("repair", review)["state"], "reviewed")
         self.assertEqual(self.runner.store.stage("repair")["state"], "staged")
@@ -884,8 +899,10 @@ class E1RunnerTests(unittest.TestCase):
             self.runner.store.promote("repair", between_objectives=False)
         self.assertEqual(self.runner.store.promote("repair", between_objectives=True)["state"], "promoted")
         self.assertEqual(self.runner.store.active("main")["configuration"], record["candidate"])
+        self.assertEqual(self.runner.store.assert_promoted("repair")["state"], "promoted")
         self.assertEqual(self.runner.store.rollback("repair", reason="observed regression")["state"], "rolled-back")
         self.assertEqual(self.runner.store.active("main"), original)
+        self.runner.store._check_comparison(self.runner.store.load("repair"))
 
     def test_native_review_imports_exact_gateway_report(self):
         _, _, review, _ = self._native_review()
