@@ -413,6 +413,7 @@ def _listener_pids(port: int) -> set[int]:
         text=True,
         stdout=subprocess.PIPE,
         stderr=subprocess.DEVNULL,
+        timeout=1,
         check=False,
     )
     return {
@@ -428,6 +429,7 @@ def _process_open_paths(pid: int) -> set[Path]:
         text=True,
         stdout=subprocess.PIPE,
         stderr=subprocess.DEVNULL,
+        timeout=1,
         check=False,
     )
     return {
@@ -511,8 +513,49 @@ def clear_trial_auth_settings(config: RuntimeConfig) -> None:
     write_json(path, settings)
 
 
+def reject_persisted_trial_preload(config: RuntimeConfig) -> None:
+    """A trial must not inherit oMLX pinned models from an earlier session."""
+    path = config.base_path / "model_settings.json"
+    if path.is_symlink():
+        raise RuntimeError("Mavis trial model settings are a symbolic link")
+    if not path.exists():
+        return
+    document = read_json(path)
+    if (not isinstance(document, dict) or document.get("version") != 1
+            or not isinstance(document.get("models"), dict)):
+        raise RuntimeError("Mavis trial model settings cannot rule out a pinned preload")
+    for model_id, settings in document["models"].items():
+        if not isinstance(model_id, str) or not isinstance(settings, dict):
+            raise RuntimeError("Mavis trial model settings are malformed")
+        pinned = settings.get("is_pinned", False)
+        if type(pinned) is not bool:
+            raise RuntimeError("Mavis trial pinned-model state is untrusted")
+        if pinned:
+            raise RuntimeError("Mavis trial refuses a persisted pinned-model preload")
+
+
+def reject_residual_trial_auth(config: RuntimeConfig) -> None:
+    """A new trial never adopts a key left by a prior interrupted trial."""
+    path = config.base_path / "settings.json"
+    if path.is_symlink():
+        raise RuntimeError("Mavis trial settings are a symbolic link")
+    if not path.exists():
+        return
+    settings = read_json(path)
+    auth = settings.get("auth", {})
+    if not isinstance(auth, dict):
+        raise RuntimeError("Mavis trial authentication settings are malformed")
+    if "api_key" in auth:
+        error = RuntimeError("residual Mavis trial authentication requires recovery")
+        error.residual_trial_auth = True
+        raise error
+
+
 def start_server(config: RuntimeConfig, wait_seconds: float = 30.0, *,
-                 require_new: bool = False) -> dict[str, Any]:
+                 require_new: bool = False,
+                 heartbeat: Callable[[], None] | None = None) -> dict[str, Any]:
+    if heartbeat is not None and (not require_new or not config.api_key):
+        raise ValueError("monitored startup requires a new authenticated trial server")
     if endpoint_alive(config.endpoint, **_own_api(config)):
         if require_new:
             raise RuntimeError("Mavis endpoint was already running before this observation")
@@ -527,7 +570,12 @@ def start_server(config: RuntimeConfig, wait_seconds: float = 30.0, *,
     logs = config.home / "logs"
     logs.mkdir(parents=True, exist_ok=True)
     config.base_path.mkdir(parents=True, exist_ok=True)
+    if heartbeat is not None:
+        reject_residual_trial_auth(config)
     ensure_isolated_settings(config)
+    if heartbeat is not None:
+        reject_persisted_trial_preload(config)
+        heartbeat()
     command = [
         str(config.omlx_binary),
         "serve",
@@ -579,17 +627,23 @@ def start_server(config: RuntimeConfig, wait_seconds: float = 30.0, *,
         write_json(config.state_path, state)
         deadline = time.monotonic() + wait_seconds
         while time.monotonic() < deadline:
+            if heartbeat is not None:
+                heartbeat()
             exited = _child_exit_unreaped(process)
             if exited is not None:
                 raise RuntimeError(
                     f"Mavis oMLX exited during startup with status {exited.si_status}"
                 )
-            if endpoint_alive(config.endpoint, **_own_api(config)):
+            if endpoint_alive(config.endpoint,
+                              **({"timeout": 0.5} if heartbeat is not None else {}),
+                              **_own_api(config)):
+                if heartbeat is not None:
+                    heartbeat()
                 if require_new and not owns_running_server(config):
                     raise RuntimeError("Mavis endpoint changed owner during startup")
                 _TRIAL_PROCESSES[process.pid] = process
                 return state
-            time.sleep(0.25)
+            time.sleep(0.1 if heartbeat is not None else 0.25)
         raise TimeoutError("Mavis oMLX did not become healthy before the startup deadline")
     except BaseException:
         try:
@@ -639,7 +693,8 @@ def _process_group_workers(pid: int) -> set[int]:
 
 
 def _stop_spawned_process_group(process: subprocess.Popen[Any], *,
-                                timeout: float = 5.0) -> None:
+                                timeout: float = 5.0,
+                                heartbeat: Callable[[], bool] | None = None) -> None:
     """Signal only while this Popen's unreaped leader reserves its group ID."""
     pid = process.pid
     exited = _child_exit_unreaped(process)
@@ -658,9 +713,19 @@ def _stop_spawned_process_group(process: subprocess.Popen[Any], *,
         os.killpg(pid, signal.SIGTERM)
     except ProcessLookupError:
         pass
+    forced = False
     for phase in ("term", "kill"):
         deadline = time.monotonic() + timeout
         while time.monotonic() < deadline:
+            if heartbeat is not None and not forced and not heartbeat():
+                # The leader is still unreaped, so the group number cannot
+                # alias another session when an unsafe handoff escalates.
+                _child_exit_unreaped(process)
+                try:
+                    os.killpg(pid, signal.SIGKILL)
+                except ProcessLookupError:
+                    pass
+                forced = True
             exited = _child_exit_unreaped(process)
             workers = _process_group_workers(pid)
             if exited is not None and not workers:
@@ -679,7 +744,8 @@ def _stop_spawned_process_group(process: subprocess.Popen[Any], *,
 
 
 def stop_trial_server(config: RuntimeConfig, expected_state: dict[str, Any], *,
-                      timeout: float = 10.0) -> None:
+                      timeout: float = 10.0,
+                      heartbeat: Callable[[], bool] | None = None) -> None:
     """Abort only the server this trial launched and prove its group exited."""
     if not config.state_path.is_file() or read_json(config.state_path) != expected_state:
         raise RuntimeError("Mavis trial server launch record changed")
@@ -691,7 +757,10 @@ def stop_trial_server(config: RuntimeConfig, expected_state: dict[str, Any], *,
         raise RuntimeError("Mavis trial server process handle changed")
     if _child_exit_unreaped(process) is None and not owns_running_server(config):
         raise RuntimeError("Mavis trial server ownership is unproven")
-    _stop_spawned_process_group(process, timeout=timeout)
+    _stop_spawned_process_group(
+        process, timeout=timeout,
+        **({"heartbeat": heartbeat} if heartbeat is not None else {}),
+    )
     _TRIAL_PROCESSES.pop(pid, None)
 
 
@@ -829,7 +898,8 @@ def reserve_empty_mavis_port(config: RuntimeConfig, *,
 
 def park_mavis_server(config: RuntimeConfig, *, timeout: float = 30,
                       expected_pid: int | None = None,
-                      expected_state: dict[str, Any] | None = None) -> socket.socket:
+                      expected_state: dict[str, Any] | None = None,
+                      heartbeat: Callable[[], bool] | None = None) -> socket.socket:
     """Stop the owned server or reserve its empty port through IRIS restoration.
 
     The caller must keep the returned listening socket open until IRIS is
@@ -847,8 +917,34 @@ def park_mavis_server(config: RuntimeConfig, *, timeout: float = 30,
     state = expected_state if expected_state is not None else (
         read_json(config.state_path) if pid is not None else None
     )
-    if endpoint_alive(config.endpoint, **_own_api(config)):
-        status = request_json(config.endpoint, "/api/status", **_own_headers(config))
+    def reserve_after_verified_stop() -> socket.socket:
+        try:
+            return reserve_empty_mavis_port(config, verify_endpoint=False)
+        except BaseException as error:
+            failure = RuntimeError(
+                f"Mavis trial group stopped, but empty port reservation failed: {error}"
+            )
+            failure.gpu_work_stopped = True
+            raise failure from error
+
+    def emergency_reservation() -> socket.socket:
+        if state is None:
+            raise RuntimeError("Mavis emergency park lacks exact trial state")
+        stop_trial_server(config, state, timeout=1)
+        return reserve_after_verified_stop()
+
+    stopped_here = False
+    if heartbeat is not None and not heartbeat():
+        return emergency_reservation()
+    if endpoint_alive(config.endpoint, timeout=0.5 if heartbeat else 10,
+                      **_own_api(config)):
+        if heartbeat is not None and not heartbeat():
+            return emergency_reservation()
+        status = request_json(config.endpoint, "/api/status",
+                              timeout=0.5 if heartbeat else 10,
+                              **_own_headers(config))
+        if heartbeat is not None and not heartbeat():
+            return emergency_reservation()
         if (not isinstance(status, dict) or status.get("status") != "ok"
                 or type(status.get("active_requests")) is not int
                 or type(status.get("waiting_requests")) is not int
@@ -858,12 +954,17 @@ def park_mavis_server(config: RuntimeConfig, *, timeout: float = 30,
             raise RuntimeError("Mavis server has active, queued, or loading work")
         if pid is None or state is None:
             raise RuntimeError("Mavis live server lacks owned process state")
-        stop_trial_server(config, state, timeout=timeout)
+        stop_trial_server(config, state, timeout=timeout, heartbeat=heartbeat)
+        stopped_here = True
+    elif heartbeat is not None and not heartbeat():
+        return emergency_reservation()
     elif _listener_pids(_port(config.endpoint)):
         raise RuntimeError("Mavis endpoint is occupied by an unidentified listener")
     elif state is not None:
         # The server may have exited while an owned worker remains. Its
         # unreaped leader still reserves the process-group number.
-        stop_trial_server(config, state, timeout=timeout)
-    reservation = reserve_empty_mavis_port(config, verify_endpoint=False)
+        stop_trial_server(config, state, timeout=timeout, heartbeat=heartbeat)
+        stopped_here = True
+    reservation = (reserve_after_verified_stop() if stopped_here else
+                   reserve_empty_mavis_port(config, verify_endpoint=False))
     return reservation

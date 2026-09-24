@@ -51,6 +51,150 @@ class FakeProcess:
 
 
 class RuntimeTests(unittest.TestCase):
+    def test_trial_rejects_persisted_pinned_preload_before_spawn(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            binary = root / "omlx"
+            binary.write_text("fixture")
+            config = RuntimeConfig(home=root / "home", omlx_binary=binary,
+                                   api_key="test-secret")
+            write_json(config.base_path / "model_settings.json", {
+                "version": 1, "models": {"old-model": {"is_pinned": True}},
+            })
+            with (patch("mavis.runtime.endpoint_alive", return_value=False),
+                  patch("mavis.runtime.port_in_use", return_value=False),
+                  patch("mavis.runtime.subprocess.Popen") as spawn,
+                  self.assertRaisesRegex(RuntimeError, "pinned-model preload")):
+                start_server(config, require_new=True, heartbeat=lambda: None)
+            spawn.assert_not_called()
+
+    def test_trial_refuses_even_matching_residual_key_before_spawn(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            binary = root / "omlx"
+            binary.write_text("fixture")
+            config = RuntimeConfig(home=root / "home", omlx_binary=binary,
+                                   api_key="test-secret")
+            settings_path = config.base_path / "settings.json"
+            write_json(settings_path, {"version": "1.0", "auth": {
+                "api_key": "test-secret", "skip_api_key_verification": False,
+            }})
+            original = settings_path.read_bytes()
+            with (patch("mavis.runtime.endpoint_alive", return_value=False),
+                  patch("mavis.runtime.port_in_use", return_value=False),
+                  patch("mavis.runtime.subprocess.Popen") as spawn,
+                  self.assertRaisesRegex(RuntimeError, "residual Mavis trial") as caught):
+                start_server(config, require_new=True, heartbeat=lambda: None)
+            self.assertTrue(caught.exception.residual_trial_auth)
+            self.assertEqual(settings_path.read_bytes(), original)
+            spawn.assert_not_called()
+
+    def test_trial_rejects_untrusted_pinned_record_and_accepts_false(self):
+        with tempfile.TemporaryDirectory() as directory:
+            config = RuntimeConfig(home=Path(directory), api_key="test-secret")
+            path = config.base_path / "model_settings.json"
+            for pinned in ("false", 1):
+                write_json(path, {"version": 1, "models": {"model": {
+                    "is_pinned": pinned,
+                }}})
+                with self.assertRaisesRegex(RuntimeError, "pinned-model state"):
+                    runtime.reject_persisted_trial_preload(config)
+            write_json(path, {"version": 1, "models": {"model": {
+                "is_pinned": False,
+            }}})
+            runtime.reject_persisted_trial_preload(config)
+
+    def test_post_launch_game_heartbeat_stops_exact_no_gpu_child_group(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            binary = root / "harmless-server"
+            binary.write_text("#!/bin/sh\nsleep 30\n")
+            binary.chmod(0o700)
+            config = RuntimeConfig(home=root / "home", omlx_binary=binary,
+                                   api_key="test-secret")
+            observed: list[int] = []
+            calls = 0
+            def heartbeat() -> None:
+                nonlocal calls
+                calls += 1
+                if calls == 2:
+                    observed.append(runtime.read_json(config.state_path)["pid"])
+                    raise RuntimeError("game began during trial startup")
+            with (patch("mavis.runtime.endpoint_alive", return_value=False),
+                  patch("mavis.runtime.port_in_use", return_value=False),
+                  self.assertRaisesRegex(RuntimeError, "game began")):
+                start_server(config, require_new=True, heartbeat=heartbeat)
+            self.assertEqual(calls, 2)
+            self.assertFalse(config.state_path.exists())
+            self.assertEqual(runtime._process_group_workers(observed[0]), set())
+            with self.assertRaises(ChildProcessError):
+                os.waitid(os.P_PID, observed[0], os.WEXITED | os.WNOHANG | os.WNOWAIT)
+
+    def test_unsafe_heartbeat_kills_only_its_unreaped_no_gpu_group(self):
+        child = subprocess.Popen(
+            [sys.executable, "-c", "import signal,time; "
+             "signal.signal(signal.SIGTERM, signal.SIG_IGN); "
+             "print('ready', flush=True); time.sleep(30)"],
+            start_new_session=True, stdout=subprocess.PIPE,
+            stderr=subprocess.DEVNULL, text=True,
+        )
+        try:
+            self.assertEqual(child.stdout.readline().strip(), "ready")
+            runtime._stop_spawned_process_group(
+                child, timeout=2, heartbeat=lambda: False,
+            )
+            self.assertEqual(child.returncode, -signal.SIGKILL)
+        finally:
+            child.stdout.close()
+            if child.returncode is None:
+                try:
+                    os.killpg(child.pid, signal.SIGKILL)
+                except ProcessLookupError:
+                    pass
+                child.wait()
+
+    def test_game_during_park_status_aborts_registered_group_without_idle_claim(self):
+        with tempfile.TemporaryDirectory() as directory:
+            config = RuntimeConfig(home=Path(directory), api_key="test-secret")
+            state = {"pid": 1234}
+            write_json(config.state_path, state)
+            heartbeat = Mock(side_effect=[True, True, False])
+            reservation = Mock()
+            with (patch.dict(runtime._TRIAL_PROCESSES, {1234: FakeProcess()}, clear=True),
+                  patch("mavis.runtime.endpoint_alive", return_value=True),
+                  patch("mavis.runtime.request_json", return_value={
+                      "status": "ok", "active_requests": 1,
+                      "waiting_requests": 0, "models_loading": 0,
+                  }), patch("mavis.runtime.stop_trial_server") as stop,
+                  patch("mavis.runtime.reserve_empty_mavis_port",
+                        return_value=reservation)):
+                self.assertIs(runtime.park_mavis_server(
+                    config, expected_pid=1234, expected_state=state,
+                    heartbeat=heartbeat,
+                ), reservation)
+            stop.assert_called_once_with(config, state, timeout=1)
+            self.assertEqual(heartbeat.call_count, 3)
+
+    def test_park_reservation_failure_records_proven_group_stop(self):
+        with tempfile.TemporaryDirectory() as directory:
+            config = RuntimeConfig(home=Path(directory), api_key="test-secret")
+            state = {"pid": 1234}
+            write_json(config.state_path, state)
+            with (patch.dict(runtime._TRIAL_PROCESSES, {1234: FakeProcess()}, clear=True),
+                  patch("mavis.runtime.endpoint_alive", return_value=True),
+                  patch("mavis.runtime.request_json", return_value={
+                      "status": "ok", "active_requests": 0,
+                      "waiting_requests": 0, "models_loading": 0,
+                  }), patch("mavis.runtime.stop_trial_server") as stop,
+                  patch("mavis.runtime.reserve_empty_mavis_port",
+                        side_effect=RuntimeError("foreign listener")),
+                  self.assertRaisesRegex(RuntimeError, "group stopped") as caught):
+                runtime.park_mavis_server(
+                    config, expected_pid=1234, expected_state=state,
+                )
+            stop.assert_called_once_with(config, state, timeout=30, heartbeat=None)
+            self.assertTrue(caught.exception.gpu_work_stopped)
+
     def test_exited_unreaped_leader_anchors_worker_group_until_stop(self):
         child = subprocess.Popen(
             [sys.executable, "-c", "import subprocess,sys; "

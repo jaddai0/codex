@@ -8,7 +8,7 @@ import sys
 import tempfile
 import threading
 import unittest
-from unittest.mock import Mock, patch
+from unittest.mock import ANY, Mock, patch
 from urllib.error import HTTPError
 
 from mavis.runtime import RuntimeConfig, ensure_isolated_settings
@@ -50,9 +50,146 @@ class Lease:
 
 class SharedGpuObservationTests(unittest.TestCase):
     def setUp(self):
-        self.config = RuntimeConfig(home=Path("/private/tmp/mavis-test"),
+        self.directory = tempfile.TemporaryDirectory()
+        self.addCleanup(self.directory.cleanup)
+        self.config = RuntimeConfig(home=Path(self.directory.name), api_key="test-secret",
                                     allow_concurrent_local=True)
+        self.config.base_path.mkdir(parents=True)
+        (self.config.base_path / "settings.json").write_text(json.dumps({
+            "auth": {"api_key": "test-secret", "skip_api_key_verification": False}
+        }))
+        self.real_prove_trial_auth = observer._prove_trial_auth
+        proof = patch.object(observer, "_prove_trial_auth")
+        proof.start()
+        self.addCleanup(proof.stop)
         self.lease = Lease()
+
+    def test_private_trial_key_is_required_before_gpu_lease(self):
+        config = RuntimeConfig(home=self.config.home, allow_concurrent_local=True)
+        with patch.object(observer, "_lease_command") as lease, \
+                self.assertRaisesRegex(ValueError, "private trial key"):
+            with observer.shared_mavis_model(config, "test"):
+                pass
+        lease.assert_not_called()
+
+    def test_residual_trial_key_is_preserved_after_rejected_start(self):
+        error = RuntimeError("residual Mavis trial authentication requires recovery")
+        error.residual_trial_auth = True
+        with (patch.object(observer, "_lease_command", side_effect=self.lease),
+              patch.object(observer, "loaded_generation_models", return_value=["iris-model"]),
+              patch.object(observer, "require_idle_iris_handoff"),
+              patch.object(observer, "reserve_empty_mavis_port", return_value=Mock()),
+              patch.object(observer, "start_server", side_effect=error),
+              patch.object(observer, "clear_trial_auth_settings") as clear,
+              self.assertRaisesRegex(RuntimeError, "residual Mavis trial")):
+            with observer.shared_mavis_model(self.config, "test"):
+                pass
+        clear.assert_not_called()
+        self.assertIn("test-secret", (self.config.base_path / "settings.json").read_text())
+        self.assertIn(("release", "codex-mavis"), self.lease.calls)
+
+    def test_emergency_abort_skips_aggregate_request_status_on_exact_trial(self):
+        with (patch.object(observer, "endpoint_alive") as alive,
+              patch.object(observer, "request_json") as request,
+              patch.object(observer, "stop_trial_server") as stop,
+              patch.object(observer, "reserve_empty_mavis_port", return_value=Mock()),
+              patch.object(observer, "clear_trial_auth_settings") as clear):
+            observer._abort_observation_server(
+                self.config, {"pid": 1234}, emergency=True,
+            )
+        alive.assert_not_called()
+        request.assert_not_called()
+        stop.assert_called_once_with(self.config, {"pid": 1234})
+        clear.assert_called_once_with(self.config)
+
+    def test_emergency_abort_refuses_changed_private_auth(self):
+        (self.config.base_path / "settings.json").write_text(json.dumps({
+            "auth": {"api_key": "another-key", "skip_api_key_verification": False}
+        }))
+        with patch.object(observer, "stop_trial_server") as stop, \
+                self.assertRaisesRegex(RuntimeError, "authentication proof changed"):
+            observer._abort_observation_server(
+                self.config, {"pid": 1234}, emergency=True,
+            )
+        stop.assert_not_called()
+
+    def test_game_begins_while_request_drain_is_polling(self):
+        self.lease.purpose = "our-e0"
+        token = observer._PURPOSE.set("our-e0")
+        def active(*_args, **_kwargs):
+            self.lease.game_live = True
+            return {"status": "ok", "active_requests": 1,
+                    "waiting_requests": 0, "models_loading": 0}
+        try:
+            with patch.object(observer, "_lease_command", side_effect=self.lease), \
+                    patch.object(observer, "request_json", side_effect=active), \
+                    self.assertRaisesRegex(observer.UnsafeSharedGPU, "game state is unsafe"):
+                observer._drained_request_status(self.config, wait_seconds=2.5)
+        finally:
+            observer._PURPOSE.reset(token)
+
+    def test_game_during_cleanup_status_aborts_exact_server_before_park(self):
+        state = {"pid": 1234}
+        loaded = {"yes": False}
+        statuses = {"count": 0}
+        def generation(endpoint, **_kwargs):
+            return (["iris-model"] if endpoint == self.config.iris_endpoint else
+                    ([self.config.model] if loaded["yes"] else []))
+        def status(*_args, **_kwargs):
+            statuses["count"] += 1
+            if statuses["count"] == 2:
+                self.lease.game_live = True
+            return {"status": "ok", "active_requests": 0,
+                    "waiting_requests": 0, "models_loading": 0}
+        with (patch.object(observer, "_lease_command", side_effect=self.lease),
+              patch.object(observer, "loaded_generation_models", side_effect=generation),
+              patch.object(observer, "require_idle_iris_handoff"),
+              patch.object(observer, "reserve_empty_mavis_port", return_value=Mock()),
+              patch.object(observer, "start_server", return_value=state),
+              patch.object(observer, "read_json", return_value=state),
+              patch.object(observer, "inventory", return_value=[{"id": self.config.model}]),
+              patch.object(observer, "endpoint_alive", return_value=True),
+              patch.object(observer, "load_model",
+                           side_effect=lambda _: loaded.__setitem__("yes", True)),
+              patch.object(observer, "request_json", side_effect=status),
+              patch.object(observer, "stop_trial_server") as stop,
+              patch.object(observer, "park_mavis_server") as park,
+              self.assertRaisesRegex(RuntimeError, "game state is unsafe")):
+            with observer.shared_mavis_model(self.config, "test"):
+                pass
+        self.assertGreaterEqual(statuses["count"], 2)
+        stop.assert_called_once_with(self.config, state)
+        park.assert_not_called()
+        self.assertIn(("release", "codex-mavis"), self.lease.calls)
+
+    def test_unsafe_child_aborts_server_before_child_group(self):
+        child = Mock(pid=4321)
+        child.returncode = None
+        order: list[str] = []
+        shared = {"iris_generation_models": ["iris-model"],
+                  "observation_child_safe": True}
+        token = observer._PURPOSE.set("our-e0")
+        abort_token = observer._EMERGENCY_ABORT.set(lambda: order.append("server"))
+        self.lease.purpose = "our-e0"
+        try:
+            def peek(_child):
+                self.lease.game_live = True
+                return None
+            with (patch.object(observer, "_lease_command", side_effect=self.lease),
+                  patch.object(observer, "loaded_generation_models", return_value=["iris-model"]),
+                  patch.object(observer.subprocess, "Popen", return_value=child),
+                  patch.object(observer, "_child_exit_unreaped", side_effect=peek),
+                  patch.object(observer, "_stop_spawned_process_group",
+                               side_effect=lambda _: order.append("child")),
+                  self.assertRaisesRegex(observer.UnsafeSharedGPU, "game state is unsafe")):
+                observer.run_monitored_observation(
+                    self.config, ["e0"], cwd=Path("/tmp"), env={}, stdout=None,
+                    shared=shared, timeout=30,
+                )
+            self.assertEqual(order, ["server", "child"])
+        finally:
+            observer._EMERGENCY_ABORT.reset(abort_token)
+            observer._PURPOSE.reset(token)
 
     def test_trial_auth_requires_live_401_then_keyed_status(self):
         config = RuntimeConfig(home=Path("/tmp/mavis-auth-test"), api_key="test-secret")
@@ -60,13 +197,13 @@ class SharedGpuObservationTests(unittest.TestCase):
         with patch.object(observer, "request_json", side_effect=[
             unauthorized, {"status": "ok"},
         ]) as request:
-            observer._prove_trial_auth(config)
+            self.real_prove_trial_auth(config)
         unauthorized.close()
         self.assertEqual(request.call_args_list[1].kwargs["headers"],
                          {"Authorization": "Bearer test-secret"})
         with patch.object(observer, "request_json", return_value={"status": "ok"}), \
                 self.assertRaisesRegex(RuntimeError, "without its key"):
-            observer._prove_trial_auth(config)
+                self.real_prove_trial_auth(config)
 
     def test_authenticated_stopped_child_waits_for_request_to_drain(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -145,8 +282,9 @@ class SharedGpuObservationTests(unittest.TestCase):
             config = RuntimeConfig(home=Path(directory), api_key="test-secret",
                                    allow_concurrent_local=True)
             state = {"pid": 1234}
-            def start(_config, *, require_new):
+            def start(_config, *, require_new, heartbeat):
                 self.assertTrue(require_new)
+                self.assertTrue(callable(heartbeat))
                 ensure_isolated_settings(_config)
                 return state
             with (patch.object(observer, "_lease_command", side_effect=self.lease),
@@ -170,8 +308,9 @@ class SharedGpuObservationTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory:
             config = RuntimeConfig(home=Path(directory), api_key="test-secret",
                                    allow_concurrent_local=True)
-            def start(_config, *, require_new):
+            def start(_config, *, require_new, heartbeat):
                 self.assertTrue(require_new)
+                self.assertTrue(callable(heartbeat))
                 ensure_isolated_settings(_config)
                 raise RuntimeError("startup failed after owned group stopped")
             with (patch.object(observer, "_lease_command", side_effect=self.lease),
@@ -191,8 +330,9 @@ class SharedGpuObservationTests(unittest.TestCase):
             config = RuntimeConfig(home=Path(directory), api_key="test-secret",
                                    allow_concurrent_local=True)
             state = {"pid": 1234}
-            def start(_config, *, require_new):
+            def start(_config, *, require_new, heartbeat):
                 self.assertTrue(require_new)
+                self.assertTrue(callable(heartbeat))
                 ensure_isolated_settings(_config)
                 write_json(_config.state_path, state)
                 return state
@@ -224,7 +364,7 @@ class SharedGpuObservationTests(unittest.TestCase):
                         shared["observation_child_pid"] = 4321
                         self.lease.game_live = True
             stop.assert_called_once_with(config, state)
-            self.assertGreaterEqual(draining["checks"], 3)
+            self.assertEqual(draining["checks"], 0)
             park.assert_not_called()
             self.assertNotIn("test-secret", (config.base_path / "settings.json").read_text())
             self.assertIn(("release", "codex-mavis"), self.lease.calls)
@@ -234,15 +374,17 @@ class SharedGpuObservationTests(unittest.TestCase):
             config = RuntimeConfig(home=Path(directory), api_key="test-secret",
                                    allow_concurrent_local=True)
             state = {"pid": 1234}
-            def start(_config, *, require_new):
+            def start(_config, *, require_new, heartbeat):
                 self.assertTrue(require_new)
+                self.assertTrue(callable(heartbeat))
                 ensure_isolated_settings(_config)
                 write_json(_config.state_path, state)
                 return state
             def generations(endpoint, **_kwargs):
                 return ["iris-model"] if endpoint == config.iris_endpoint else []
+            active = {"yes": False}
             def status(*_args, **_kwargs):
-                return {"status": "ok", "active_requests": 1 if self.lease.game_live else 0,
+                return {"status": "ok", "active_requests": 1 if active["yes"] else 0,
                         "waiting_requests": 0, "models_loading": 0}
             with (patch.object(observer, "_lease_command", side_effect=self.lease),
                   patch.object(observer, "loaded_generation_models", side_effect=generations),
@@ -255,13 +397,15 @@ class SharedGpuObservationTests(unittest.TestCase):
                   patch.object(observer, "load_model"),
                   patch.object(observer, "request_json", side_effect=status),
                   patch.object(observer, "stop_trial_server") as stop,
-                  patch.object(observer, "park_mavis_server") as park,
+                  patch.object(observer, "park_mavis_server",
+                               side_effect=RuntimeError("active request remained")) as park,
                   self.assertRaisesRegex(RuntimeError, "lease retained")):
                 with observer.shared_mavis_model(config, "test") as shared:
                     shared["observation_child_pid"] = 4321
-                    self.lease.game_live = True
+                    active["yes"] = True
+                    raise RuntimeError("observation child disconnected unexpectedly")
             stop.assert_not_called()
-            park.assert_not_called()
+            park.assert_called_once()
             self.assertNotIn(("release", "codex-mavis"), self.lease.calls)
             self.assertIn("test-secret", (config.base_path / "settings.json").read_text())
             receipts = list((config.home / "evaluations/shared-gpu-failures").glob("*.json"))
@@ -281,10 +425,9 @@ class SharedGpuObservationTests(unittest.TestCase):
                     self.lease.game_live = True
                     blocked.wait(10)
                     return {"status": "ok"}
-                def abort(_config, state, *, own_generation, own_unload, stopped):
+                def abort(_config, state, *, emergency, stopped):
                     self.assertEqual(state, {"pid": 1234})
-                    self.assertEqual(own_generation, had_child)
-                    self.assertTrue(own_unload)
+                    self.assertTrue(emergency)
                     stopped["yes"] = True
                     blocked.set()
                 with (patch.object(observer, "_lease_command", side_effect=self.lease),
@@ -354,7 +497,7 @@ class SharedGpuObservationTests(unittest.TestCase):
                   patch.object(observer.subprocess, "Popen", return_value=child),
                   patch.object(observer, "_child_exit_unreaped", side_effect=peek),
                   patch.object(observer, "_stop_spawned_process_group") as stop,
-                  self.assertRaises(subprocess.TimeoutExpired)):
+                  self.assertRaisesRegex(observer.UnsafeSharedGPU, "timed out")):
                 observer.run_monitored_observation(
                     self.config, ["e0"], cwd=Path("/tmp"), env={}, stdout=None,
                     shared=shared, timeout=30,
@@ -513,8 +656,8 @@ class SharedGpuObservationTests(unittest.TestCase):
             with self.assertRaisesRegex(RuntimeError, "already running"):
                 with observer.shared_mavis_model(self.config, "test"):
                     pass
-        reservation.close.assert_called_once()
-        start.assert_called_once_with(self.config, require_new=True)
+        self.assertEqual(reservation.close.call_count, 2)
+        start.assert_called_once_with(self.config, require_new=True, heartbeat=ANY)
         park.assert_not_called()
         self.assertIn(("release", "codex-mavis"), self.lease.calls)
 
@@ -547,7 +690,7 @@ class SharedGpuObservationTests(unittest.TestCase):
                     pass
         self.assertTrue(any(call.args[1].endswith("/unload") for call in api.call_args_list))
         park.assert_called_once_with(self.config, expected_pid=1234,
-                                     expected_state={"pid": 1234})
+                                     expected_state={"pid": 1234}, heartbeat=ANY)
         self.assertIn(("release", "codex-mavis"), self.lease.calls)
 
     def test_failed_park_still_releases_own_lease(self):
@@ -574,6 +717,34 @@ class SharedGpuObservationTests(unittest.TestCase):
                     pass
         abort.assert_called_once()
         receipt.assert_called_once()
+        self.assertIn(("release", "codex-mavis"), self.lease.calls)
+
+    def test_proven_park_stop_releases_lease_when_foreign_port_blocks_reservation(self):
+        state = {"pid": 1234}
+        error = RuntimeError("group stopped, but foreign port blocked reservation")
+        error.gpu_work_stopped = True
+        def generation(endpoint, **_kwargs):
+            return ["iris-model"] if endpoint == self.config.iris_endpoint else []
+        with (patch.object(observer, "_lease_command", side_effect=self.lease),
+              patch.object(observer, "loaded_generation_models", side_effect=generation),
+              patch.object(observer, "require_idle_iris_handoff"),
+              patch.object(observer, "reserve_empty_mavis_port", return_value=Mock()),
+              patch.object(observer, "start_server", return_value=state),
+              patch.object(observer, "read_json", return_value=state),
+              patch.object(observer, "inventory", return_value=[{"id": self.config.model}]),
+              patch.object(observer, "endpoint_alive", return_value=True),
+              patch.object(observer, "load_model"),
+              patch.object(observer, "request_json", return_value={
+                  "status": "ok", "active_requests": 0,
+                  "waiting_requests": 0, "models_loading": 0,
+              }), patch.object(observer, "park_mavis_server", side_effect=error),
+              patch.object(observer, "stop_trial_server") as abort,
+              patch.object(observer, "_failure_receipt",
+                           return_value=Path("/tmp/e0-port-race.json"))):
+            with self.assertRaisesRegex(RuntimeError, "foreign port blocked"):
+                with observer.shared_mavis_model(self.config, "test"):
+                    pass
+        abort.assert_not_called()
         self.assertIn(("release", "codex-mavis"), self.lease.calls)
 
     def test_success_parks_only_new_server_and_reports_lease_release(self):
@@ -603,9 +774,9 @@ class SharedGpuObservationTests(unittest.TestCase):
             self.assertEqual(result["mavis_loaded"], False)
             self.assertTrue(result["iris_stayed_loaded"])
             self.assertTrue(result["gpu_lease_released"])
-        start.assert_called_once_with(self.config, require_new=True)
+        start.assert_called_once_with(self.config, require_new=True, heartbeat=ANY)
         park.assert_called_once_with(self.config, expected_pid=1234,
-                                     expected_state={"pid": 1234})
+                                     expected_state={"pid": 1234}, heartbeat=ANY)
         self.assertIn(("renew", "codex-mavis", "90"), self.lease.calls)
         self.assertIn(("release", "codex-mavis"), self.lease.calls)
 
