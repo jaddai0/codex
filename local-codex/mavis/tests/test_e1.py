@@ -54,8 +54,10 @@ def bootstrap_inspection(home: Path, assignment: dict) -> dict:
             "weights_fingerprint": assignment["model_identity"]["weights_fingerprint"],
             "cited_file": shard,
             "cited_sha256": model_files[shard],
+            "config_sha256": sha256_file(Path(assignment["model_artifacts"]["model_path"]) / "config.json"),
             "observed_architecture": config["architectures"][0],
-            "observed_quantization": config.get("quantization") or config.get("quantization_config"),
+            "observed_quantization_sha256": e1_bootstrap._digest(
+                config.get("quantization") or config.get("quantization_config")),
         },
         "conclusion": {"matched": True, "issues": []},
     }
@@ -777,7 +779,7 @@ class E1RunnerTests(unittest.TestCase):
         write_json(
             gateway_report,
             {
-                "schema_version": "mavis.e1-bootstrap-review/v2",
+                "schema_version": "mavis.e1-bootstrap-review/v3",
                 "verdict": "accepted",
                 "inspection": bootstrap_inspection(self.home, assignment),
                 "e0_summary_sha256": sha256_file(summary),
@@ -1143,6 +1145,19 @@ class E1RunnerTests(unittest.TestCase):
         model.write_bytes(b"different-weight-bytes")
         with self.assertRaisesRegex(ValueError, "model artifact bytes changed"):
             self.runner.store.promote("repair", between_objectives=True)
+
+    def test_bootstrap_review_rejects_false_model_hashes(self):
+        self._paired_bootstrap_trials()
+        report = self.root / "bootstrap-gateway-job/report.md"
+        original = read_json(report)
+        for field in ("config_sha256", "observed_quantization_sha256"):
+            with self.subTest(field=field):
+                altered = copy.deepcopy(original)
+                altered["inspection"]["model"][field] = "0" * 64
+                write_json(report, altered)
+                with self.assertRaisesRegex(ValueError, "model inspection differs"):
+                    e1_bootstrap.check_bootstrap_review(self.home, report)
+        write_json(report, original)
 
     def test_native_review_rejects_wrong_facts_and_gateway_assignment(self):
         _, assignment_path, review, status = self._native_review()

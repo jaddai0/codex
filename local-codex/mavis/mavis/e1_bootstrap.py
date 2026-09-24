@@ -207,16 +207,18 @@ def _check_review_inspection(home: Path, assignment: dict[str, Any], review: dic
     config = read_json(Path(assignment["model_artifacts"]["model_path"]) / "config.json")
     if (not isinstance(model, dict)
             or set(model) != {"model_id", "weights_fingerprint", "cited_file",
-                                  "cited_sha256", "observed_architecture",
-                                  "observed_quantization"}
+                                  "cited_sha256", "config_sha256", "observed_architecture",
+                                  "observed_quantization_sha256"}
             or model["model_id"] != assignment["model_identity"]["model_id"]
             or model["weights_fingerprint"] != assignment["model_identity"]["weights_fingerprint"]
             or not isinstance(model["cited_file"], str)
             or not model["cited_file"].endswith(".safetensors")
             or model["cited_sha256"] != files.get(model["cited_file"])
+            or model["config_sha256"] != sha256_file(
+                Path(assignment["model_artifacts"]["model_path"]) / "config.json")
             or model["observed_architecture"] != config["architectures"][0]
-            or model["observed_quantization"] !=
-            (config.get("quantization") or config.get("quantization_config"))):
+            or model["observed_quantization_sha256"] != _digest(
+                config.get("quantization") or config.get("quantization_config"))):
         raise ValueError("E1 bootstrap review model inspection differs from installed model")
     if inspection["conclusion"] != {"matched": True, "issues": []}:
         raise ValueError("E1 bootstrap review cannot accept unresolved inspection issues")
@@ -436,20 +438,25 @@ def _gateway_arguments(
             "Independently inspect the installed E0 case receipts, baseline, installed "
             "package and its pinned source checkout, and exact model artifact hashes in the "
             "context packet. Return a raw JSON object with schema_version "
-            "mavis.e1-bootstrap-review/v2, verdict, and inspection. Extract values from "
+            "mavis.e1-bootstrap-review/v3, verdict accepted only if every fact "
+            "matches, and inspection. Extract values from "
             "the actual files, not just the frozen packet: source {revision, "
             "package_tree_sha256, checked_file, checked_sha256, source_excerpt} using "
             "local-codex/mavis/mavis/e1_bootstrap.py; e0_cases with one {case, receipt_path, "
             "receipt_sha256, observed_status, cited_evidence} for every mandatory case in "
             "order; model {model_id, weights_fingerprint, cited_file, cited_sha256, "
-            "observed_architecture, observed_quantization} citing a weight shard and the "
-            "actual config.json; and conclusion {matched: true, issues: []} only if all "
+            "config_sha256, observed_architecture, observed_quantization_sha256} "
+            "citing a weight shard and the actual config.json; compute the "
+            "quantization SHA-256 from the actual config value using canonical "
+            "sorted-key compact JSON, and never paste the large quantization map; "
+            "conclusion {matched: true, issues: []} only if all "
             "inspected facts agree. Also include "
             "e0_summary_sha256, baseline_sha256, package_manifest_sha256, "
             "installed_candidate_digest, model_identity_digest, assignment_sha256, "
             f"gateway_worker_job_id ({job_id}), and verifier_job_id ({job_id}-terra). "
             "This names the planned separate verifier; it does not claim that verifier ran. "
-            "Use the frozen packet's exact hashes. Return raw JSON without code fences."
+            "Use the frozen packet's exact hashes. Return one complete raw JSON "
+            "object without a preamble, code fences, or trailing text."
         ),
         "lane": "minimax",
         "model": owner["model"],
@@ -573,7 +580,7 @@ def check_bootstrap_review(home: Path, report_path: Path) -> dict[str, str]:
         raise ValueError("E1 bootstrap check must read the dispatched gateway report")
     review = read_json(report_path)
     if (
-        review.get("schema_version") != "mavis.e1-bootstrap-review/v2"
+        review.get("schema_version") != "mavis.e1-bootstrap-review/v3"
         or review.get("verdict") != "accepted"
         or review.get("e0_summary_sha256") != assignment["e0_summary"]["sha256"]
         or review.get("baseline_sha256") != assignment["baseline"]["sha256"]
@@ -658,7 +665,7 @@ def _review(home: Path, receipt: dict[str, Any], status_reader: Callable[[str], 
                         home / "verifications/e1-bootstrap/main.json", "independent review")
     _checked_ref(receipt.get("review_assignment"), assignment_path, "review assignment")
     review = read_json(path)
-    if (review.get("schema_version") != "mavis.e1-bootstrap-review/v2"
+    if (review.get("schema_version") != "mavis.e1-bootstrap-review/v3"
             or review.get("verdict") != "accepted"
             or review.get("e0_summary_sha256") != receipt["e0_summary"]["sha256"]
             or review.get("baseline_sha256") != receipt["baseline"]["sha256"]
