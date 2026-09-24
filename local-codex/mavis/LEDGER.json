@@ -34,11 +34,13 @@
         "After the launcher changed, installed candidate 7ad62299b passed fresh E0 run 9682efbf5d8f40ee9abe5f16ecf75ac9, all 10 cases. The four observer cases were regenerated on this exact installation; IRIS stayed loaded, Mavis was parked, and the GPU lease released. The shell launcher hash is separately bound by the install manifest and live librarian receipt.",
         "Final source suite after the shell-librarian dispatch regression passed 312 tests with two skips; see Mavis/evidence/phase2-librarian-launcher-final-source-tests-7ad62299b.log.",
         "After the installed MCP bridge changed the candidate, six candidate-bound E0 observer arms were refreshed. Final installed run 326665986826461ba7c2a74b8705789e passed 10/10 with before/after fingerprint equality, IRIS loaded, Mavis parked, and GPU lease released. See ~/.local-codex/mavis-service/evaluations/e0/final-installed-shared.json.",
-        "The full Mavis source suite after the MCP bridge passed 314 tests with two skips; retained at Mavis/evidence/phase2-mcp-installed/final-source-suite.log."
+        "The full Mavis source suite after the MCP bridge passed 314 tests with two skips; retained at Mavis/evidence/phase2-mcp-installed/final-source-suite.log.",
+        "Current installed package source revision 069dfa8dd78d8f40e28639135f7ad7770b3653ad passed the small-repository, buried-failure, and isolation observers. Its compaction observer produced the correct recovered fact but failed the required IRIS-stayed-loaded check when IRIS oMLX restarted. A later retry stopped at the 15-minute IRIS-idle gate. The current candidate has no all-pass E0 summary; see Mavis/evidence/phase3/observe-compaction-069dfa8dd.log and the rerun log.",
+        "The source package suite at branch e94463e23 passed 412 tests with two skips; the gateway suite passed 190 tests. These source checks do not replace the current installed E0 gate. See Mavis/evidence/phase3/source-suite-e94463e23.log and gateway-tests-20260924.log."
       ],
       "id": "phase-1",
       "requirement": "Deliver a useful isolated Mavis with objectives, evidence, compaction, delegation, Jev, parsing, search, and interruption recovery; pass E0 plus two independently verified real tasks.",
-      "status": "pass"
+      "status": "reject"
     },
     {
       "artifact": "local-codex/mavis/reports/phase2-installed-mcp-bridge-2026-09-24.md",
@@ -66,7 +68,8 @@
       "command": "PYTHONDONTWRITEBYTECODE=1 PYTHONPATH=local-codex/mavis python3 -m unittest discover -s local-codex/mavis/tests -q",
       "evidence": [
         "E1 source runner freezes revisions and checks, retains host receipts, dispatches native gateway assignments, and rejects dirty candidate checkouts. Current package suite passed 289 tests and host suite passed 125. Gateway Terra verification now requires evidence-specific findings and exposes the accepted verifier report path and hash; source contract tests passed, but no current installed E1 trial has run.",
-        "Installed accepted main-profile selection has source tests and independent review, but no real accepted profile is active. Native candidate activation receipt, paired failure comparison, independent promotion review, and rollback remain open; compare-native intentionally fails closed until activation is proven."
+        "Installed accepted main-profile selection has source tests and independent review, but no real accepted profile is active. Native candidate activation receipt, paired failure comparison, independent promotion review, and rollback remain open; compare-native intentionally fails closed until activation is proven.",
+        "The E1 bootstrap review and trial-only receipt for candidate c6e6ac3a7 were independently accepted, then preserved as historical evidence before installing 069dfa8dd. The current candidate needs a fresh E0 and bootstrap review; e1-clean-main-069 is frozen with separate clean baseline/candidate checkouts and six unfinished installed trials. See Mavis/evidence/phase3/e1-freeze-069dfa8dd.log and e1-prepare-*-069dfa8dd.log."
       ],
       "id": "phase-3",
       "requirement": "Deliver resumable continuous improvement and prove one reviewed promotion and rollback.",
@@ -78,7 +81,8 @@
       "evidence": [
         "An initial installed six-test run was rejected by Terra because fractional tax escaped the blueprint. The fixture added that case, the source package passed 300 tests, and installed candidate 003c908e1 passed fresh E0.",
         "The fresh seven-test held-out task passed catalog then checkout across compaction and process restart. Host checks passed 3/3 and 7/7; Terra independently accepted; the protected blueprint, tests, dirty note, and untracked draft retained their hashes. IRIS stayed loaded and the GPU lease was released.",
-        "Broader large-repository, ambiguous-failure, flaky-dependency, concurrent-worktree, decomposition, and tool-discovery shards remain open."
+        "Broader large-repository, ambiguous-failure, flaky-dependency, concurrent-worktree, decomposition, and tool-discovery shards remain open.",
+        "The protected large-project fixture passed verify_fixture.py, observe_large_e2.py dry-run, capture_native_large_e2.py --dry-run, and 12 synthetic checks on 2026-09-24. The native installed run and independent acceptance have not occurred; see Mavis/evidence/phase4-large-fixture/*-20260924.log."
       ],
       "id": "phase-4",
       "requirement": "Pass a held-out multi-package task across compaction and restart.",
@@ -121,6 +125,7 @@
   "status": "partial",
   "task": "Implement the Mavis local coding execution and verified improvement plan.",
   "uncertainty": [
+    "Current installed candidate 069dfa8dd has no all-pass E0 receipt. IRIS oMLX gracefully restarted three times during the candidate-bound compaction gate, and its model is currently unloaded. Shared-GPU admission requires a stable loaded IRIS model idle for 15 minutes; no Mavis GPU trial may run until that live gate passes. The GPU lease is released.",
     "Installed candidate eba4c2b81 passed fresh E0 10/10 in run 326665986826461ba7c2a74b8705789e. The project-bound memory MCP tool works in the default sandbox. Three repeated checkout pairs gave a narrow positive signal, but a distinct settings-helper task exited without implementing and failed host acceptance; automatic helper promotion is rejected.",
     "Installed candidate 7ad62299b passed all ten E0 cases in run 9682efbf5d8f40ee9abe5f16ecf75ac9. The prior installation is retained at ~/.local/share/local-codex-backups/mavis-before-librarian-launcher-20260924.",
     "Phase 2 installed librarian and output-reader role canaries passed with pinned Qwen3.5-4B and independent Terra review. The 0.8B candidate failed factual answer and irregular-log quality. A 4B coding arm completed and passed host acceptance while the baseline looped after passing host tests; the single unmatched pair does not establish net benefit, and default-sandbox helper access remains open.",
