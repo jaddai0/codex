@@ -18,6 +18,7 @@ use codex_protocol::protocol::HookOutputEntryKind;
 use codex_protocol::protocol::HookRunStatus;
 use codex_protocol::protocol::HookSource;
 use codex_protocol::shell_environment::CODEX_EXEC_SERVER_NOISE_AUTH_TOKEN_ENV_VAR;
+use codex_protocol::shell_environment::MAVIS_E0_TRIAL_API_KEY_ENV_VAR;
 use codex_utils_absolute_path::AbsolutePathBuf;
 use pretty_assertions::assert_eq;
 use tempfile::TempDir;
@@ -347,6 +348,10 @@ fn build_command_replays_snapshot_before_hook_overrides_and_scrubbing() {
             OsString::from(CODEX_EXEC_SERVER_NOISE_AUTH_TOKEN_ENV_VAR),
             OsString::from("captured-noise-token"),
         ),
+        (
+            OsString::from(MAVIS_E0_TRIAL_API_KEY_ENV_VAR),
+            OsString::from("captured-trial-key"),
+        ),
         #[cfg(unix)]
         (
             OsString::from("CODEX_HOOK_NON_UNICODE"),
@@ -359,6 +364,10 @@ fn build_command_replays_snapshot_before_hook_overrides_and_scrubbing() {
         (
             CODEX_EXEC_SERVER_NOISE_AUTH_TOKEN_ENV_VAR.to_string(),
             "configured-noise-token".to_string(),
+        ),
+        (
+            MAVIS_E0_TRIAL_API_KEY_ENV_VAR.to_string(),
+            "configured-trial-key".to_string(),
         ),
     ]);
     let command = build_command(
@@ -387,11 +396,122 @@ fn build_command_replays_snapshot_before_hook_overrides_and_scrubbing() {
         configured_environment_value(&command, CODEX_EXEC_SERVER_NOISE_AUTH_TOKEN_ENV_VAR),
         None
     );
+    assert_eq!(
+        configured_environment_value(&command, MAVIS_E0_TRIAL_API_KEY_ENV_VAR),
+        None
+    );
     #[cfg(unix)]
     assert_eq!(
         configured_environment_value(&command, "CODEX_HOOK_NON_UNICODE"),
         Some(Some(non_unicode_value))
     );
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn trial_key_is_absent_from_real_hook_child() {
+    let environment = vec![
+        (
+            OsString::from("CODEX_HOOK_SAFE_ENV"),
+            OsString::from("visible"),
+        ),
+        (
+            OsString::from(MAVIS_E0_TRIAL_API_KEY_ENV_VAR),
+            OsString::from("trial-secret"),
+        ),
+    ];
+    let mut command = build_command(
+        &CommandShell {
+            program: "/bin/sh".to_string(),
+            args: vec!["-c".to_string()],
+        },
+        "printf '%s|%s' \"${MAVIS_E0_TRIAL_API_KEY-unset}\" \"${CODEX_HOOK_SAFE_ENV-unset}\"",
+        &environment,
+        &HashMap::from([(
+            MAVIS_E0_TRIAL_API_KEY_ENV_VAR.to_string(),
+            "override-secret".to_string(),
+        )]),
+    );
+    let output = command.output().await.expect("run real hook child");
+    assert!(output.status.success());
+    assert_eq!(output.stdout, b"unset|visible");
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn generated_mavis_start_and_compact_hooks_keep_working_without_trial_key() {
+    let temp = tempdir().expect("hook canary directory");
+    let mavis = temp.path().join("mavis");
+    std::fs::create_dir(&mavis).expect("fake Mavis package directory");
+    std::fs::write(mavis.join("__init__.py"), "").expect("fake Mavis package");
+    std::fs::write(
+        mavis.join("__main__.py"),
+        "import os, sys\nfrom pathlib import Path\n".to_string()
+            + "Path(os.environ['MAVIS_HOOK_MARKER']).write_text("
+            + "'KEY_ABSENT' if 'MAVIS_E0_TRIAL_API_KEY' not in os.environ else 'KEY_PRESENT')\n"
+            + "print('{}')\n",
+    )
+    .expect("fake Mavis hook command");
+    let environment = Arc::new(
+        std::env::vars_os()
+            .chain([(
+                OsString::from(MAVIS_E0_TRIAL_API_KEY_ENV_VAR),
+                OsString::from("trial-secret"),
+            )])
+            .collect(),
+    );
+    let (result_sender, _result_receiver) = async_channel::unbounded();
+    let runtime = CommandHookRuntime::new(
+        CommandShell {
+            program: "/bin/sh".to_string(),
+            args: vec!["-c".to_string()],
+        },
+        environment,
+        ThreadId::new(),
+        result_sender,
+    );
+    for (event_name, subcommand) in [
+        (HookEventName::SessionStart, "compaction-handoff"),
+        (HookEventName::PreCompact, "pre-compact"),
+    ] {
+        let marker = temp.path().join(subcommand);
+        let command = format!("python3 -m mavis {subcommand}");
+        let env = HashMap::from([
+            ("PYTHONPATH".to_string(), temp.path().display().to_string()),
+            (
+                "MAVIS_HOOK_MARKER".to_string(),
+                marker.display().to_string(),
+            ),
+            (
+                MAVIS_E0_TRIAL_API_KEY_ENV_VAR.to_string(),
+                "override-secret".to_string(),
+            ),
+        ]);
+        let handler = ConfiguredHandler {
+            builtin: false,
+            event_name,
+            matcher: None,
+            timeout_sec: 5,
+            status_message: None,
+            additional_context_limit: Default::default(),
+            source_path: AbsolutePathBuf::try_from(temp.path().join("hooks.json"))
+                .expect("absolute hook configuration path")
+                .into(),
+            source: HookSource::User,
+            display_order: 0,
+            kind: ConfiguredHandlerKind::Command {
+                command: command.clone(),
+                r#async: false,
+                env: env.clone(),
+            },
+        };
+        let result = run_command(&runtime, &handler, &command, &env, "{}", temp.path()).await;
+        assert_eq!(result.exit_code, Some(0), "{subcommand}: {}", result.stderr);
+        assert_eq!(result.stdout, "{}\n");
+        assert_eq!(std::fs::read_to_string(marker).unwrap(), "KEY_ABSENT");
+        assert!(!result.stdout.contains("trial-secret"));
+        assert!(!result.stderr.contains("trial-secret"));
+    }
 }
 
 #[test]
