@@ -425,6 +425,7 @@ class RuntimeTests(unittest.TestCase):
                           side_effect=lambda child, **_: child.wait()) as stop:
                 stop_trial_server(config, state)
                 self.assertNotIn(1234, runtime._TRIAL_PROCESSES)
+                self.assertFalse(config.state_path.exists())
             stop.assert_called_once_with(process, timeout=10.0)
 
     def test_trial_abort_rejects_changed_launch_record_without_signal(self):
@@ -528,6 +529,7 @@ class RuntimeTests(unittest.TestCase):
                     reservation = park_mavis_server(config)
                 try:
                     self.assertIsNotNone(child.returncode)
+                    self.assertFalse(config.state_path.exists())
                     with socket.socket() as probe:
                         self.assertEqual(probe.connect_ex(("127.0.0.1", port)), 0)
                     with self.assertRaises(OSError):

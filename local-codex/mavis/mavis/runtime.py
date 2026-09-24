@@ -778,6 +778,10 @@ def stop_trial_server(config: RuntimeConfig, expected_state: dict[str, Any], *,
         **({"heartbeat": heartbeat} if heartbeat is not None else {}),
     )
     _TRIAL_PROCESSES.pop(pid, None)
+    # A stopped trial must not leave a PID-bearing record for a later process
+    # to mistake for a server it can still control.
+    if config.state_path.is_file() and read_json(config.state_path) == expected_state:
+        config.state_path.unlink()
 
 
 def available_memory_bytes() -> int:
