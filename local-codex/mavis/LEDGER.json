@@ -1,23 +1,11 @@
 {
-  "schema_version": "work-closeout/v1",
-  "task": "Implement the Mavis local coding execution and verified improvement plan.",
   "constraint": {
     "binding": "evidence",
-    "statement": "The system is complete only when its installed local runtime, external harnesses, retained receipts, independent verification, and staged promotion gates agree.",
     "evidence": [
       "Live IRIS/oMLX state and installed harnesses were inspected before implementation."
-    ]
+    ],
+    "statement": "The system is complete only when its installed local runtime, external harnesses, retained receipts, independent verification, and staged promotion gates agree."
   },
-  "status": "partial",
-  "uncertainty": [
-    "Installed candidate eba4c2b81 passed fresh E0 10/10 in run 326665986826461ba7c2a74b8705789e. The local memory MCP bridge completed no-model and 4B calls in the default sandbox; matched net benefit remains unproven.",
-    "Installed candidate 7ad62299b passed all ten E0 cases in run 9682efbf5d8f40ee9abe5f16ecf75ac9. The prior installation is retained at ~/.local/share/local-codex-backups/mavis-before-librarian-launcher-20260924.",
-    "Phase 2 installed librarian and output-reader role canaries passed with pinned Qwen3.5-4B and independent Terra review. The 0.8B candidate failed factual answer and irregular-log quality. A 4B coding arm completed and passed host acceptance while the baseline looped after passing host tests; the single unmatched pair does not establish net benefit, and default-sandbox helper access remains open.",
-    "Phase 3 E1 has source gates and native assignment plumbing. A real paired comparison, independent promotion, and rollback remain open.",
-    "Phase 4 held-out two-package work passed across compaction and restart with independent Terra acceptance. Broader large-project, conflict, flaky-dependency, and tool-discovery coverage remains open.",
-    "The Rust core suite ran 4,591 tests and had 278 failures from environment and cross-package cases; the Mavis-focused Rust tests passed. The broad suite remains an open gate.",
-    "Hosted Jev returned one typed answer under the local capped ledger; external invoice reconciliation and a local Jev candidate remain open."
-  ],
   "rejected_alternatives": [
     "Sharing IRIS port 8000 was rejected by the approved plan.",
     "Flat API substitutions for native tool-using harnesses were rejected.",
@@ -25,21 +13,18 @@
   ],
   "requirements": [
     {
-      "id": "phase-0",
-      "requirement": "Establish the baseline, ownership, adapters, templates, ledger, and real harness canaries.",
-      "status": "pass",
-      "command": "/Users/dustinpainter/.opencode/bin/opencode run --dir <isolated fixture> -m minimax/MiniMax-M3 [file-read canary]; codex exec --model gpt-5.6-terra --sandbox read-only [isolated file-read canary]; zcode --prompt --json [isolated file-read canary]",
       "artifact": "/Users/dustinpainter/.local-codex/mavis-service/evidence/phase0-zcode-json-canary/fcb53383093f4064991f9c0500d34132/receipt.json",
+      "command": "/Users/dustinpainter/.opencode/bin/opencode run --dir <isolated fixture> -m minimax/MiniMax-M3 [file-read canary]; codex exec --model gpt-5.6-terra --sandbox read-only [isolated file-read canary]; zcode --prompt --json [isolated file-read canary]",
       "evidence": [
         "The frozen baseline, ownership, templates, and adapters are recorded. MiniMax M2.5 and M3 used OpenCode's Read tool, native Terra Codex used a shell tool, and GLM ZCode used its Read tool. Each returned its isolated fixture answer. Host receipts exist under phase0-minimax-m3-canary, phase0-terra-canary, and phase0-zcode-json-canary; the ZCode model-IO trace records the exact fixture path."
-      ]
+      ],
+      "id": "phase-0",
+      "requirement": "Establish the baseline, ownership, adapters, templates, ledger, and real harness canaries.",
+      "status": "pass"
     },
     {
-      "id": "phase-1",
-      "requirement": "Deliver a useful isolated Mavis with objectives, evidence, compaction, delegation, Jev, parsing, search, and interruption recovery; pass E0 plus two independently verified real tasks.",
-      "status": "pass",
-      "command": "PYTHONDONTWRITEBYTECODE=1 PYTHONPATH=~/.local/share/local-codex python3 local-codex/mavis/scripts/run_final_e0_with_handoff.py; observe_small_repository.py; observe_buried_failure.py; observe_compaction_restart.py; observe_isolation_recovery.py",
       "artifact": "/Users/dustinpainter/.local-codex/mavis-service/evaluations/e0/final-installed-shared.json",
+      "command": "PYTHONDONTWRITEBYTECODE=1 PYTHONPATH=~/.local/share/local-codex python3 local-codex/mavis/scripts/run_final_e0_with_handoff.py; observe_small_repository.py; observe_buried_failure.py; observe_compaction_restart.py; observe_isolation_recovery.py",
       "evidence": [
         "Installed candidate 003c908e1 passed all ten E0 cases in run fcd45a6933fc4608a9d0caaebd7f8089. The observer recorded the same before/after candidate fingerprint, IRIS loaded, Mavis unloaded, and the GPU lease released.",
         "The candidate-matched small repository task at /Users/dustinpainter/.local-codex/mavis-service/evaluations/e0/tasks/25c962288169439a8d9449d0b6ff7ed4 repaired its failing test, preserved the dirty note, and received a completed accepting native Terra review.",
@@ -50,14 +35,14 @@
         "Final source suite after the shell-librarian dispatch regression passed 312 tests with two skips; see Mavis/evidence/phase2-librarian-launcher-final-source-tests-7ad62299b.log.",
         "After the installed MCP bridge changed the candidate, six candidate-bound E0 observer arms were refreshed. Final installed run 326665986826461ba7c2a74b8705789e passed 10/10 with before/after fingerprint equality, IRIS loaded, Mavis parked, and GPU lease released. See ~/.local-codex/mavis-service/evaluations/e0/final-installed-shared.json.",
         "The full Mavis source suite after the MCP bridge passed 314 tests with two skips; retained at Mavis/evidence/phase2-mcp-installed/final-source-suite.log."
-      ]
+      ],
+      "id": "phase-1",
+      "requirement": "Deliver a useful isolated Mavis with objectives, evidence, compaction, delegation, Jev, parsing, search, and interruption recovery; pass E0 plus two independently verified real tasks.",
+      "status": "pass"
     },
     {
-      "id": "phase-2",
-      "requirement": "Deliver project memory, retrieval, librarian, and output reader with stale/deleted-code and isolation proof.",
-      "status": "reject",
-      "command": "PYTHONDONTWRITEBYTECODE=1 PYTHONPATH=~/.local/share/local-codex python3 Mavis/evidence/phase2-librarian-installed-canary.py; installed mavis librarian ask and output inspect; native Terra Codex read-only reviews; python3 Mavis/evidence/phase2-mcp-installed/verify-installed-canary.py; installed Mavis E0 run_final_e0_with_handoff.py",
       "artifact": "local-codex/mavis/reports/phase2-installed-mcp-bridge-2026-09-24.md",
+      "command": "PYTHONDONTWRITEBYTECODE=1 PYTHONPATH=~/.local/share/local-codex python3 Mavis/evidence/phase2-librarian-installed-canary.py; installed mavis librarian ask and output inspect; native Terra Codex read-only reviews; python3 Mavis/evidence/phase2-mcp-installed/verify-installed-canary.py; installed Mavis E0 run_final_e0_with_handoff.py",
       "evidence": [
         "Project retrieval handles stale/deleted/renamed paths and hash-verified global records. Librarian/output-reader evidence boundaries, zero-failure parsing, and bounded archive paging are implemented; the current Mavis source suite passed 289 tests.",
         "A fixed 16-question direct-MLX comparison measured Qwen3 Embedding 0.6B at 12/16 expected files in the top five and the installed 8B model at 13/16. Real-model branch, changed-file, rename, and deletion freshness checks passed; see phase2-embedding-comparison.md.",
@@ -68,63 +53,79 @@
         "The shell launcher initially omitted the librarian service route. Source dispatch and a real project-archive launcher regression were repaired, reviewed by native Terra, committed as 7ad62299b, installed, and canaried through ~/.local/bin/mavis. The live 4B receipt binds shell SHA-256 7d0ec70042ba81938b11a7a4295808c73e09c459705cfb8a56c097a17d7ed733 to the install manifest before/after. Completed-task benefit remains open.",
         "A paired installed coding canary used identical initial Git revisions and dirty-note hashes. The direct-search baseline passed host 5/5 but repeated false claims that tool output was hidden and was stopped after 253.763 seconds without turn completion. The corrected 4B librarian arm made a real cited model call, completed natively in 89.193 seconds, and passed host 5/5. The first helper invocation failed in the default sandbox on loopback access; the successful arm used an explicit network override. Native Terra accepted only a capability signal and rejected promotion; see phase2-completed-work-canary-2026-09-24.md and Mavis/evidence/phase2-benefit. Default-sandbox integration and matched repeated net-benefit proof remain open.",
         "The installed candidate eba4c2b81 registered a project-bound local MCP librarian. A real agent in workspace-write, without a network override, completed exact-archive and pinned 4B calls with source-verified citations; the host verifier passed at Mavis/evidence/phase2-mcp-installed/verification.json. Both tests ran while IRIS stayed loaded; Mavis/helper unloaded and the GPU lease released. The prior approval-blocked call and its repair are retained. This clears the default-sandbox route only; matched completed-work benefit and automatic helper loading remain open.",
-        "Native read-only Terra follow-up accepted the final installed bridge and current E0 candidate after checking saved MCP config hash, runtime network_access=false receipt, unchanged tracked user files, real two-call transcript, model binding, citations, and cleanup; see Mavis/evidence/phase2-mcp-installed/terra-installed-followup.txt. Its acceptance excludes net benefit and whole-plan completion."
-      ]
+        "Native read-only Terra follow-up accepted the final installed bridge and current E0 candidate after checking saved MCP config hash, runtime network_access=false receipt, unchanged tracked user files, real two-call transcript, model binding, citations, and cleanup; see Mavis/evidence/phase2-mcp-installed/terra-installed-followup.txt. Its acceptance excludes net benefit and whole-plan completion.",
+        "Three installed baseline/helper pairs used matching checkout revisions and host checks. Helper passed all three host gates; baseline passed two and failed one despite native exit zero. Model-arm cycles favored helper by 24.3 and 4.9 seconds in the two both-passing pairs. Native Terra accepted the corrected bound packet after an initial partial review caused by a record update during review. The active helper was not promoted; distinct held-out tasks, exact accepted-completion timing, and cloud-use reconciliation remain open. See Mavis/evidence/phase2-matched-mcp/review-closeout.json and reports/phase2-matched-mcp-trial-2026-09-24.md."
+      ],
+      "id": "phase-2",
+      "requirement": "Deliver project memory, retrieval, librarian, and output reader with stale/deleted-code and isolation proof.",
+      "status": "reject"
     },
     {
-      "id": "phase-3",
-      "requirement": "Deliver resumable continuous improvement and prove one reviewed promotion and rollback.",
-      "status": "reject",
-      "command": "PYTHONDONTWRITEBYTECODE=1 PYTHONPATH=local-codex/mavis python3 -m unittest discover -s local-codex/mavis/tests -q",
       "artifact": "local-codex/mavis/reports/phase3-e1-runner.md",
+      "command": "PYTHONDONTWRITEBYTECODE=1 PYTHONPATH=local-codex/mavis python3 -m unittest discover -s local-codex/mavis/tests -q",
       "evidence": [
         "E1 source runner freezes revisions and checks, retains host receipts, dispatches native gateway assignments, and rejects dirty candidate checkouts. Current package suite passed 289 tests and host suite passed 125. Gateway Terra verification now requires evidence-specific findings and exposes the accepted verifier report path and hash; source contract tests passed, but no current installed E1 trial has run.",
         "Installed accepted main-profile selection has source tests and independent review, but no real accepted profile is active. Native candidate activation receipt, paired failure comparison, independent promotion review, and rollback remain open; compare-native intentionally fails closed until activation is proven."
-      ]
+      ],
+      "id": "phase-3",
+      "requirement": "Deliver resumable continuous improvement and prove one reviewed promotion and rollback.",
+      "status": "reject"
     },
     {
-      "id": "phase-4",
-      "requirement": "Pass a held-out multi-package task across compaction and restart.",
-      "status": "reject",
-      "command": "PYTHONDONTWRITEBYTECODE=1 PYTHONPATH=~/.local/share/local-codex python3 local-codex/mavis/scripts/observe_heldout_e2.py",
       "artifact": "/Users/dustinpainter/.local-codex/mavis-service/evaluations/e2/tasks/f0a3a0f52eda4c58aa82a2f60276a0ab/verification.json",
+      "command": "PYTHONDONTWRITEBYTECODE=1 PYTHONPATH=~/.local/share/local-codex python3 local-codex/mavis/scripts/observe_heldout_e2.py",
       "evidence": [
         "An initial installed six-test run was rejected by Terra because fractional tax escaped the blueprint. The fixture added that case, the source package passed 300 tests, and installed candidate 003c908e1 passed fresh E0.",
         "The fresh seven-test held-out task passed catalog then checkout across compaction and process restart. Host checks passed 3/3 and 7/7; Terra independently accepted; the protected blueprint, tests, dirty note, and untracked draft retained their hashes. IRIS stayed loaded and the GPU lease was released.",
         "Broader large-repository, ambiguous-failure, flaky-dependency, concurrent-worktree, decomposition, and tool-discovery shards remain open."
-      ]
+      ],
+      "id": "phase-4",
+      "requirement": "Pass a held-out multi-package task across compaction and restart.",
+      "status": "reject"
     },
     {
-      "id": "phase-5",
-      "requirement": "Evaluate and stage a local Jev-style candidate without violating license or training boundaries.",
-      "status": "reject",
-      "command": "python3 -m mavis eval phase5",
       "artifact": "~/.local-codex/mavis-service/evaluations/phase5",
+      "command": "python3 -m mavis eval phase5",
       "evidence": [
         "Conditional evaluation pending Phase 4."
-      ]
+      ],
+      "id": "phase-5",
+      "requirement": "Evaluate and stage a local Jev-style candidate without violating license or training boundaries.",
+      "status": "reject"
     },
     {
-      "id": "phase-6",
-      "requirement": "Train and approve a targeted adapter only if prior evidence establishes the need and compatibility.",
-      "status": "reject",
-      "command": "python3 -m mavis eval phase6",
       "artifact": "~/.local-codex/mavis-service/evaluations/phase6",
+      "command": "python3 -m mavis eval phase6",
       "evidence": [
         "Conditional work is not yet authorized by its evidence gate; trained adapters still require user approval."
-      ]
+      ],
+      "id": "phase-6",
+      "requirement": "Train and approve a targeted adapter only if prior evidence establishes the need and compatibility.",
+      "status": "reject"
     },
     {
-      "id": "workspace-consolidation",
-      "requirement": "Consolidate Mavis work folders, retain unique evidence and active work, and remove obsolete checkouts.",
-      "status": "pass",
-      "command": "git worktree list --porcelain; git status --porcelain; git worktree remove/move for verified paths; cmp and shasum -a 256 for retained artifacts; installed Mavis harness_job_status canary",
       "artifact": "/Users/dustinpainter/Dev-Projects/Mavis/evidence/checkout-consolidation.json",
+      "command": "git worktree list --porcelain; git status --porcelain; git worktree remove/move for verified paths; cmp and shasum -a 256 for retained artifacts; installed Mavis harness_job_status canary",
       "evidence": [
         "Forty-two obsolete worktrees were removed. Their branches and Git commits remain reachable; the exact paths and heads are recorded in /Users/dustinpainter/Dev-Projects/Mavis/evidence/checkout-consolidation.json.",
         "The original 49 GB local-codex checkout was removed after its sole report-formatting diff was saved with SHA-256 under Mavis/evidence. One top-level Mavis folder remains under Dev-Projects, with two active source checkouts and retained unique evidence.",
         "The installed Mavis package, runtime receipts, and IRIS services remain at their live paths. The installed gateway status canary succeeded after the source checkout moved."
-      ]
+      ],
+      "id": "workspace-consolidation",
+      "requirement": "Consolidate Mavis work folders, retain unique evidence and active work, and remove obsolete checkouts.",
+      "status": "pass"
     }
+  ],
+  "schema_version": "work-closeout/v1",
+  "status": "partial",
+  "task": "Implement the Mavis local coding execution and verified improvement plan.",
+  "uncertainty": [
+    "Installed candidate eba4c2b81 passed fresh E0 10/10 in run 326665986826461ba7c2a74b8705789e. The local memory MCP bridge completed no-model and 4B calls in the default sandbox. Six matched coding arms on one repeated task passed independent packet review; general net benefit remains unproven.",
+    "Installed candidate 7ad62299b passed all ten E0 cases in run 9682efbf5d8f40ee9abe5f16ecf75ac9. The prior installation is retained at ~/.local/share/local-codex-backups/mavis-before-librarian-launcher-20260924.",
+    "Phase 2 installed librarian and output-reader role canaries passed with pinned Qwen3.5-4B and independent Terra review. The 0.8B candidate failed factual answer and irregular-log quality. A 4B coding arm completed and passed host acceptance while the baseline looped after passing host tests; the single unmatched pair does not establish net benefit, and default-sandbox helper access remains open.",
+    "Phase 3 E1 has source gates and native assignment plumbing. A real paired comparison, independent promotion, and rollback remain open.",
+    "Phase 4 held-out two-package work passed across compaction and restart with independent Terra acceptance. Broader large-project, conflict, flaky-dependency, and tool-discovery coverage remains open.",
+    "The Rust core suite ran 4,591 tests and had 278 failures from environment and cross-package cases; the Mavis-focused Rust tests passed. The broad suite remains an open gate.",
+    "Hosted Jev returned one typed answer under the local capped ledger; external invoice reconciliation and a local Jev candidate remain open."
   ]
 }
