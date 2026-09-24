@@ -621,6 +621,8 @@ def run_trial(experiment_id: str, arm: str, case_id: str, task: str) -> Path:
             argv = [
                 str(core_binary),
                 "exec",
+                "--sandbox",
+                "workspace-write",
                 "-C",
                 str(binding["checkout"].resolve()),
                 "--",

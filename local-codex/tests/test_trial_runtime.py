@@ -497,6 +497,13 @@ class TrialRuntimeTests(unittest.TestCase):
         self.assertEqual(events[-1], ("cleanup",))
         self.assertIn(("monitor-start",), events)
         self.assertIn(("monitor-end",), events)
+        self.assertEqual(
+            launch.call_args.args[1],
+            [
+                str(self.core), "exec", "--sandbox", "workspace-write", "-C",
+                str(self._binding("candidate")["checkout"].resolve()), "--", "task",
+            ],
+        )
         self.assertTrue(launch.call_args.kwargs["lease_held"])
         self.assertTrue(callable(launch.call_args.kwargs["heartbeat"]))
 
