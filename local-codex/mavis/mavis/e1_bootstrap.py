@@ -457,8 +457,11 @@ def _gateway_arguments(
             "with shasum -a 256; do not hash parsed or re-serialized JSON), "
             f"gateway_worker_job_id ({job_id}), and verifier_job_id ({job_id}-terra). "
             "This names the planned separate verifier; it does not claim that verifier ran. "
-            "Use the frozen packet's exact hashes. Return one complete raw JSON "
-            "object without a preamble, code fences, or trailing text."
+            "Use the frozen packet's exact hashes. Build the final JSON in a "
+            "file, parse that exact file with json.loads, then output its exact "
+            "bytes; do not retype or shorten the validated JSON. Return one "
+            "complete raw JSON object without a preamble, code fences, or "
+            "trailing text."
         ),
         "lane": "minimax",
         "model": owner["model"],
@@ -573,7 +576,7 @@ def _dispatch(
 
 
 
-def check_bootstrap_review(home: Path, report_path: Path) -> dict[str, str]:
+def check_bootstrap_review(home: Path, report_path: Path) -> dict[str, Any]:
     """Deterministic pre-completion check; does not depend on gateway acceptance."""
     home = Path(home).resolve()
     assignment_path, assignment, _ = _assignment(home)
@@ -597,11 +600,66 @@ def check_bootstrap_review(home: Path, report_path: Path) -> dict[str, str]:
     ):
         raise ValueError("E1 bootstrap review differs from frozen evidence")
     _check_review_inspection(home, assignment, review)
+    checkout = home / "e1/bootstrap/review-checkout"
+    source_path = checkout / "local-codex/mavis/mavis/e1_bootstrap.py"
+    model_dir = Path(assignment["model_artifacts"]["model_path"])
+    cited_file = review["inspection"]["model"]["cited_file"]
+    model_config = model_dir / "config.json"
+    config = read_json(model_config)
+    source_revision = _git_revision(checkout)
+    source_tree = package_tree_sha256(checkout / "local-codex/mavis/mavis")
+    source_sha = sha256_file(source_path)
+    config_sha = sha256_file(model_config)
+    shard_sha = sha256_file(model_dir / cited_file)
+    e0_observations = []
+    for case in E0_CASES:
+        receipt_path = home / "evaluations/e0" / f"{case}.json"
+        receipt = read_json(receipt_path)
+        e0_observations.append({
+            "case": case,
+            "command": f"sha256_file({receipt_path}); read_json({receipt_path})",
+            "receipt_sha256": sha256_file(receipt_path),
+            "observed_status": receipt["status"],
+        })
+    observations = {
+        "source": {
+            "command": f"git -C {checkout} rev-parse HEAD; package_tree_sha256({checkout / 'local-codex/mavis/mavis'}); sha256_file({source_path})",
+            "revision": source_revision,
+            "package_tree_sha256": source_tree,
+            "checked_sha256": source_sha,
+        },
+        "e0_cases": e0_observations,
+        "model": {
+            "command": f"sha256_file({model_dir / cited_file}); sha256_file({model_config}); read_json({model_config})",
+            "cited_file": cited_file,
+            "cited_sha256": shard_sha,
+            "config_sha256": config_sha,
+            "observed_architecture": config["architectures"][0],
+            "observed_quantization_sha256": _digest(
+                config.get("quantization") or config.get("quantization_config")
+            ),
+        },
+    }
+    if (observations["source"]["revision"] != review["inspection"]["source"]["revision"]
+            or observations["source"]["package_tree_sha256"] != review["inspection"]["source"]["package_tree_sha256"]
+            or observations["source"]["checked_sha256"] != review["inspection"]["source"]["checked_sha256"]
+            or any(
+                item["receipt_sha256"] != inspected["receipt_sha256"]
+                or item["observed_status"] != inspected["observed_status"]
+                for item, inspected in zip(e0_observations, review["inspection"]["e0_cases"], strict=True)
+            )
+            or any(
+                observations["model"][key] != review["inspection"]["model"][key]
+                for key in ("cited_file", "cited_sha256", "config_sha256",
+                            "observed_architecture", "observed_quantization_sha256")
+            )):
+        raise ValueError("E1 bootstrap host observations changed during review")
     return {
         "schema_version": "mavis.e1-bootstrap-review-check/v1",
         "status": "pass",
         "assignment_sha256": sha256_file(assignment_path),
         "report_sha256": sha256_file(report_path),
+        "host_observations": observations,
     }
 
 

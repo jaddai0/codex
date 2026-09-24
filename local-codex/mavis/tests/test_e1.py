@@ -808,7 +808,13 @@ class E1RunnerTests(unittest.TestCase):
             gateway_dir, gateway_report, gateway_assignment, "c" * 64,
             assignment["required_checks"],
         )
-        e1_bootstrap.check_bootstrap_review(self.home, gateway_report)
+        host_check = e1_bootstrap.check_bootstrap_review(self.home, gateway_report)
+        observations = host_check["host_observations"]
+        self.assertEqual(observations["source"]["revision"], assignment["starting_revision"])
+        self.assertIn("git -C", observations["source"]["command"])
+        self.assertEqual(len(observations["e0_cases"]), len(E0_CASES))
+        self.assertEqual(observations["model"]["cited_sha256"],
+                         assignment["model_artifacts"]["files"]["model-00001.safetensors"])
         e1_bootstrap.import_bootstrap_review_report(self.home, status_reader=status)
         bootstrap = e1_bootstrap.create_bootstrap(self.home, review)
         for arm in ("baseline", "candidate"):
