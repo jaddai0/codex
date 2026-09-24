@@ -98,8 +98,9 @@ experiment record; they do not mark Phase 2 complete.
 
 ## Next acceptance
 
-Provide a supported local-helper route in Mavis's default coding sandbox,
-canary it through the installed launcher, and run several matched completed
-tasks with the same sandbox settings, full task-boundary timing, host checks,
-independent review, and cloud usage receipts before enabling the 4B helper by
-default. The false tool-output loop is retained as a Phase 3 failure case.
+The installed local-helper route now works in Mavis's default coding sandbox;
+see `phase2-installed-mcp-bridge-2026-09-24.md` for the candidate-bound
+two-call canary and fresh E0 gate. Run several matched completed tasks with the
+same sandbox settings, full task-boundary timing, host checks, independent
+review, and cloud usage receipts before enabling the 4B helper by default.
+The false tool-output loop is retained as a Phase 3 failure case.
