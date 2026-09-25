@@ -14,6 +14,7 @@ from uuid import uuid4
 
 from .evidence import parse_test_output
 from .gateway import GatewayUnavailable, harness_job_status
+from .jev import CONTEXT_VERSION, normalize_context
 from .profile_transition import pending as profile_transition_pending
 from .storage import profile_boundary_lock, read_json, require_safe_id, sha256_file, write_json
 
@@ -280,6 +281,7 @@ class ObjectiveStore:
                 reason = self._advice_ineligibility(record, prior_state)
                 if reason is None:
                     assignment = record["assignments"][-1]
+                    context = self._advice_context(record)
                     intent = {
                         "event_id": uuid4().hex,
                         "attempt_id": attempt_id,
@@ -287,6 +289,8 @@ class ObjectiveStore:
                         "assignment_id": assignment["assignment_id"],
                         "starting_revision": assignment["starting_revision"],
                         "host_receipts_sha256": _sha256_json(record["evidence_receipts"]),
+                        "context_version": CONTEXT_VERSION,
+                        "context_sha256": _jev_digest(context),
                         "status": "pending",
                         "created_at": _now(),
                     }
@@ -333,6 +337,27 @@ class ObjectiveStore:
             return "no_failed_host_check"
         return None
 
+    def _advice_context(self, record: dict[str, Any]) -> dict[str, Any]:
+        """Describe the latest current failure from validated host evidence only."""
+        receipts = self._validated_receipts(record)
+        assignment = record["assignments"][-1]
+        checkout = Path(str(assignment["checkout"]["path"])).resolve()
+        assigned_at = datetime.fromisoformat(assignment["assigned_at"])
+        required = {str(check["id"]) for check in record["acceptance_checks"]}
+        failures = [receipt for receipt in receipts
+                    if receipt["verdict"] == "fail"
+                    and Path(str(receipt["cwd"])).resolve() == checkout
+                    and bool(set(receipt["acceptance_check_ids"]) & required)
+                    and datetime.fromisoformat(receipt["started_at"]) >= assigned_at]
+        if not failures:
+            raise ValueError("Jev context requires current validated host failure")
+        latest = max(failures, key=lambda item: item["started_at"])
+        facts = ["check_failed"]
+        if latest["changed_revision"] != assignment["starting_revision"]:
+            facts.append("source_changed")
+        return normalize_context({"version": CONTEXT_VERSION,
+                                  "facts": facts})
+
     def _record_escalation_advice(self, record: dict[str, Any],
                                   intent: dict[str, Any]) -> dict[str, Any]:
         """Finish one durable intent after releasing the objective lock."""
@@ -345,9 +370,13 @@ class ObjectiveStore:
         }
         outcome: dict[str, Any] = {"status": "blocked", "reason": "unknown"}
         try:
+            context = self._advice_context(record)
+            if (intent.get("context_version") != CONTEXT_VERSION
+                    or intent.get("context_sha256") != _jev_digest(context)):
+                raise ValueError("Jev context changed after intent retention")
             advice = self.advice_hook(self.shared_home, self.home.parent,
                                       "escalation", signals, 0.01,
-                                      event_id=intent["event_id"])
+                                      event_id=intent["event_id"], context=context)
             if (not isinstance(advice, dict)
                     or advice.get("advisory") is not True
                     or advice.get("binding") is not False
@@ -364,6 +393,8 @@ class ObjectiveStore:
                     or receipt.get("event_id") != intent["event_id"]
                     or receipt.get("purpose") != "escalation"
                     or receipt.get("signals_sha256") != _jev_digest(signals)
+                    or receipt.get("context_version") != intent["context_version"]
+                    or receipt.get("context_sha256") != intent["context_sha256"]
                     or receipt.get("project_root_sha256") != _jev_digest(str(self.home.parent.resolve()))
                     or receipt.get("estimated_cost_usd") != 0.01
                     or receipt.get("advisory") is not True
@@ -407,6 +438,8 @@ class ObjectiveStore:
             "assignment_id": intent["assignment_id"],
             "starting_revision": intent["starting_revision"],
             "host_receipts_sha256": intent["host_receipts_sha256"],
+            "context_version": intent["context_version"],
+            "context_sha256": intent["context_sha256"],
             "signals_sha256": _jev_digest(signals),
             "deterministic_disposition": "escalated",
             "outcome": outcome,
@@ -420,6 +453,9 @@ class ObjectiveStore:
                             if item.get("event_id") == intent["event_id"]), None)
             if pending is None or pending.get("status") != "pending":
                 raise ValueError("Jev advice intent changed before retention")
+            if (pending.get("context_version") != intent["context_version"]
+                    or pending.get("context_sha256") != intent["context_sha256"]):
+                raise ValueError("Jev advice intent context changed before retention")
             current = (
                 len(latest["attempts"]) == attempt_number
                 and latest["attempts"][-1].get("attempt_id") == intent["attempt_id"]

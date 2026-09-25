@@ -110,8 +110,13 @@ class JevWorkflowTests(unittest.TestCase):
         })
         gateway.assert_called_once_with("escalation", {
             "retry_count": 2, "unresolved_count": 0, "verifier_accepted": False,
-        }, 0.01)
+        }, 0.01, context={"version": "mavis-jev-context/v1",
+                          "facts": ["check_failed"]})
         event = self.linked_event(record)
+        intent = record["jev_advice_events"][0]
+        receipt = json.loads(Path(event["outcome"]["advice_receipt"]).read_text())
+        self.assertEqual(event["context_sha256"], intent["context_sha256"])
+        self.assertEqual(receipt["context_sha256"], intent["context_sha256"])
         self.assertEqual(event["outcome"]["status"], "answered")
         self.assertTrue(Path(event["outcome"]["advice_receipt"]).is_file())
         with self.assertRaisesRegex(ValueError, "invalid objective transition"):
@@ -125,6 +130,27 @@ class JevWorkflowTests(unittest.TestCase):
             record = self.repeat_failure()
         self.assertEqual(record["state"], "escalated")
         self.assertEqual(self.linked_event(record)["outcome"]["status"], "refused")
+
+    def test_changed_revision_adds_only_observed_source_fact(self):
+        (self.fixture / "src").mkdir()
+        (self.fixture / "src" / "result.txt").write_text("changed")
+        subprocess.run(["git", "add", "src/result.txt"], cwd=self.fixture, check=True)
+        subprocess.run(["git", "-c", "user.name=Mavis Test",
+                        "-c", "user.email=mavis@example.invalid", "commit", "-qm", "change"],
+                       cwd=self.fixture, check=True)
+        receipt = run_command(self.home, "jev-workflow",
+                              ["python3", "-c", "print('FAILED'); raise SystemExit(1)"],
+                              self.fixture, acceptance_check_ids=["c1"])
+        self.store.add_receipt("jev-workflow", receipt)
+        refusal = {"success": False, "decision": "cap_blocked", "advisory": True,
+                   "binding": False, "grants_permission": False}
+        with patch("mavis.jev.mavis_jev_decisions", return_value=refusal) as gateway:
+            record = self.repeat_failure()
+        self.assertEqual(record["state"], "escalated")
+        self.assertEqual(gateway.call_args.kwargs["context"], {
+            "version": "mavis-jev-context/v1",
+            "facts": ["check_failed", "source_changed"],
+        })
 
     def test_transport_failure_does_not_change_host_rule(self):
         with patch("mavis.jev.mavis_jev_decisions",
@@ -222,6 +248,39 @@ class JevWorkflowTests(unittest.TestCase):
             return advise(*args, **{**kwargs, "event_id": "other-event"})
 
         store = ObjectiveStore(self.home, advice_hook=wrong_event)
+        with patch("mavis.jev.mavis_jev_decisions", return_value=answer):
+            store.record_attempt("jev-workflow", "same", ["first.log"], "first repair")
+            record = store.record_attempt("jev-workflow", "same", [], "second repair")
+        self.assertEqual(record["state"], "escalated")
+        self.assertEqual(self.linked_event(record)["outcome"],
+                         {"status": "blocked", "reason": "ValueError"})
+
+    def test_missing_context_digest_in_advice_receipt_is_blocked(self):
+        answer = {"success": True, "decision": "answered", "advisory": True,
+                  "binding": False, "grants_permission": False,
+                  "answers": {"decision": {"type": "noul", "noul": 0.9}}}
+
+        def missing_context(*args, **kwargs):
+            return advise(*args, **{**kwargs, "context": None})
+
+        store = ObjectiveStore(self.home, advice_hook=missing_context)
+        with patch("mavis.jev.mavis_jev_decisions", return_value=answer):
+            store.record_attempt("jev-workflow", "same", ["first.log"], "first repair")
+            record = store.record_attempt("jev-workflow", "same", [], "second repair")
+        self.assertEqual(record["state"], "escalated")
+        self.assertEqual(self.linked_event(record)["outcome"],
+                         {"status": "blocked", "reason": "ValueError"})
+
+    def test_changed_context_digest_in_advice_receipt_is_blocked(self):
+        answer = {"success": True, "decision": "answered", "advisory": True,
+                  "binding": False, "grants_permission": False,
+                  "answers": {"decision": {"type": "noul", "noul": 0.9}}}
+
+        def changed_context(*args, **kwargs):
+            return advise(*args, **{**kwargs, "context": {
+                "version": "mavis-jev-context/v1", "facts": ["check_passed"]}})
+
+        store = ObjectiveStore(self.home, advice_hook=changed_context)
         with patch("mavis.jev.mavis_jev_decisions", return_value=answer):
             store.record_attempt("jev-workflow", "same", ["first.log"], "first repair")
             record = store.record_attempt("jev-workflow", "same", [], "second repair")

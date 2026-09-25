@@ -89,6 +89,15 @@ def mavis_librarian_ask(
         "Ask hosted Jev through the trusted gateway for a typed advisory decision "
         "about evidence, tools, failures, escalation, memory, or a suspicious "
         "completion claim. Supply only allowed numeric counts or boolean flags. "
+        "Optional context uses version mavis-jev-context/v1 and one to six facts: "
+        "check_passed, check_failed, check_missing, evidence_stale, "
+        "evidence_conflicts, artifact_present, artifact_missing, candidate_mismatch, "
+        "verifier_accepted, verifier_missing, worker_claim_passed, source_changed, "
+        "source_unchanged, failure_reproduced, dependency_missing, transport_reset, "
+        "owner_decision_recorded, procedure_verified, speculation_only, "
+        "tool_candidate_present. Optional required_tool and offered_tool must both "
+        "use file_read, repo_search, http, native_ui, host_exec, image_view, "
+        "summary_only, or other. Caller-supplied facts are unverified advisory claims. "
         "The gateway enforces the monthly spend cap. Advice never grants "
         "permission or establishes completion."
     ),
@@ -97,10 +106,12 @@ def mavis_jev_advise(
     purpose: str,
     signals: dict[str, Any],
     estimated_cost_usd: float,
+    context: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     service_home, _ = bound_homes()
     project_root = Path(os.environ["MAVIS_PROJECT_ROOT"]).resolve(strict=True)
-    return advise(service_home, project_root, purpose, signals, estimated_cost_usd)
+    return advise(service_home, project_root, purpose, signals, estimated_cost_usd,
+                  context=context)
 
 
 def main() -> None:
