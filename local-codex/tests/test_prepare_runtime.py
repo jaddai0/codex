@@ -620,7 +620,7 @@ class PrepareRuntimeTests(unittest.TestCase):
                         mavis_home=service, project_root=project,
                     )
 
-    def test_profile_passes_gateway_environment_file_path_only(self):
+    def test_profile_passes_gateway_environment_file_path_and_capped_jev_opt_in(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             script = root / "gateway" / "bin" / "mcp-server.sh"
@@ -642,6 +642,10 @@ class PrepareRuntimeTests(unittest.TestCase):
             self.assertEqual(
                 parsed["mcp_servers"]["model-gateway"]["env"]["MODEL_GATEWAY_ENV_FILE"],
                 str(env_file.resolve()),
+            )
+            self.assertEqual(
+                parsed["mcp_servers"]["model-gateway"]["env"]["MODEL_GATEWAY_JEV_USE_OPENROUTER_KEY"],
+                "1",
             )
             self.assertNotIn("fixture-secret", profile)
 
