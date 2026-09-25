@@ -12,6 +12,7 @@ import uuid
 
 from .evaluations import installed_candidate_fingerprint
 from .e1_bootstrap import _summary as current_e0_summary
+from .gateway import VERIFIER_MODEL, glm_review_launcher
 from .runtime import RuntimeConfig
 from .storage import sha256_file, write_json
 
@@ -321,7 +322,7 @@ def matching_first_rollout(session_root: Path, repo: Path, prompt: str, started:
     return candidates[0]
 
 
-def terra_review_prompt(manifest_path: Path, rollout: Path) -> str:
+def independent_review_prompt(manifest_path: Path, rollout: Path) -> str:
     return (
         "Read-only independent review of the held-out installed Mavis work. "
         f"Read {manifest_path}, BLUEPRINT.md, the baseline log, and git diff. "
@@ -333,21 +334,22 @@ def terra_review_prompt(manifest_path: Path, rollout: Path) -> str:
     )
 
 
-def terra_review_command(repo: Path, message_path: Path, prompt: str) -> list[str]:
-    return ["codex", "exec", "--model", "gpt-5.6-terra", "--sandbox", "read-only",
+def independent_review_command(repo: Path, message_path: Path, prompt: str) -> list[str]:
+    """GLM 5.3 in the Codex CLI harness, read-only, via the gateway's launcher."""
+    return [str(glm_review_launcher()), "exec", "--model", VERIFIER_MODEL, "--sandbox", "read-only",
             "-C", str(repo), "--json", "--output-last-message", str(message_path), prompt]
 
 
-def codex_terra_review_completed(log: str, verdict: str) -> str:
+def codex_review_completed(log: str, verdict: str) -> str:
     """Require one completed native Codex turn and its exact saved final text."""
     if not log.endswith("\n"):
-        raise ValueError("Terra JSONL ended with an incomplete event")
+        raise ValueError("review JSONL ended with an incomplete event")
     try:
         events = [json.loads(line) for line in log.splitlines() if line.strip()]
     except json.JSONDecodeError as exc:
-        raise ValueError("Terra JSONL has a malformed event") from exc
+        raise ValueError("review JSONL has a malformed event") from exc
     if not events or any(not isinstance(event, dict) for event in events):
-        raise ValueError("Terra JSONL has no valid events")
+        raise ValueError("review JSONL has no valid events")
     threads = [event.get("thread_id") for event in events if event.get("type") == "thread.started"]
     starts = [index for index, event in enumerate(events) if event.get("type") == "turn.started"]
     completes = [index for index, event in enumerate(events) if event.get("type") == "turn.completed"]
@@ -362,7 +364,7 @@ def codex_terra_review_completed(log: str, verdict: str) -> str:
             or messages[-1][1] != verdict
             or not isinstance(verdict, str)
             or not re.match(r"^ACCEPT(?:$|[\s:.-])", verdict.lstrip())):
-        raise ValueError("Terra review did not finish with an accepting native Codex message")
+        raise ValueError("GLM review did not finish with an accepting native Codex message")
     return threads[0]
 
 
@@ -437,17 +439,17 @@ def verify_heldout(manifest_path: Path) -> dict[str, object]:
                        for index, row in enumerate(first))
             or resume_complete <= 0):
         raise ValueError("E2 compaction or matching resumed task completion is unproved")
-    review_log = task / "terra-review.jsonl"
-    review_stderr = task / "terra-review.stderr.log"
-    review_text = task / "terra-review.txt"
-    review_command = terra_review_command(Path(final_state["repo"]), review_text,
-                                           terra_review_prompt(manifest_path, rollout))
+    review_log = task / "glm-review.jsonl"
+    review_stderr = task / "glm-review.stderr.log"
+    review_text = task / "glm-review.txt"
+    review_command = independent_review_command(Path(final_state["repo"]), review_text,
+                                                 independent_review_prompt(manifest_path, rollout))
     if (result.get("review_exit") != 0
             or result.get("review_argv") != review_command
             or result.get("review_log_sha256") != sha256_file(review_log)
             or result.get("review_stderr_sha256") != sha256_file(review_stderr)
             or result.get("review_text_sha256") != sha256_file(review_text)
-            or result.get("review_thread_id") != codex_terra_review_completed(
+            or result.get("review_thread_id") != codex_review_completed(
                 review_log.read_text(), review_text.read_text())):
         raise ValueError("E2 independent native review did not accept")
     return {"schema_version": "mavis.e2-verification/v1", "status": "pass",

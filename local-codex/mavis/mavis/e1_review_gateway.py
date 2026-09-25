@@ -1,4 +1,4 @@
-"""Complete paired E1 review through a real worker receipt and separate Terra job."""
+"""Complete paired E1 review through a real worker receipt and separate GLM verifier job."""
 
 from __future__ import annotations
 
@@ -8,6 +8,7 @@ from typing import Any, Callable
 from .e1_review import _paths, check_review_report, import_review_report
 from .gateway import (harness_job_complete, harness_job_status, harness_job_verify,
                       harness_verifier_start)
+from .gateway import VERIFIER_JOB_SUFFIX
 from .objectives import _validate_gateway_status
 from .storage import read_json, sha256_file, write_json
 
@@ -19,7 +20,7 @@ def _dispatch(home: Path, record: dict[str, Any]) -> tuple[Path, dict[str, Any],
     dispatch = read_json(dispatch_path)
     if (dispatch.get("experiment_id") != record["experiment_id"]
             or dispatch.get("packet_sha256") != sha256_file(assignment_path)
-            or dispatch.get("verifier_job_id") != f"{dispatch.get('job_id')}-terra"):
+            or dispatch.get("verifier_job_id") != f"{dispatch.get('job_id')}{VERIFIER_JOB_SUFFIX}"):
         raise ValueError("E1 review dispatch changed")
     return dispatch_path, dispatch, assignment
 
@@ -81,7 +82,7 @@ def start_review_verifier(
     home: Path, record: dict[str, Any], *,
     starter: Callable[[str, str], dict[str, Any]] | None = None,
 ) -> dict[str, Any]:
-    """Start Terra only after the named host check is bound to completion."""
+    """Start the GLM verifier only after the named host check is bound to completion."""
     home = Path(home).resolve()
     dispatch_path, dispatch, _ = _dispatch(home, record)
     completion_path = dispatch_path.parent / "review-completion.json"
@@ -103,12 +104,12 @@ def start_review_verifier(
         raise ValueError("E1 review gateway completion changed")
     path = dispatch_path.parent / "review-verifier-dispatch.json"
     if path.exists():
-        raise FileExistsError("E1 Terra verifier was already started")
+        raise FileExistsError("E1 GLM verifier was already started")
     result = (starter or harness_verifier_start)(dispatch["job_id"], dispatch["verifier_job_id"])
     if (not isinstance(result, dict) or result.get("success") is not True
             or result.get("started") is not True or result.get("accepted") is not False
             or result.get("job_id") != dispatch["verifier_job_id"]):
-        raise ValueError("E1 gateway did not start the exact Terra verifier")
+        raise ValueError("E1 gateway did not start the exact GLM verifier")
     saved = {"schema_version": "mavis.e1-review-verifier-dispatch/v1",
              "job_id": dispatch["job_id"], "verifier_job_id": dispatch["verifier_job_id"],
              "completion_sha256": sha256_file(completion_path)}
@@ -121,7 +122,7 @@ def verify_and_import_review(
     status_reader: Callable[[str], dict[str, Any]] | None = None,
     verifier: Callable[[str, str, str], dict[str, Any]] | None = None,
 ) -> dict[str, Any]:
-    """Require Terra's accepted gateway verdict before importing report bytes."""
+    """Require the GLM verifier's accepted gateway verdict before importing report bytes."""
     home = Path(home).resolve()
     dispatch_path, dispatch, _ = _dispatch(home, record)
     verifier_dispatch = read_json(dispatch_path.parent / "review-verifier-dispatch.json")
@@ -130,7 +131,7 @@ def verify_and_import_review(
             or verifier_dispatch.get("verifier_job_id") != dispatch["verifier_job_id"]
             or verifier_dispatch.get("completion_sha256") != sha256_file(
                 dispatch_path.parent / "review-completion.json")):
-        raise ValueError("E1 Terra dispatch changed")
+        raise ValueError("E1 GLM verifier dispatch changed")
     checked = check_review_report(home, record, Path(dispatch["report_path"]))
     check_path = Path(dispatch["job_dir"]) / "independent-e1-review.json"
     if read_json(check_path) != checked:
@@ -146,7 +147,7 @@ def verify_and_import_review(
             or not isinstance(acceptance, dict) or acceptance.get("accepted") is not True
             or acceptance.get("verifier_job_id") != dispatch["verifier_job_id"]
             or acceptance.get("evidence_sha256") != report_sha):
-        raise ValueError("E1 Terra verdict was not accepted by the gateway")
+        raise ValueError("E1 GLM verifier verdict was not accepted by the gateway")
     _validate_gateway_status(read_status(dispatch["job_id"]), dispatch["job_id"])
     path = import_review_report(home, record, read_status)
     return {"review": str(path), "review_sha256": sha256_file(path),

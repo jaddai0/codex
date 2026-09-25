@@ -14,6 +14,7 @@ from uuid import uuid4
 
 from .evidence import parse_test_output
 from .gateway import GatewayUnavailable, harness_job_status
+from .gateway import VERIFIER as GATEWAY_VERIFIER
 from .jev import CONTEXT_VERSION, normalize_context
 from .profile_transition import pending as profile_transition_pending
 from .storage import profile_boundary_lock, read_json, require_safe_id, sha256_file, write_json
@@ -816,12 +817,12 @@ def _validate_gateway_status(status: dict[str, Any], worker_job_id: str) -> None
         raise ValueError("gateway acceptance is not bound to the worker job")
     verifier_job_id = acceptance.get("verifier_job_id")
     if (
-        acceptance.get("verifier") != "terra"
+        acceptance.get("verifier") != GATEWAY_VERIFIER
         or not isinstance(verifier_job_id, str)
         or not verifier_job_id
         or verifier_job_id == worker_job_id
     ):
-        raise ValueError("gateway acceptance requires a distinct Terra verifier job")
+        raise ValueError("gateway acceptance requires a distinct GLM verifier job")
     for field in (
         "target_sha256",
         "evidence_sha256",

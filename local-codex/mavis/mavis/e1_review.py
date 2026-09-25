@@ -8,6 +8,7 @@ from typing import Any, Callable
 
 from .e1 import validate_e1_bundle
 from .experiments import _digest
+from .gateway import VERIFIER_JOB_SUFFIX
 from .objectives import _validate_gateway_status
 from .storage import read_json, require_safe_id, sha256_file, write_json
 
@@ -186,7 +187,7 @@ def dispatch_review(home: Path, record: dict[str, Any], *, job_id: str,
                     starter: Callable[[dict[str, Any]], dict[str, Any]]) -> dict[str, Any]:
     """Start an independent native reviewer against the frozen trial packet."""
     require_safe_id(job_id, "review job id")
-    verifier_job_id = require_safe_id(f"{job_id}-terra", "review verifier job id")
+    verifier_job_id = require_safe_id(f"{job_id}{VERIFIER_JOB_SUFFIX}", "review verifier job id")
     assignment_path, receipt_path = _paths(home, record["experiment_id"])
     packet = read_json(assignment_path)
     facts = _facts(home, record)
@@ -262,7 +263,7 @@ def check_review_report(home: Path, record: dict[str, Any], report_path: Path) -
             or owner in [worker["owner"] for worker in facts["candidate_workers"]]):
         raise ValueError("E1 review check lost its frozen paired bundle or independent owner")
     job_id = require_safe_id(dispatch.get("job_id"), "review job id")
-    verifier_job_id = require_safe_id(f"{job_id}-terra", "review verifier job id")
+    verifier_job_id = require_safe_id(f"{job_id}{VERIFIER_JOB_SUFFIX}", "review verifier job id")
     gateway_path = Path(dispatch.get("gateway_assignment_path") or "")
     gateway_assignment = read_json(gateway_path)
     expected = _gateway_arguments(assignment, assignment_path, job_id)
@@ -336,7 +337,7 @@ def import_review_report(home: Path, record: dict[str, Any],
 
 def validate_review(home: Path, record: dict[str, Any], receipt_path: Path,
                     status_reader: Callable[[str], dict[str, Any]]) -> dict[str, Any]:
-    """Require a different accepted gateway worker and Terra verifier for exact facts."""
+    """Require a different accepted gateway worker and GLM verifier for exact facts."""
     assignment_path, canonical_receipt = _paths(home, record["experiment_id"])
     if Path(receipt_path).resolve() != canonical_receipt.resolve():
         raise ValueError("E1 review receipt must be in the separate verification store")
@@ -368,7 +369,7 @@ def validate_review(home: Path, record: dict[str, Any], receipt_path: Path,
     expected_gateway = _gateway_arguments(assignment, assignment_path, dispatch.get("job_id"))
     if (dispatch.get("schema_version") != "mavis.e1-review-dispatch/v1"
             or dispatch.get("experiment_id") != record["experiment_id"]
-            or dispatch.get("verifier_job_id") != f"{dispatch.get('job_id')}-terra"
+            or dispatch.get("verifier_job_id") != f"{dispatch.get('job_id')}{VERIFIER_JOB_SUFFIX}"
             or dispatch.get("packet_path") != str(assignment_path)
             or dispatch.get("packet_sha256") != sha256_file(assignment_path)
             or dispatch.get("gateway_assignment_sha256") != sha256_file(gateway_assignment_path)

@@ -84,7 +84,7 @@ guard; runtime endpoint and installed-service acceptance remain separate.
 `mavis.experiments.ExperimentStore` keeps prompt, tool-setting, and retrieval
 candidate configurations under the Mavis home. It freezes the active baseline,
 accepts matched held-out results with retained output hashes, requires a
-separate candidate and review gateway worker accepted by Terra for the exact
+separate candidate and review gateway worker accepted by the GLM 5.3 verifier for the exact
 candidate report and comparison, stages a
 candidate, and promotes it only between objectives. Rollback restores the
 previous accepted configuration. An experiment can be queued through

@@ -63,7 +63,7 @@ def bootstrap_inspection(home: Path, assignment: dict) -> dict:
     }
 
 
-def terra_verifier_evidence(worker_dir: Path, worker_report: Path,
+def glm_verifier_evidence(worker_dir: Path, worker_report: Path,
                             worker_assignment: Path, target: str,
                             required_checks: list[str]) -> dict:
     receipt = worker_dir / "receipt.json"
@@ -81,20 +81,28 @@ def terra_verifier_evidence(worker_dir: Path, worker_report: Path,
          "observation": f"The {ref} evidence record was checked against the frozen bootstrap packet and matched exactly."}
         for ref, digest in digests.items()
     ]
-    terra_report = worker_dir.parent / "bootstrap-terra-evidence-fixture" / "report.md"
-    write_json(terra_report, {"target_sha256": target, "verdict": "accepted",
+    glm_report = worker_dir.parent / "bootstrap-glm-evidence-fixture" / "report.md"
+    write_json(glm_report, {"target_sha256": target, "verdict": "accepted",
                               "findings": findings})
     return {
-        "schema_version": "model-gateway-terra-verifier-evidence/v1",
-        "verifier_job_id": "review-job-terra", "verdict": "accepted",
+        "schema_version": "model-gateway-verifier-evidence/v2",
+        "verifier": "glm-codex", "verifier_model": "z-ai/glm-5.3",
+        "verifier_job_id": "review-job-glm", "verdict": "accepted",
         "target_sha256": target,
         "worker_report_sha256": sha256_file(worker_report),
-        "report_path": str(terra_report), "report_sha256": sha256_file(terra_report),
+        "report_path": str(glm_report), "report_sha256": sha256_file(glm_report),
         "findings": findings,
     }
 
 
-def canonical_terra_findings(runner, worker_job_id: str) -> list[dict]:
+def write_glm_verdict(module, verifier_dir: Path, verdict: dict) -> None:
+    """Save a GLM-style final message and run the gateway's own host capture on it."""
+    raw = verifier_dir / "verdict-raw.md"
+    raw.write_text("Evidence checked; final JSON follows.\n\n" + json.dumps(verdict, indent=2) + "\n")
+    assert module.capture_verifier_verdict(raw, verifier_dir / "report.md")
+
+
+def canonical_verifier_findings(runner, worker_job_id: str) -> list[dict]:
     binding = runner._target_binding(worker_job_id)
     completion = read_json(runner._job_dir(worker_job_id) / "completion.json")
     assignment = read_json(runner._job_dir(worker_job_id) / "assignment.json")
@@ -524,7 +532,7 @@ class E1RunnerTests(unittest.TestCase):
                 "candidate_sha256": record["candidate"]["sha256"],
                 "candidate_job_id": "candidate-job",
                 "gateway_worker_job_id": "review-job",
-                "verifier_job_id": "terra-review",
+                "verifier_job_id": "glm-review",
                 "verdict": "accepted",
             },
         )
@@ -540,10 +548,10 @@ class E1RunnerTests(unittest.TestCase):
                 "acceptance": {
                     "accepted": True,
                     "job_id": job_id,
-                    "verifier": "terra",
-                    "verifier_job_id": "terra-candidate"
+                    "verifier": "glm-codex",
+                    "verifier_job_id": "glm-candidate"
                     if candidate
-                    else "terra-review",
+                    else "glm-review",
                     "target_sha256": "a" * 64,
                     "evidence_sha256": "b" * 64,
                     "report_sha256_on_disk": "c" * 64,
@@ -632,8 +640,8 @@ class E1RunnerTests(unittest.TestCase):
             "job_id": job_id, "state": "completed", "exit_code": 0,
             "accepted": True, "mavis_binding": binding,
             "receipt": {"job_id": job_id, "exit_code": 0},
-            "acceptance": {"accepted": True, "job_id": job_id, "verifier": "terra",
-                           "verifier_job_id": "terra-job", "target_sha256": "a" * 64,
+            "acceptance": {"accepted": True, "job_id": job_id, "verifier": "glm-codex",
+                           "verifier_job_id": "glm-job", "target_sha256": "a" * 64,
                            "evidence_sha256": "b" * 64, "report_sha256_on_disk": "c" * 64,
                            "verifier_verdict_sha256": "d" * 64}}
         with self.assertRaises(FileNotFoundError):
@@ -738,14 +746,14 @@ class E1RunnerTests(unittest.TestCase):
                 "acceptance": {
                     "accepted": True,
                     "job_id": job_id,
-                    "verifier": "terra",
-                    "verifier_job_id": "review-job-terra",
+                    "verifier": "glm-codex",
+                    "verifier_job_id": "review-job-glm",
                     "target_sha256": target,
                     "evidence_sha256": "b" * 64,
                     "report_sha256_on_disk": sha256_file(gateway_report),
-                    "verifier_verdict_sha256": terra_evidence["report_sha256"],
+                    "verifier_verdict_sha256": glm_evidence["report_sha256"],
                 },
-                "verifier_evidence": terra_evidence,
+                "verifier_evidence": glm_evidence,
                 "mavis_binding": {
                     "schema_version": "model-gateway-mavis-objective-binding/v1",
                     "objective_id": "e1-bootstrap-main",
@@ -801,10 +809,10 @@ class E1RunnerTests(unittest.TestCase):
                 ),
                 "assignment_sha256": sha256_file(assignment_path),
                 "gateway_worker_job_id": "review-job",
-                "verifier_job_id": "review-job-terra",
+                "verifier_job_id": "review-job-glm",
             },
         )
-        terra_evidence = terra_verifier_evidence(
+        glm_evidence = glm_verifier_evidence(
             gateway_dir, gateway_report, gateway_assignment, "c" * 64,
             assignment["required_checks"],
         )
@@ -1002,8 +1010,8 @@ class E1RunnerTests(unittest.TestCase):
             return {
                 "job_id": job_id, "state": "completed", "exit_code": 0, "accepted": True,
                 "receipt": {"job_id": job_id, "exit_code": 0},
-                "acceptance": {"accepted": True, "job_id": job_id, "verifier": "terra",
-                               "verifier_job_id": "independent-review-worker-terra",
+                "acceptance": {"accepted": True, "job_id": job_id, "verifier": "glm-codex",
+                               "verifier_job_id": "independent-review-worker-glm",
                                "target_sha256": "a" * 64,
                                "evidence_sha256": "b" * 64,
                                "report_sha256_on_disk": sha256_file(report),
@@ -1041,8 +1049,8 @@ class E1RunnerTests(unittest.TestCase):
         self.assertTrue(review.is_file())
         self.assertEqual(self.runner.store.stage("repair")["state"], "staged")
 
-    def test_paired_review_gateway_completion_and_terra_contract(self):
-        """Canonical gateway rules reject unbound checks and Terra verdicts."""
+    def test_paired_review_gateway_completion_and_glm_verifier_contract(self):
+        """Canonical gateway rules reject unbound checks and GLM verifier verdicts."""
         record, assignment_path, review, _ = self._native_review()
         review.unlink()
         worker = self.root / "review-gateway-job"
@@ -1055,8 +1063,8 @@ class E1RunnerTests(unittest.TestCase):
         module = importlib.util.module_from_spec(spec)
         spec.loader.exec_module(module)
         runner = module.HarnessJobRunner(self.root / "gateway-jobs", tmux_binary="/bin/false")
-        verifier_id = "independent-review-worker-terra"
-        verifier_dir = self.root / "review-terra-job"
+        verifier_id = "independent-review-worker-glm"
+        verifier_dir = self.root / "review-glm-job"
         verifier_dir.mkdir()
         runner._job_dir = lambda job_id: worker if job_id == "independent-review-worker" else verifier_dir
         self.assertEqual(module.validate_assignment(read_json(worker / "assignment.json")), [])
@@ -1102,36 +1110,37 @@ class E1RunnerTests(unittest.TestCase):
             e1_review_gateway.start_review_verifier(self.home, record, starter=lambda *_: {})
         output.write_bytes(saved_output)
 
-        def start_terra(job_id, verifier_job_id):
+        def start_glm(job_id, verifier_job_id):
             binding = runner._target_binding(job_id)
             self.assertEqual(verifier_job_id, verifier_id)
             write_json(verifier_dir / "assignment.json", {
-                "lane": "terra", "verification_target": binding})
+                "lane": "glm-codex", "model": "z-ai/glm-5.3", "verification_target": binding})
             write_json(verifier_dir / "meta.json", {
-                "job_id": verifier_job_id, "lane": "terra", "command": module.build_native_command(
-                    "terra", prompt="Verify paired E1 evidence", model="gpt-5.6-terra",
-                    output_last_message=str(verifier_dir / "report.md"), sandbox="read-only")})
+                "job_id": verifier_job_id, "lane": "glm-codex", "command": module.build_native_command(
+                    "glm-codex", prompt="Verify paired E1 evidence", model="z-ai/glm-5.3",
+                    output_last_message=str(verifier_dir / "verdict-raw.md"), sandbox="read-only"),
+                "capture_verdict": True})
             return {"success": True, "started": True, "accepted": False,
                     "job_id": verifier_job_id}
 
-        e1_review_gateway.start_review_verifier(self.home, record, starter=start_terra)
+        e1_review_gateway.start_review_verifier(self.home, record, starter=start_glm)
         verify = lambda job_id, verifier_job_id, report_sha: {
             "success": True, **runner.record_verification(
-                job_id, verifier="terra", verdict="accepted",
+                job_id, verifier="glm-codex", verdict="accepted",
                 evidence_sha256=report_sha, verifier_job_id=verifier_job_id)}
         with self.assertRaisesRegex(ValueError, "terminal receipt"):
             e1_review_gateway.verify_and_import_review(
                 self.home, record, status_reader=status, verifier=verify)
         write_json(verifier_dir / "receipt.json", {"job_id": verifier_id, "exit_code": 0})
-        write_json(verifier_dir / "report.md", {
+        write_glm_verdict(module, verifier_dir, {
             "target_sha256": "0" * 64, "verdict": "accepted", "findings": "wrong target"})
         with self.assertRaisesRegex(ValueError, "not accepted"):
             e1_review_gateway.verify_and_import_review(
                 self.home, record, status_reader=status, verifier=verify)
         self.assertFalse(status("independent-review-worker")["accepted"])
-        write_json(verifier_dir / "report.md", {
+        write_glm_verdict(module, verifier_dir, {
             "target_sha256": runner._target_binding("independent-review-worker")["target_sha256"],
-            "verdict": "accepted", "findings": canonical_terra_findings(
+            "verdict": "accepted", "findings": canonical_verifier_findings(
                 runner, "independent-review-worker")})
         result = e1_review_gateway.verify_and_import_review(
             self.home, record, status_reader=status, verifier=verify)
@@ -1403,7 +1412,7 @@ class E1RunnerTests(unittest.TestCase):
         self.assertEqual(call.call_args.kwargs["environment_overrides"],
                          {"OPENCODE_CONFIG_CONTENT": policy})
 
-    def test_bootstrap_gateway_completion_and_terra_contract(self):
+    def test_bootstrap_gateway_completion_and_glm_verifier_contract(self):
         """Exercise the canonical gateway's real receipt and acceptance rules."""
         self._paired_bootstrap_trials()
         source = (Path(__file__).resolve().parents[4] / "ai-skills-dev-mavis-gateway"
@@ -1415,8 +1424,8 @@ class E1RunnerTests(unittest.TestCase):
         spec.loader.exec_module(module)
         runner = module.HarnessJobRunner(self.root / "gateway-jobs", tmux_binary="/bin/false")
         worker = self.root / "bootstrap-gateway-job"
-        verifier_job = "review-job-terra"
-        verifier_dir = self.root / "bootstrap-terra-job"
+        verifier_job = "review-job-glm"
+        verifier_dir = self.root / "bootstrap-glm-job"
         verifier_dir.mkdir()
         runner._job_dir = lambda job_id: worker if job_id == "review-job" else verifier_dir
         self.assertEqual(module.validate_assignment(read_json(worker / "assignment.json")), [])
@@ -1448,34 +1457,35 @@ class E1RunnerTests(unittest.TestCase):
         self.assertIsNotNone(runner._target_binding("review-job"))
         self.assertFalse(status("review-job")["accepted"])
 
-        def start_terra(job_id, verifier_job_id):
+        def start_glm(job_id, verifier_job_id):
             binding = runner._target_binding(job_id)
             self.assertEqual(verifier_job_id, verifier_job)
             write_json(verifier_dir / "assignment.json", {
-                "lane": "terra", "verification_target": binding})
+                "lane": "glm-codex", "model": "z-ai/glm-5.3", "verification_target": binding})
             write_json(verifier_dir / "meta.json", {
-                "job_id": verifier_job_id, "lane": "terra", "command": module.build_native_command(
-                    "terra", prompt="Verify frozen E1 evidence", model="gpt-5.6-terra",
-                    output_last_message=str(verifier_dir / "report.md"), sandbox="read-only")})
+                "job_id": verifier_job_id, "lane": "glm-codex", "command": module.build_native_command(
+                    "glm-codex", prompt="Verify frozen E1 evidence", model="z-ai/glm-5.3",
+                    output_last_message=str(verifier_dir / "verdict-raw.md"), sandbox="read-only"),
+                "capture_verdict": True})
             return {"success": True, "started": True, "accepted": False,
                     "job_id": verifier_job_id}
 
-        e1_bootstrap_gateway.start_bootstrap_verifier(self.home, starter=start_terra)
+        e1_bootstrap_gateway.start_bootstrap_verifier(self.home, starter=start_glm)
         write_json(verifier_dir / "receipt.json", {
             "job_id": verifier_job, "exit_code": 0})
-        write_json(verifier_dir / "report.md", {
+        write_glm_verdict(module, verifier_dir, {
             "target_sha256": "0" * 64, "verdict": "accepted", "findings": "wrong target"})
         verify = lambda job_id, verifier_job_id, report_sha: {
             "success": True, **runner.record_verification(
-                job_id, verifier="terra", verdict="accepted",
+                job_id, verifier="glm-codex", verdict="accepted",
                 evidence_sha256=report_sha, verifier_job_id=verifier_job_id)}
         with self.assertRaisesRegex(ValueError, "not accepted"):
             e1_bootstrap_gateway.verify_and_import_bootstrap_review(
                 self.home, status_reader=status, verifier=verify)
         self.assertFalse(status("review-job")["accepted"])
-        write_json(verifier_dir / "report.md", {
+        write_glm_verdict(module, verifier_dir, {
             "target_sha256": runner._target_binding("review-job")["target_sha256"],
-            "verdict": "accepted", "findings": canonical_terra_findings(runner, "review-job")})
+            "verdict": "accepted", "findings": canonical_verifier_findings(runner, "review-job")})
         result = e1_bootstrap_gateway.verify_and_import_bootstrap_review(
             self.home, status_reader=status, verifier=verify)
         self.assertEqual(result["review_sha256"], sha256_file(worker / "report.md"))

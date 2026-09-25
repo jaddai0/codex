@@ -95,7 +95,7 @@ Sol coordinates interfaces and exceptions. It should not routinely implement plu
 | Launchers, adapters, schemas, routine tests, hygiene | MiniMax through OpenCode |
 | Routing, quota accounting, diagnostics, failure testing | GLM through ZCode |
 | Ordinary coding after bootstrap | Local Mavis |
-| Independent milestone verification | Terra through Codex |
+| Independent milestone verification | GLM 5.3 (`z-ai/glm-5.3`, OpenRouter) in the Codex CLI harness, read-only, via the gateway's `bin/glm-codex.sh` (Dustin, 2026-09-25; was Terra) |
 | Escalated implementation or diagnosis | Sonnet, then Opus |
 | Hardest unresolved architecture or reasoning | Astra/Fable |
 
@@ -105,9 +105,9 @@ Use native harnesses for tool-using work. Preserve ordinary gateway API generati
 
 External workers run in dedicated tmux sessions with structured events and durable logs. Give concurrent writers separate worktrees. Allow only one writer per checkout.
 
-**A worker cannot certify its own success.** The supervisor gathers evidence; deterministic checks run first; Terra then checks the coherent milestone. Sol receives a compact accepted receipt or a specific exception. Changed code or acceptance artifacts invalidate the old receipt.
+**A worker cannot certify its own success.** The supervisor gathers evidence; deterministic checks run first; the GLM 5.3 verifier then checks the coherent milestone. Work done on a GLM lane cannot be verified by it (the gateway refuses GLM worker lanes). Sol receives a compact accepted receipt or a specific exception. Changed code or acceptance artifacts invalidate the old receipt.
 
-Terra checks for missing requirements, disabled tests, fabricated success, unexpected edits, and fixes that merely hide the reported failure. Evaluation tests remain outside the worker’s writable area.
+The verifier checks for missing requirements, disabled tests, fabricated success, unexpected edits, and fixes that merely hide the reported failure. Evaluation tests remain outside the worker’s writable area.
 
 ### Escalation and persistence
 
@@ -155,7 +155,7 @@ Record existing failures separately from new regressions. Preserve unrelated wor
 
 ### Phase 1 — Make Mavis useful
 
-**Owners:** MiniMax for launcher and evidence plumbing; GLM for gateway jobs and Jev; Terra verifies.
+**Owners:** MiniMax for launcher and evidence plumbing; GLM for gateway jobs and Jev; GLM 5.3 verifies.
 
 Deliver:
 
@@ -177,7 +177,7 @@ Do not delay this phase for embeddings, small helper models, broad benchmark run
 
 ### Phase 2 — Add project memory, retrieval, and small helpers
 
-**Owners:** Mavis/MiniMax implement; GLM tests retrieval; Terra verifies.
+**Owners:** Mavis/MiniMax implement; GLM tests retrieval; GLM 5.3 verifies.
 
 **Memory and retrieval**
 
@@ -214,7 +214,7 @@ Evaluate Qwen3.5-0.8B first, then 4B, for each helper independently. Choose the 
 
 ### Phase 3 — Establish continuous improvement
 
-**Owners:** Mavis generates candidates; MiniMax/GLM implement bounded repairs; Terra verifies promotion.
+**Owners:** Mavis generates candidates; MiniMax/GLM implement bounded repairs; GLM 5.3 verifies promotion.
 
 Collect objectives, model/profile versions, available model traces, tool calls, raw outputs, changes, tests, reviewer findings, retries, routing decisions, latency, and usage.
 
@@ -237,7 +237,7 @@ Prompt optimization should use failure explanations and controlled comparisons. 
 
 ### Phase 4 — Harden difficult and large-project work
 
-**Owners:** Mavis with GLM/MiniMax assistance; Terra verifies.
+**Owners:** Mavis with GLM/MiniMax assistance; GLM 5.3 verifies.
 
 Add evaluation and workflow coverage for:
 
@@ -385,7 +385,7 @@ Every new capability needs one owner, a narrow interface, tests, a disable path,
 
 Maintain architecture checks for forbidden dependencies, duplicated provider registries, and direct cloud calls bypassing the gateway. Review upstream Codex changes in small increments.
 
-Delegate cleanup, stale-document repair, fixture maintenance, and archive checks to MiniMax or Mavis. Terra verifies cleanup receipts. Remove only task-owned disposable material after recovery and retention checks pass.
+Delegate cleanup, stale-document repair, fixture maintenance, and archive checks to MiniMax or Mavis. GLM 5.3 verifies cleanup receipts. Remove only task-owned disposable material after recovery and retention checks pass.
 
 Sol may adapt implementation details when evidence exposes a better route. It must record the reason and preserve the required behavior, authority, and success criteria.
 

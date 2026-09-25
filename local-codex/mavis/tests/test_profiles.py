@@ -150,7 +150,7 @@ class ProfileStoreTests(unittest.TestCase):
                 "accepted": True,
                 "receipt": {"job_id": worker_job_id, "exit_code": 0},
                 "acceptance": {"accepted": True, "job_id": worker_job_id,
-                               "verifier": "terra", "verifier_job_id": f"terra-{experiment_id}",
+                               "verifier": "glm-codex", "verifier_job_id": f"glm-{experiment_id}",
                                "target_sha256": "a" * 64, "evidence_sha256": "b" * 64,
                                "report_sha256_on_disk": "c" * 64,
                                "verifier_verdict_sha256": "d" * 64},
@@ -186,7 +186,7 @@ class ProfileStoreTests(unittest.TestCase):
                               "candidate_sha256": record["candidate"]["sha256"],
                               "candidate_job_id": f"candidate-{experiment_id}",
                               "gateway_worker_job_id": f"review-{experiment_id}",
-                              "verifier_job_id": f"terra-{experiment_id}",
+                              "verifier_job_id": f"glm-{experiment_id}",
                               "verdict": "accepted"})
         self.experiments.review(experiment_id, verifier)
         self.experiments.stage(experiment_id)
