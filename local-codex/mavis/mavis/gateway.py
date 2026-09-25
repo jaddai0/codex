@@ -73,7 +73,8 @@ def _send(process: subprocess.Popen[str], payload: dict[str, Any]) -> None:
     process.stdin.flush()
 
 
-def _gateway_tool(name: str, arguments: dict[str, Any], timeout: float) -> dict[str, Any]:
+def _gateway_tool(name: str, arguments: dict[str, Any], timeout: float,
+                  *, require_success: bool = True) -> dict[str, Any]:
     """Call one tool on the trusted Mavis gateway without a provider fallback."""
     command, configured_env = _configured_gateway()
     environment = os.environ.copy()
@@ -135,7 +136,7 @@ def _gateway_tool(name: str, arguments: dict[str, Any], timeout: float) -> dict[
             payload = json.loads(text) if isinstance(text, str) else None
         except json.JSONDecodeError as error:
             raise GatewayUnavailable("configured model gateway returned malformed status") from error
-    if not isinstance(payload, dict) or payload.get("success") is not True:
+    if not isinstance(payload, dict) or (require_success and payload.get("success") is not True):
         raise GatewayUnavailable(f"configured model gateway returned unsuccessful {name}")
     return payload
 
@@ -175,3 +176,13 @@ def harness_job_verify(job_id: str, verifier_job_id: str, report_sha256: str,
         "job_id": job_id, "verifier": "terra", "verdict": "accepted",
         "evidence_sha256": report_sha256, "verifier_job_id": verifier_job_id,
     }, timeout)
+
+
+def jev_decisions(state: dict[str, Any], questions: dict[str, Any],
+                  estimated_cost_usd: float, timeout: float = 30.0) -> dict[str, Any]:
+    """Return the gateway's typed decision or its explicit refusal."""
+    return _gateway_tool("jev_decisions", {
+        "state": state,
+        "questions": questions,
+        "estimated_cost_usd": estimated_cost_usd,
+    }, timeout, require_success=False)

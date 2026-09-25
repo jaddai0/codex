@@ -45,7 +45,7 @@ class MemoryMcpTests(unittest.TestCase):
                 await session.initialize()
                 tools = await session.list_tools()
                 self.assertEqual([tool.name for tool in tools.tools],
-                                 ["mavis_librarian_ask"])
+                                 ["mavis_librarian_ask", "mavis_jev_advise"])
                 self.assertNotIn("project", tools.tools[0].inputSchema["properties"])
                 result = await session.call_tool("mavis_librarian_ask", {
                     "conversation_id": "design",
