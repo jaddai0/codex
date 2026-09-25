@@ -9,7 +9,7 @@ import sys
 
 from mavis.evaluations import installed_candidate_fingerprint
 from mavis.runtime import (
-    RuntimeConfig, _listener_pids, endpoint_alive, ensure_runtime, inventory,
+    RuntimeConfig, _listener_pids, endpoint_alive, ensure_runtime,
     loaded_generation_models, omlx_live_process_binding,
     omlx_runtime_fingerprint, owns_running_server, park_mavis_server,
     require_installed_selected_model, with_mavis_handoff_lease,
@@ -24,15 +24,19 @@ def main() -> int:
     root = home / "evaluations" / "e0"
     result_path = root / "isolation-recovery-shared.json"
 
-    def iris_loaded() -> bool:
-        return any(row.get("id") == config.model and row.get("loaded") is True
-                   for row in inventory(config.iris_endpoint))
-
     require_installed_selected_model(config)
     candidate = installed_candidate_fingerprint()
     runtime = omlx_runtime_fingerprint(config)
-    if not endpoint_alive(config.iris_endpoint) or not iris_loaded():
+    if not endpoint_alive(config.iris_endpoint):
         raise RuntimeError("IRIS must keep its model for service recovery")
+    iris_models = loaded_generation_models(config.iris_endpoint)
+    if (not iris_models or config.model not in iris_models
+            or len(iris_models) != len(set(iris_models))):
+        raise RuntimeError("IRIS generation model inventory is invalid")
+
+    def iris_loaded() -> bool:
+        return loaded_generation_models(config.iris_endpoint) == iris_models
+
     if endpoint_alive(config.endpoint) and loaded_generation_models(config.endpoint):
         raise RuntimeError("Mavis must not own a model before service recovery")
     iris_pids = sorted(_listener_pids(8000))
@@ -46,7 +50,8 @@ def main() -> int:
     mavis_recovered_process: dict[str, object] | None = None
     outage_observed = False
     result: dict[str, object] = {"candidate": candidate, "omlx_runtime": runtime,
-                                 "iris_pids": iris_pids}
+                                 "iris_pids": iris_pids,
+                                 "iris_generation_models": iris_models}
     try:
         reservation = park_mavis_server(config)
         reservation.close()
@@ -103,6 +108,7 @@ def main() -> int:
         "schema_version": "mavis.e0-isolation-recovery/v1",
         "candidate": candidate,
         "omlx_runtime": runtime,
+        "iris_generation_models": iris_models,
         "iris_process": iris_process,
         "mavis_recovered_process": mavis_recovered_process,
         "recovery_while_iris_loaded": True,

@@ -133,10 +133,13 @@ class E0EvaluationTests(unittest.TestCase):
             runtime = {"binary_sha256": "b" * 64, "model_id": evaluator.config.model,
                        "package_sha256": "c" * 64}
             iris_process = {"pid": 10, "package_sha256": runtime["package_sha256"]}
-            write_json(evaluator.root / "isolation-recovery-live.json", {
+            iris_models = [evaluator.config.model, "other-iris-model"]
+            proof_path = evaluator.root / "isolation-recovery-live.json"
+            write_json(proof_path, {
                 "schema_version": "mavis.e0-isolation-recovery/v1",
                 "candidate": candidate,
                 "omlx_runtime": runtime,
+                "iris_generation_models": iris_models,
                 "iris_process": iris_process,
                 "mavis_recovered_process": {"pid": 21,
                     "package_sha256": runtime["package_sha256"]},
@@ -159,8 +162,34 @@ class E0EvaluationTests(unittest.TestCase):
                     patch("mavis.evaluations._listener_pids",
                           side_effect=[{10}, {30}]), \
                     patch("mavis.evaluations.loaded_generation_models",
-                          return_value=[evaluator.config.model]):
+                          return_value=iris_models):
                 self.assertEqual(evaluator.run_case("isolation-recovery")["status"], "pass")
+            with patch.dict(os.environ, {"MAVIS_E0_PARK_OWNER_PID": "30"}), \
+                    patch("mavis.evaluations.installed_candidate_fingerprint",
+                          return_value=candidate), \
+                    patch("mavis.evaluations.omlx_runtime_fingerprint",
+                          return_value=runtime), \
+                    patch("mavis.evaluations.omlx_live_process_binding",
+                          return_value=iris_process), \
+                    patch("mavis.evaluations.endpoint_alive",
+                          side_effect=[True, False]), \
+                    patch("mavis.evaluations._listener_pids",
+                          side_effect=[{10}, {30}]), \
+                    patch("mavis.evaluations.loaded_generation_models",
+                          return_value=[evaluator.config.model]):
+                self.assertEqual(evaluator.run_case("isolation-recovery")["status"], "reject")
+            proof = json.loads(proof_path.read_text())
+            del proof["iris_generation_models"]
+            write_json(proof_path, proof)
+            with patch("mavis.evaluations.installed_candidate_fingerprint",
+                       return_value=candidate), patch(
+                           "mavis.evaluations.omlx_runtime_fingerprint",
+                           return_value=runtime
+                       ):
+                self.assertEqual(evaluator.run_case("isolation-recovery")["status"],
+                                 "blocked")
+            proof["iris_generation_models"] = iris_models
+            write_json(proof_path, proof)
             with patch("mavis.evaluations.installed_candidate_fingerprint",
                        return_value=candidate), patch(
                            "mavis.evaluations.omlx_runtime_fingerprint",

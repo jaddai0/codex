@@ -831,6 +831,12 @@ class E0Evaluator:
             return self._receipt("isolation-recovery", "blocked", ["oMLX runtime or model metadata changed since service recovery was observed"])
         if proof.get("recovery_while_iris_loaded") is not True:
             return self._receipt("isolation-recovery", "blocked", ["Mavis recovery was not observed while IRIS kept its model"])
+        iris_models = proof.get("iris_generation_models")
+        if (not isinstance(iris_models, list) or not iris_models
+                or not all(isinstance(model, str) and model for model in iris_models)
+                or len(iris_models) != len(set(iris_models))
+                or self.config.model not in iris_models):
+            return self._receipt("isolation-recovery", "blocked", ["The IRIS generation model snapshot is missing or invalid"])
         before = proof.get("before") or {}
         after = proof.get("after") or {}
         iris_alive = endpoint_alive(self.config.iris_endpoint)
@@ -858,7 +864,7 @@ class E0Evaluator:
             and recovered_process.get("package_sha256") == runtime["package_sha256"]
         )
         iris_loaded = (loaded_generation_models(self.config.iris_endpoint) ==
-                       [self.config.model]) if iris_alive else False
+                       iris_models) if iris_alive else False
         status = "pass" if iris_alive and iris_loaded and parked and observed else "reject"
         return self._receipt(
             "isolation-recovery",
