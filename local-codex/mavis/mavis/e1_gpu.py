@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from contextlib import contextmanager
 from dataclasses import replace
+import os
 from pathlib import Path
 import subprocess
 import threading
@@ -18,6 +19,7 @@ from .runtime import (
     clear_trial_auth_settings,
     endpoint_alive,
     inventory,
+    iris_voice_session_active,
     load_model,
     loaded_generation_models,
     park_mavis_server,
@@ -33,19 +35,45 @@ from .storage import read_json, write_json
 LEASE = Path.home() / ".local/bin/gpu-lease"
 HOLDER = "codex-mavis"
 LEASE_MINUTES = "90"
+# The lease record and IRIS endpoint gpu-lease itself uses. The blocked-work
+# monitor reads them directly: `gpu-lease status` also scans every process,
+# which can take several seconds while a model loads and would delay noticing a
+# new game or a lost lease.
+LEASE_RECORD = Path(os.environ.get("GPU_LEASE_FILE", Path.home() / ".gpu-lease.json"))
+MONITOR_TIMEOUT_SECONDS = 1.0
 
 
 def _lease_command(*args: str) -> str:
     # status can spend up to 1 s asking IRIS and 5 s scanning processes, the
     # bound the shared observer helper already uses. During a large model load
     # `gpu-lease status` measured 3.5 s (2026-09-25); a 2 s limit made the
-    # heartbeat abort a healthy trial.
+    # heartbeat abort a healthy trial. Monitoring loops use `_LeaseHeartbeat.monitor`
+    # instead, so this slower bound never sits on the safety path.
     result = subprocess.run([str(LEASE), *args], capture_output=True, text=True,
                             timeout=8 if args[0] == "status" else 15,
                             check=False)
     if result.returncode:
         raise RuntimeError(f"GPU lease {args[0]} failed: {(result.stderr or result.stdout).strip()}")
     return result.stdout
+
+
+def _read_lease_record() -> dict[str, Any] | None:
+    """The live lease record, or None when absent, unreadable, or expired.
+
+    Mirrors gpu-lease's own liveness rule: the deadline decides, not the process.
+    """
+    try:
+        record = read_json(LEASE_RECORD)
+    except (OSError, ValueError):
+        return None
+    if not isinstance(record, dict) or record.get("expires", 0) < time.time():
+        return None
+    return record
+
+
+def _iris_game_live() -> bool | None:
+    """Whether IRIS reports a live voice session; None when it cannot be asked."""
+    return iris_voice_session_active(timeout=MONITOR_TIMEOUT_SECONDS)
 
 
 def _owned_status(status: str, purpose: str) -> None:
@@ -89,6 +117,25 @@ class _LeaseHeartbeat:
             _safe_status(_lease_command("status"), purpose=self.purpose)
             self.next_renew = now + 300
 
+    def monitor(self) -> None:
+        """A bounded, sub-second lease check for a blocking GPU operation.
+
+        `gpu-lease status` scans every process after it reads the lease, so it
+        can take seconds during a load. Reading the lease record and asking IRIS
+        directly means a game or a lost lease is seen within about a second
+        instead of waiting for that scan. Unknown IRIS state fails closed.
+        """
+        record = _read_lease_record()
+        if (record is None or record.get("holder") != HOLDER
+                or record.get("purpose") != self.purpose):
+            raise RuntimeError("E1 GPU lease purpose changed")
+        if _iris_game_live() is not False:
+            raise RuntimeError("IRIS game state is unsafe for E1")
+        if (self.iris_endpoint is not None and
+                loaded_generation_models(self.iris_endpoint, timeout=0.5)
+                != self.iris_models):
+            raise RuntimeError("IRIS generation model inventory changed during E1")
+
     def monitor_read_only(self, work: Callable[[], Any]) -> Any:
         """Keep the loaded idle server guarded during a long file hash."""
         self(force=True)
@@ -100,7 +147,7 @@ class _LeaseHeartbeat:
         def watch() -> None:
             while not done.wait(0.2):
                 try:
-                    self(force=True)
+                    self.monitor()
                 except BaseException as error:
                     try:
                         self.abort_idle_server()
@@ -234,7 +281,7 @@ def _monitored_load(config: RuntimeConfig, heartbeat: _LeaseHeartbeat,
     threading.Thread(target=worker, name="mavis-e1-load", daemon=True).start()
     while not done.wait(0.2):
         try:
-            heartbeat(force=True)
+            heartbeat.monitor()
         except BaseException:
             _abort_trial(config, server_state, emergency=True)
             stopped["yes"] = True
@@ -272,7 +319,7 @@ def _monitored_unload(config: RuntimeConfig, heartbeat: _LeaseHeartbeat,
     threading.Thread(target=worker, name="mavis-e1-unload", daemon=True).start()
     while not done.wait(0.2):
         try:
-            heartbeat(force=True)
+            heartbeat.monitor()
         except BaseException:
             _abort_trial(config, server_state, emergency=True)
             stopped["yes"] = True
@@ -322,7 +369,7 @@ def admitted_e1_model(config: RuntimeConfig, purpose: str) -> Iterator[Callable[
         try:
             start_attempted = True
             server_state = start_server(
-                config, require_new=True, heartbeat=lambda: heartbeat(force=True)
+                config, require_new=True, heartbeat=heartbeat.monitor
             )
         except BaseException as error:
             unsafe_startup = bool(getattr(error, "unsafe_gpu_work", False))
@@ -407,7 +454,7 @@ def admitted_e1_model(config: RuntimeConfig, purpose: str) -> Iterator[Callable[
                     park_failure: list[BaseException] = []
                     def park_heartbeat() -> bool:
                         try:
-                            heartbeat(force=True)
+                            heartbeat.monitor()
                         except BaseException as error:
                             park_failure.append(error)
                             return False

@@ -130,6 +130,24 @@ def endpoint_alive(endpoint: str, *, api_key: str | None = None,
         return False
 
 
+def iris_voice_session_active(timeout: float = 1.0) -> bool | None:
+    """Whether IRIS reports a live voice session; None when it cannot be asked.
+
+    This reads gpu-lease's own IRIS status endpoint. It exists so the E1
+    blocked-work monitor can notice a game without running gpu-lease's slower
+    process scan, which can take seconds while a model loads. It is registered
+    in architecture.LOCAL_HTTP because it is a local loopback transport: the
+    endpoint is forced through `_origin`, so only loopback HTTP is accepted.
+    """
+    endpoint = os.environ.get("MAVIS_IRIS_VOICE_STATUS", "http://127.0.0.1:8117/v1")
+    try:
+        request = Request(_origin(endpoint) + "/status")
+        with urlopen(request, timeout=timeout) as response:
+            return bool(json.load(response).get("sessionActive"))
+    except (OSError, URLError, ValueError):
+        return None
+
+
 def require_idle_iris_handoff(config: RuntimeConfig, *, interval_seconds: float = 1.0,
                               expected_models: list[str] | None = None) -> None:
     """Refuse a model handoff while IRIS has active or queued generation."""

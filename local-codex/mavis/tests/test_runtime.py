@@ -281,6 +281,21 @@ class RuntimeTests(unittest.TestCase):
             if child.returncode is None:
                 child.wait()
 
+    def test_exited_unreaped_leader_with_empty_group_survives_forced_eperm(self):
+        # The real-process test above can pass through successful signalling or
+        # ESRCH, so it does not prove the EPERM branch. This forces EPERM through
+        # the whole `_stop_spawned_process_group` path with an exited leader and
+        # no workers, which is the only EPERM shape that may be accepted.
+        process = FakeProcess()
+        exited = Mock(si_status=0)
+        with patch("mavis.runtime._child_exit_unreaped", return_value=exited), \
+                patch("mavis.runtime._process_group_workers", return_value=set()), \
+                patch("mavis.runtime.os.killpg",
+                      side_effect=PermissionError(1, "denied")) as kill:
+            runtime._stop_spawned_process_group(process, timeout=1)
+        kill.assert_called_once_with(1234, signal.SIGTERM)
+        self.assertEqual(process.returncode, -signal.SIGTERM)
+
     def test_eperm_is_not_accepted_while_leader_runs_or_workers_remain(self):
         for exited, workers in ((None, set()), (Mock(si_status=0), {4321})):
             process = FakeProcess()
@@ -359,6 +374,23 @@ class RuntimeTests(unittest.TestCase):
             self.assertNotIn("test-secret", str(spawn.call_args.args[0]))
             self.assertNotIn("MAVIS_E0_TRIAL_API_KEY", spawn.call_args.kwargs["env"])
             self.assertEqual(alive.call_args_list[-1].kwargs, {"api_key": "test-secret"})
+
+    def test_iris_voice_session_probe_reads_bounded_loopback_status(self):
+        import io
+        from unittest.mock import Mock
+        for payload, expected in ((b'{"sessionActive": true}', True),
+                                  (b'{"sessionActive": false}', False),
+                                  (b'{}', False)):
+            response = Mock()
+            response.__enter__ = Mock(return_value=io.BytesIO(payload))
+            response.__exit__ = Mock(return_value=False)
+            with self.subTest(payload=payload), \
+                    patch("mavis.runtime.urlopen", return_value=response) as open_url:
+                self.assertIs(runtime.iris_voice_session_active(), expected)
+            self.assertEqual(open_url.call_args.args[0].full_url,
+                             "http://127.0.0.1:8117/status")
+        with patch("mavis.runtime.urlopen", side_effect=OSError("refused")):
+            self.assertIsNone(runtime.iris_voice_session_active())
 
     def test_authenticated_inventory_sends_bearer_without_logging_key(self):
         import io
