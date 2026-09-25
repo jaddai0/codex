@@ -167,7 +167,16 @@ def _check_review_inspection(home: Path, assignment: dict[str, Any], review: dic
     if not isinstance(inspection, dict) or set(inspection) != {
         "source", "e0_cases", "model", "conclusion"
     }:
-        raise ValueError("E1 bootstrap review lacks an evidence inspection")
+        # A reviewer that emits the facts flat is a prompt/schema failure, not a
+        # wrong verdict; name it so the next dispatch is not needed to diagnose it.
+        if inspection is None and {"source", "e0_cases", "model",
+                                   "conclusion"} <= set(review):
+            raise ValueError(
+                "E1 bootstrap review put the inspected facts at the top level; "
+                "they must be nested under inspection")
+        raise ValueError(
+            "E1 bootstrap review lacks an evidence inspection object with keys "
+            "source, e0_cases, model, conclusion")
 
     package = read_json(Path(assignment["package_manifest"]["path"]))
     source = inspection["source"]
@@ -437,12 +446,18 @@ def _gateway_arguments(
         "task": (
             "Independently inspect the installed E0 case receipts, baseline, installed "
             "package and its pinned source checkout, and exact model artifact hashes in the "
-            "context packet. Return a raw JSON object with schema_version "
-            "mavis.e1-bootstrap-review/v3, verdict accepted only if every fact "
-            "matches, and inspection. Extract values from "
-            "the actual files, not just the frozen packet: source {revision, "
+            "context packet. Return one raw JSON object with exactly these top-level keys: "
+            "schema_version (mavis.e1-bootstrap-review/v3), verdict (accepted only if every "
+            "fact matches), inspection, e0_summary_sha256, baseline_sha256, "
+            "package_manifest_sha256, installed_candidate_digest, model_identity_digest, "
+            "assignment_sha256, gateway_worker_job_id, verifier_job_id. The value of "
+            "inspection must be an object whose keys are exactly source, e0_cases, model, "
+            "conclusion: all four inspected fact groups belong inside inspection and none "
+            "of them may appear at the top level. Extract values from "
+            "the actual files, not just the frozen packet: inspection.source {revision, "
             "package_tree_sha256, checked_file, checked_sha256, source_excerpt} using "
-            "local-codex/mavis/mavis/e1_bootstrap.py; e0_cases with one {case, receipt_path, "
+            "local-codex/mavis/mavis/e1_bootstrap.py; inspection.e0_cases with one "
+            "{case, receipt_path, "
             "receipt_sha256, observed_status, cited_evidence} for every mandatory case in "
             # The host compares receipt_path against this exact canonical location
             # (_check_review_inspection, which resolves it). Name it resolved so a
@@ -450,12 +465,12 @@ def _gateway_arguments(
             f"order, where receipt_path is the absolute path "
             f"{(Path(assignment_path).resolve().parents[2] / 'evaluations/e0').resolve()}/<case>.json, "
             "not a per-run copy; "
-            "model {model_id, weights_fingerprint, cited_file, cited_sha256, "
+            "inspection.model {model_id, weights_fingerprint, cited_file, cited_sha256, "
             "config_sha256, observed_architecture, observed_quantization_sha256} "
             "citing a weight shard and the actual config.json; compute the "
             "quantization SHA-256 from the actual config value using canonical "
             "sorted-key compact JSON, and never paste the large quantization map; "
-            "conclusion {matched: true, issues: []} only if all "
+            "inspection.conclusion {matched: true, issues: []} only if all "
             "inspected facts agree. Also include "
             "e0_summary_sha256, baseline_sha256, package_manifest_sha256, "
             "installed_candidate_digest, model_identity_digest, assignment_sha256 "

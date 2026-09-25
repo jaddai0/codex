@@ -1350,6 +1350,38 @@ class E1RunnerTests(unittest.TestCase):
         self.assertIn(expected, task)
         self.assertIn("not a per-run copy", task)
 
+    def test_bootstrap_review_prompt_requires_the_nested_inspection_object(self):
+        """A report that flattened the facts was rejected; name the nesting in the task."""
+        assignment_path = self.home / "e1/bootstrap/review-assignment.json"
+        assignment_path.parent.mkdir(parents=True, exist_ok=True)
+        write_json(assignment_path, {"schema_version": "test-assignment"})
+        packet = {
+            "owner": {"provider": "minimax", "harness": "opencode",
+                      "model": "minimax/MiniMax-M3"},
+            "cwd": str(self.root), "starting_revision": "a" * 40,
+            "owned_paths": [str(self.home / "verifications/e1-bootstrap/main.json")],
+            "required_checks": ["independent-bootstrap-review"],
+            "requirements": [],
+            "objective_id": "e1-bootstrap-main",
+        }
+        task = e1_bootstrap._gateway_arguments(packet, assignment_path, "review-job")["task"]
+        self.assertIn("belong inside inspection", task)
+        for key in ("source", "e0_cases", "model", "conclusion"):
+            self.assertIn(f"inspection.{key}", task)
+
+    def test_bootstrap_review_names_a_flattened_report(self):
+        """The host check must say the facts were flattened, not that they are absent."""
+        self._paired_bootstrap_trials()
+        report = self.root / "bootstrap-gateway-job/report.md"
+        original = read_json(report)
+        flattened = {key: value for key, value in original.items()
+                     if key != "inspection"}
+        flattened.update(original["inspection"])
+        write_json(report, flattened)
+        with self.assertRaisesRegex(
+                ValueError, "put the inspected facts at the top level"):
+            e1_bootstrap.check_bootstrap_review(self.home, report)
+
     def test_bootstrap_native_review_gets_scoped_read_only_opencode_policy(self):
         assignment_path = self.home / "e1/bootstrap/review-assignment.json"
         assignment = {
