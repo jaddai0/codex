@@ -7,6 +7,7 @@ import hashlib
 import json
 import math
 from pathlib import Path
+import re
 from typing import Any
 from uuid import uuid4
 
@@ -18,6 +19,7 @@ PURPOSES = frozenset({
     "evidence_relevance", "tool_selection", "failure_classification",
     "escalation", "memory_category", "completion_suspicion",
 })
+STATE_KEYS = frozenset({"summary", "signals"})
 
 
 def _digest(value: Any) -> str:
@@ -33,6 +35,20 @@ def advise(service_home: Path, project_root: Path, purpose: str,
         raise ValueError("unknown Jev advisory purpose")
     if not isinstance(state, dict) or not isinstance(questions, dict) or not questions:
         raise ValueError("Jev requires a state object and typed questions")
+    if set(state) - STATE_KEYS or not isinstance(state.get("summary"), str):
+        raise ValueError("Jev state allows only a redacted summary and signals")
+    if not 0 < len(state["summary"]) <= 500 or "\n" in state["summary"]:
+        raise ValueError("Jev summary must be one short line")
+    signals = state.get("signals", {})
+    if not isinstance(signals, dict) or len(signals) > 20:
+        raise ValueError("Jev signals must be a small object")
+    for key, value in signals.items():
+        if not isinstance(key, str) or not re.fullmatch(r"[a-z][a-z0-9_]{0,40}", key):
+            raise ValueError("Jev signal names must be simple labels")
+        if (not isinstance(value, (str, bool, int, float)) or
+                isinstance(value, float) and not math.isfinite(value) or
+                isinstance(value, str) and (len(value) > 80 or "\n" in value)):
+            raise ValueError("Jev signal values must be short labels or numbers")
     if (isinstance(estimated_cost_usd, bool) or not isinstance(estimated_cost_usd, (int, float))
             or not math.isfinite(estimated_cost_usd)
             or not 0 < estimated_cost_usd <= 1):
@@ -54,6 +70,21 @@ def advise(service_home: Path, project_root: Path, purpose: str,
         raise ValueError("Jev gateway refusal claimed authority")
 
     decision = response.get("decision") or "policy_rejected"
+    kept_fields = (
+        "success", "decision", "failure_class", "advisory", "binding",
+        "grants_permission", "answers", "response_model", "actual_cost_usd",
+    )
+    retained_response = {key: response[key] for key in kept_fields if key in response}
+    raw_response = response.get("raw_response")
+    if isinstance(raw_response, dict) and isinstance(raw_response.get("sha256"), str):
+        retained_response["raw_response_sha256"] = raw_response["sha256"]
+    usage_receipt = response.get("usage_receipt")
+    if isinstance(usage_receipt, dict):
+        retained_response["usage_receipt"] = {
+            key: usage_receipt[key]
+            for key in ("cost_usd", "response_sha256", "at_epoch")
+            if key in usage_receipt
+        }
     record = {
         "schema_version": "mavis.jev-advice/v1",
         "advisory": True,
@@ -66,7 +97,7 @@ def advise(service_home: Path, project_root: Path, purpose: str,
         "estimated_cost_usd": float(estimated_cost_usd),
         "received_at": datetime.now(timezone.utc).isoformat(),
         "decision": decision,
-        "gateway_response": response,
+        "gateway_response": retained_response,
     }
     receipt = Path(service_home) / "jev" / f"{uuid4().hex}.json"
     write_json(receipt, record)

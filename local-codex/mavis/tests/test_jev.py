@@ -29,7 +29,7 @@ class JevAdviceTests(unittest.TestCase):
         self.project.mkdir()
 
     def test_answered_advice_has_local_receipt_and_no_authority(self):
-        state = {"failure": "tests still fail after a changed approach"}
+        state = {"summary": "tests still fail after a changed approach"}
         gateway = {
             "success": True, "decision": "answered", "advisory": True,
             "binding": False, "grants_permission": False,
@@ -45,7 +45,7 @@ class JevAdviceTests(unittest.TestCase):
         receipt = Path(result["receipt"])
         record = json.loads(receipt.read_text())
         self.assertEqual(record["gateway_response"], gateway)
-        self.assertNotIn(state["failure"], receipt.read_text())
+        self.assertNotIn(state["summary"], receipt.read_text())
         self.assertEqual(receipt.stat().st_mode & 0o777, 0o600)
 
     def test_gateway_cap_refusal_is_recorded_without_answers(self):
@@ -54,7 +54,7 @@ class JevAdviceTests(unittest.TestCase):
             "binding": False, "grants_permission": False,
         }
         with patch("mavis.jev.jev_decisions", return_value=gateway):
-            result = advise(self.service, self.project, "tool_selection", {},
+            result = advise(self.service, self.project, "tool_selection", {"summary": "tool unavailable"},
                             QUESTIONS, 0.01)
         self.assertEqual(result["decision"], "cap_blocked")
         self.assertEqual(result["answers"], {})
@@ -68,14 +68,31 @@ class JevAdviceTests(unittest.TestCase):
         }
         with patch("mavis.jev.jev_decisions", return_value=gateway):
             with self.assertRaisesRegex(ValueError, "claimed authority"):
-                advise(self.service, self.project, "escalation", {}, QUESTIONS, 0.01)
+                advise(self.service, self.project, "escalation", {"summary": "failed checks"}, QUESTIONS, 0.01)
         self.assertFalse((self.service / "jev").exists())
 
     def test_unbounded_cost_is_rejected_before_gateway(self):
         with patch("mavis.jev.jev_decisions") as call:
             with self.assertRaisesRegex(ValueError, "estimated cost"):
-                advise(self.service, self.project, "escalation", {}, QUESTIONS, 2)
+                advise(self.service, self.project, "escalation", {"summary": "failed checks"}, QUESTIONS, 2)
         call.assert_not_called()
+
+    def test_state_rejects_arbitrary_project_data_before_gateway(self):
+        with patch("mavis.jev.jev_decisions") as call:
+            with self.assertRaisesRegex(ValueError, "redacted summary"):
+                advise(self.service, self.project, "escalation",
+                       {"client_secret": "short"}, QUESTIONS, 0.01)
+        call.assert_not_called()
+
+    def test_receipt_discards_provider_detail(self):
+        gateway = {
+            "success": False, "decision": "unavailable", "failure_class": "transport",
+            "detail": "remote body that must not be repeated locally",
+        }
+        with patch("mavis.jev.jev_decisions", return_value=gateway):
+            result = advise(self.service, self.project, "escalation",
+                            {"summary": "failed checks"}, QUESTIONS, 0.01)
+        self.assertNotIn("remote body", Path(result["receipt"]).read_text())
 
 
 if __name__ == "__main__":
