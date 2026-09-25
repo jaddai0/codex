@@ -135,6 +135,11 @@ class E1GPUAdmissionTests(unittest.TestCase):
             patch.object(e1_gpu, "inventory", side_effect=lambda endpoint, **kwargs: (
                 [{"id": "model-a", "loaded": self.loaded}] if endpoint == self.config.endpoint
                 else [{"id": model, "loaded": True} for model in self.iris])),
+            patch.object(e1_gpu, "_read_lease_record", side_effect=lambda: (
+                {"holder": "codex-mavis", "purpose": self.purpose,
+                 "expires": time.time() + 3600} if self.held else None)),
+            patch.object(e1_gpu, "_iris_game_live", side_effect=lambda: (
+                None if self.unavailable else bool(self.game))),
         ]
         self.patches = [p.start() for p in patchers]
         for patcher in patchers:
@@ -282,11 +287,63 @@ class E1GPUAdmissionTests(unittest.TestCase):
 
     def test_slow_gpu_status_is_bounded_and_fails_closed(self):
         with patch.object(e1_gpu.subprocess, "run", side_effect=subprocess.TimeoutExpired(
-            [str(e1_gpu.LEASE), "status"], 2,
+            [str(e1_gpu.LEASE), "status"], 8,
         )) as run:
             with self.assertRaises(subprocess.TimeoutExpired):
                 RAW_LEASE_COMMAND("status")
-        self.assertEqual(run.call_args.kwargs["timeout"], 2)
+        # gpu-lease status can spend 1 s asking IRIS and 5 s scanning processes;
+        # it measured 3.5 s during a large model load (2026-09-25). Monitoring
+        # does not call it, so this looser bound never sits on the safety path.
+        self.assertEqual(run.call_args.kwargs["timeout"], 8)
+
+    def test_slow_gpu_status_cannot_delay_monitor_game_detection(self):
+        # A blocked monitor must still notice a game within its bound even while
+        # `gpu-lease status` is stuck in its process scan.
+        slow = threading.Event()
+        entered = threading.Event()
+        original_abort = self.abort.side_effect
+        original_command = self.patches[0].side_effect
+
+        def abort(config, state, **kwargs):
+            original_abort(config, state, **kwargs)
+            slow.set()
+
+        def command(*args):
+            if args[0] == "status" and entered.is_set():
+                slow.wait(5)
+            return original_command(*args)
+
+        def hashing():
+            entered.set()
+            self.game = True
+            slow.wait(5)
+
+        self.abort.side_effect = abort
+        self.patches[0].side_effect = command
+        started = time.monotonic()
+        with self.assertRaisesRegex(RuntimeError, "game state is unsafe"):
+            with e1_gpu.admitted_e1_model(self.config, "e1:trial") as heartbeat:
+                heartbeat.monitor_read_only(hashing)
+        self.assertLess(time.monotonic() - started, 1.5)
+        self.abort.assert_called_once()
+        self.assertFalse(self.server)
+
+    def test_monitor_sees_lost_lease_before_the_slow_command_returns(self):
+        heartbeat = e1_gpu._LeaseHeartbeat("e1:trial:abc")
+        with patch.object(e1_gpu, "_lease_command") as slow, \
+                patch.object(e1_gpu, "_read_lease_record", return_value=None):
+            with self.assertRaisesRegex(RuntimeError, "purpose changed"):
+                heartbeat.monitor()
+            slow.assert_not_called()
+
+    def test_monitor_treats_unanswered_iris_as_unsafe(self):
+        heartbeat = e1_gpu._LeaseHeartbeat("e1:trial:abc")
+        with patch.object(e1_gpu, "_read_lease_record", return_value={
+                "holder": "codex-mavis", "purpose": "e1:trial:abc",
+                "expires": time.time() + 3600}), \
+                patch.object(e1_gpu, "_iris_game_live", return_value=None):
+            with self.assertRaisesRegex(RuntimeError, "game state is unsafe"):
+                heartbeat.monitor()
 
     def test_game_during_post_load_hash_stops_exact_idle_server(self):
         gate = threading.Event()

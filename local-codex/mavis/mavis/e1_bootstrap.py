@@ -444,7 +444,13 @@ def _gateway_arguments(
             "package_tree_sha256, checked_file, checked_sha256, source_excerpt} using "
             "local-codex/mavis/mavis/e1_bootstrap.py; e0_cases with one {case, receipt_path, "
             "receipt_sha256, observed_status, cited_evidence} for every mandatory case in "
-            "order; model {model_id, weights_fingerprint, cited_file, cited_sha256, "
+            # The host compares receipt_path against this exact canonical location
+            # (_check_review_inspection). Name it so the reviewer does not cite a
+            # byte-identical per-run copy and get rejected.
+            f"order, where receipt_path is the absolute path "
+            f"{(Path(assignment_path).resolve().parents[2] / 'evaluations/e0').resolve()}/<case>.json, "
+            "not a per-run copy; "
+            "model {model_id, weights_fingerprint, cited_file, cited_sha256, "
             "config_sha256, observed_architecture, observed_quantization_sha256} "
             "citing a weight shard and the actual config.json; compute the "
             "quantization SHA-256 from the actual config value using canonical "

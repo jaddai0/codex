@@ -28,7 +28,7 @@ NETWORK_MODULES = frozenset({"requests", "httpx", "aiohttp", "http.client", "url
 # These functions call only the local oMLX HTTP endpoint. Any new caller or
 # transport must receive a deliberate review here and in the function itself.
 LOCAL_HTTP = {
-    "runtime.py": {"request_json"},
+    "runtime.py": {"request_json", "iris_voice_session_active"},
     "evaluations.py": {"_post_json"},
     "helper_eval.py": {"_completion"},
 }

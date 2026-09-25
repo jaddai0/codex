@@ -1285,6 +1285,20 @@ class E1RunnerTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             self.runner.store._check_comparison(self.runner.store.load("repair"))
 
+    def test_bootstrap_review_prompt_names_the_host_canonical_receipt_path(self):
+        """The emitted task must name the exact path the host check enforces."""
+        self._paired_bootstrap_trials()
+        assignment_path = self.home / "e1/bootstrap/review-assignment.json"
+        packet = read_json(assignment_path)
+        arguments = e1_bootstrap._gateway_arguments(packet, assignment_path, "review-job")
+        canonical = (self.home / "evaluations/e0").resolve()
+        self.assertEqual(
+            (assignment_path.resolve().parents[2] / "evaluations/e0").resolve(), canonical)
+        for case in e1_bootstrap.E0_CASES:
+            self.assertEqual(canonical / f"{case}.json",
+                             (self.home / "evaluations/e0" / f"{case}.json").resolve())
+        self.assertIn(f"{canonical}/<case>.json", arguments["task"])
+
     def test_bootstrap_gateway_status_rejects_forged_or_revoked_acceptance(self):
         self._paired_bootstrap_trials()
         original = e1_bootstrap.harness_job_status("review-job")
