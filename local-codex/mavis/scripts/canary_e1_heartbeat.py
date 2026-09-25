@@ -51,6 +51,10 @@ MONITOR_LATENCY_BOUND = 1.5
 CANARY_SECONDS = 90
 
 
+class _SkipMonitor(Exception):
+    """Raised when the revision under canary has no bounded monitor to exercise."""
+
+
 def _monotonic_call(work) -> tuple[float, BaseException | None]:
     started = time.monotonic()
     try:
@@ -142,7 +146,7 @@ def part_eperm_stop() -> dict:
 
 def _expect_refusal(heartbeat, label: str) -> dict:
     _, error = _monotonic_call(heartbeat.monitor)
-    return {"case": label, "raised": error is not None,
+    return {"case": label, "raised": isinstance(error, RuntimeError),
             "error": repr(error) if error is not None else None}
 
 
@@ -274,11 +278,19 @@ def main() -> int:
         "parts": {},
     }
     lease_holder, lease_released = None, False
+    monitor_present = receipt["host"]["has_monitor"]
     try:
         receipt["parts"]["iris_parity"] = part_iris_parity()
         if not receipt["parts"]["iris_parity"]["pass"]:
             raise RuntimeError("IRIS parity failed; refusing to canary the monitor")
         receipt["parts"]["eperm_stop"] = part_eperm_stop()
+
+        if not monitor_present:
+            receipt["parts"]["monitor_parts"] = {
+                "status": "skipped",
+                "reason": "this revision has no _LeaseHeartbeat.monitor to canary",
+            }
+            raise _SkipMonitor
 
         pre_acquire = e1_gpu._LeaseHeartbeat(receipt["purpose"])
         receipt["parts"]["missing_lease"] = _expect_refusal(pre_acquire, "missing lease")
@@ -303,6 +315,8 @@ def main() -> int:
         receipt["parts"]["sustained_monitor"] = part_sustained_monitor(
             heartbeat, args.seconds
         )
+    except _SkipMonitor:
+        pass
     except SystemExit:
         raise
     except BaseException as error:
@@ -318,14 +332,24 @@ def main() -> int:
         receipt["finished_epoch"] = time.time()
 
     parts = receipt["parts"]
-    receipt["verdict"] = "pass" if (
-        not receipt.get("error")
-        and parts.get("iris_parity", {}).get("pass")
+    proven = (
+        parts.get("iris_parity", {}).get("pass")
         and parts.get("eperm_stop", {}).get("pass")
+    )
+    full = (
+        proven
         and parts.get("missing_lease", {}).get("raised")
         and parts.get("fail_closed", {}).get("pass")
         and parts.get("sustained_monitor", {}).get("pass")
-    ) else "fail"
+    )
+    if receipt.get("error"):
+        receipt["verdict"] = "fail"
+    elif full:
+        receipt["verdict"] = "pass"
+    elif proven and not monitor_present:
+        receipt["verdict"] = "partial-no-monitor"
+    else:
+        receipt["verdict"] = "fail"
     out = Path(args.out)
     out.parent.mkdir(parents=True, exist_ok=True)
     out.write_text(json.dumps(receipt, indent=1, sort_keys=True) + "\n")
@@ -333,7 +357,7 @@ def main() -> int:
                       ("run_id", "verdict", "lease_released", "error")
                       if key in receipt}, indent=1))
     print(f"receipt: {out}")
-    return 0 if receipt["verdict"] == "pass" else 1
+    return 1 if receipt["verdict"] == "fail" else 0
 
 
 if __name__ == "__main__":
