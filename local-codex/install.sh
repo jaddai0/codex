@@ -45,7 +45,40 @@ for relative in sorted(committed):
 PY
 
 cd "$repo_root/codex-rs"
-cargo build --release --bin codex
+if [[ ${MAVIS_REUSE_CORE:-0} == 1 ]]; then
+    python3 - "$repo_root" "$install_share" <<'PY'
+from pathlib import Path
+import hashlib
+import json
+import subprocess
+import sys
+
+source = Path(sys.argv[1]).resolve(strict=True)
+share = Path(sys.argv[2]).resolve(strict=True)
+manifest = json.loads((share / "install-manifest.json").read_text())
+previous = manifest.get("source_revision")
+installed = share / "local-codex-core"
+built = source / "codex-rs/target/release/codex"
+if (manifest.get("schema_version") != "mavis.installed-core/v1"
+        or Path(manifest.get("source_repository", "")).resolve() != source
+        or manifest.get("core_binary") != str(installed)
+        or not isinstance(previous, str)
+        or not installed.is_file() or not built.is_file()):
+    raise SystemExit("Mavis cannot reuse an unbound core binary")
+for binary in (installed, built):
+    with binary.open("rb") as stream:
+        digest = hashlib.file_digest(stream, "sha256").hexdigest()
+    if digest != manifest.get("core_sha256"):
+        raise SystemExit("Mavis reusable core differs from the installed candidate")
+if subprocess.run(
+    ["git", "-C", str(source), "diff", "--quiet", previous, "HEAD", "--", "codex-rs"],
+    check=False,
+).returncode != 0:
+    raise SystemExit("Mavis Rust source changed since the verified core build")
+PY
+else
+    cargo build --release --bin codex
+fi
 
 mkdir -p "$install_bin" "$install_share"
 install -m 0755 target/release/codex "$install_share/local-codex-core"
