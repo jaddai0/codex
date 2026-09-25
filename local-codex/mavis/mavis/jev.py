@@ -7,11 +7,10 @@ import hashlib
 import json
 import math
 from pathlib import Path
-import re
 from typing import Any
 from uuid import uuid4
 
-from .gateway import jev_decisions
+from .gateway import mavis_jev_decisions
 from .storage import write_json
 
 
@@ -19,7 +18,15 @@ PURPOSES = frozenset({
     "evidence_relevance", "tool_selection", "failure_classification",
     "escalation", "memory_category", "completion_suspicion",
 })
-STATE_KEYS = frozenset({"summary", "signals"})
+COUNT_SIGNAL_KEYS = frozenset({
+    "failed_checks", "passed_checks", "retry_count", "candidate_count",
+    "evidence_count", "unresolved_count",
+})
+FLAG_SIGNAL_KEYS = frozenset({
+    "tool_available",
+    "required_checks_complete", "verifier_accepted", "change_detected",
+})
+SIGNAL_KEYS = COUNT_SIGNAL_KEYS | FLAG_SIGNAL_KEYS
 
 
 def _digest(value: Any) -> str:
@@ -28,35 +35,25 @@ def _digest(value: Any) -> str:
 
 
 def advise(service_home: Path, project_root: Path, purpose: str,
-           state: dict[str, Any], questions: dict[str, Any],
+           signals: dict[str, Any],
            estimated_cost_usd: float) -> dict[str, Any]:
     """Keep a local receipt; Jev's answer cannot change permissions or completion."""
     if purpose not in PURPOSES:
         raise ValueError("unknown Jev advisory purpose")
-    if not isinstance(state, dict) or not isinstance(questions, dict) or not questions:
-        raise ValueError("Jev requires a state object and typed questions")
-    if set(state) - STATE_KEYS or not isinstance(state.get("summary"), str):
-        raise ValueError("Jev state allows only a redacted summary and signals")
-    if not 0 < len(state["summary"]) <= 500 or "\n" in state["summary"]:
-        raise ValueError("Jev summary must be one short line")
-    signals = state.get("signals", {})
-    if not isinstance(signals, dict) or len(signals) > 20:
-        raise ValueError("Jev signals must be a small object")
+    if not isinstance(signals, dict) or not signals or len(signals) > 10:
+        raise ValueError("Jev signals must be a nonempty small object")
+    if set(signals) - SIGNAL_KEYS:
+        raise ValueError("Jev signals include an unknown field")
     for key, value in signals.items():
-        if not isinstance(key, str) or not re.fullmatch(r"[a-z][a-z0-9_]{0,40}", key):
-            raise ValueError("Jev signal names must be simple labels")
-        if (not isinstance(value, (str, bool, int, float)) or
-                isinstance(value, float) and not math.isfinite(value) or
-                isinstance(value, str) and (len(value) > 80 or "\n" in value)):
-            raise ValueError("Jev signal values must be short labels or numbers")
+        if ((key in COUNT_SIGNAL_KEYS and
+             (type(value) is not int or not 0 <= value <= 1_000_000)) or
+            (key in FLAG_SIGNAL_KEYS and type(value) is not bool)):
+            raise ValueError("Jev signal values must be bounded counts or flags")
     if (isinstance(estimated_cost_usd, bool) or not isinstance(estimated_cost_usd, (int, float))
             or not math.isfinite(estimated_cost_usd)
             or not 0 < estimated_cost_usd <= 1):
         raise ValueError("Jev estimated cost must be between $0 and $1")
-    if len(json.dumps({"state": state, "questions": questions}, ensure_ascii=False)) > 16000:
-        raise ValueError("Jev request exceeds the bounded evidence packet")
-
-    response = jev_decisions(state, questions, float(estimated_cost_usd))
+    response = mavis_jev_decisions(purpose, signals, float(estimated_cost_usd))
     if not isinstance(response, dict) or not isinstance(response.get("success"), bool):
         raise ValueError("Jev gateway response is malformed")
     if response["success"]:
@@ -91,8 +88,7 @@ def advise(service_home: Path, project_root: Path, purpose: str,
         "binding": False,
         "grants_permission": False,
         "purpose": purpose,
-        "state_sha256": _digest(state),
-        "questions_sha256": _digest(questions),
+        "signals_sha256": _digest(signals),
         "project_root_sha256": _digest(str(project_root.resolve())),
         "estimated_cost_usd": float(estimated_cost_usd),
         "received_at": datetime.now(timezone.utc).isoformat(),

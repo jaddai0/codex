@@ -178,11 +178,11 @@ def harness_job_verify(job_id: str, verifier_job_id: str, report_sha256: str,
     }, timeout)
 
 
-def jev_decisions(state: dict[str, Any], questions: dict[str, Any],
-                  estimated_cost_usd: float, timeout: float = 30.0) -> dict[str, Any]:
-    """Return the gateway's typed decision or its explicit refusal."""
-    return _gateway_tool("jev_decisions", {
-        "state": state,
-        "questions": questions,
+def mavis_jev_decisions(purpose: str, signals: dict[str, Any],
+                        estimated_cost_usd: float, timeout: float = 30.0) -> dict[str, Any]:
+    """Return the gateway's fixed-template decision or explicit refusal."""
+    return _gateway_tool("mavis_jev_decisions", {
+        "purpose": purpose,
+        "signals": signals,
         "estimated_cost_usd": estimated_cost_usd,
     }, timeout, require_success=False)
