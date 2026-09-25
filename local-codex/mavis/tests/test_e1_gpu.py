@@ -224,11 +224,11 @@ class E1GPUAdmissionTests(unittest.TestCase):
 
     def test_slow_gpu_status_is_bounded_and_fails_closed(self):
         with patch.object(e1_gpu.subprocess, "run", side_effect=subprocess.TimeoutExpired(
-            [str(e1_gpu.LEASE), "status"], 0.5,
+            [str(e1_gpu.LEASE), "status"], 8,
         )) as run:
             with self.assertRaises(subprocess.TimeoutExpired):
                 RAW_LEASE_COMMAND("status")
-        self.assertEqual(run.call_args.kwargs["timeout"], 0.5)
+        self.assertEqual(run.call_args.kwargs["timeout"], 8)
 
     def test_game_during_post_load_hash_stops_exact_idle_server(self):
         gate = threading.Event()

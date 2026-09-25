@@ -35,7 +35,7 @@ LEASE_MINUTES = "90"
 
 def _lease_command(*args: str) -> str:
     result = subprocess.run([str(LEASE), *args], capture_output=True, text=True,
-                            timeout=0.5 if args[0] == "status" else 15,
+                            timeout=8 if args[0] == "status" else 15,
                             check=False)
     if result.returncode:
         raise RuntimeError(f"GPU lease {args[0]} failed: {(result.stderr or result.stdout).strip()}")
