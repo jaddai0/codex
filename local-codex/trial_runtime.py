@@ -8,6 +8,7 @@ import json
 import os
 from pathlib import Path
 import re
+import secrets
 import shutil
 import subprocess
 import sys
@@ -150,10 +151,12 @@ def _prepare_trial_locked(
     gateway_env_file: Path | None = None,
     package_manifest: Path | None = None,
     heartbeat_monitor: Callable[[Callable[[], dict]], dict] | None = None,
+    trial_auth: bool = False,
 ) -> Path:
     if binding["profile_source"] == "e0-bootstrap":
-        rebind = lambda: trial_binding(mavis_home, binding["record"]["experiment_id"],
-                                       binding["arm"], binding["case_id"])
+        def rebind() -> dict:
+            return trial_binding(mavis_home, binding["record"]["experiment_id"],
+                                 binding["arm"], binding["case_id"])
         refreshed = heartbeat_monitor(rebind) if heartbeat_monitor is not None else rebind()
         if (refreshed["profile_source"] != "e0-bootstrap"
                 or refreshed["profile"]["_source_sha256"] != binding["profile"]["_source_sha256"]):
@@ -237,6 +240,7 @@ def _prepare_trial_locked(
             gateway_env_file=gateway_env_file,
             package_manifest=package_manifest,
             package_hash=package_hash,
+            trial_auth=trial_auth,
         )
         marker.unlink()
         return result
@@ -298,6 +302,7 @@ def _write_trial_home(
     gateway_env_file: Path | None,
     package_manifest: Path | None,
     package_hash: str | None,
+    trial_auth: bool,
 ) -> Path:
     record = binding["record"]
     arm, case_id = binding["arm"], binding["case_id"]
@@ -312,6 +317,7 @@ def _write_trial_home(
         gateway_root=gateway_root,
         gateway_env_file=gateway_env_file,
         accepted_instructions_path=instructions_path,
+        trial_auth=trial_auth,
     )
     ensure_persona(runtime_home, share / "persona.toml")
     trial_id = f"{record['experiment_id']}-{arm}-{case_id}"
@@ -373,6 +379,7 @@ def _write_trial_home(
         else None,
         "selected_model": selected,
         "model_provider": "omlx",
+        "trial_auth": trial_auth,
         "model_endpoint": local_base_url(base_url),
         "config_path": str((runtime_home / "config.toml").resolve()),
         "config_sha256": sha256_file(runtime_home / "config.toml"),
@@ -391,12 +398,14 @@ def _write_trial_home(
     return receipt_path
 
 
-def validate_trial_receipt(receipt: dict) -> None:
+def validate_trial_receipt(receipt: dict, *, trial_api_key: str | None = None) -> None:
     if (
         receipt.get("schema_version") != "mavis.e1-trial-launch/v1"
         or receipt.get("state") != "prepared"
     ):
         raise ValueError("E1 trial receipt is not prepared")
+    if receipt.get("trial_auth", False) and not trial_api_key:
+        raise ValueError("E1 authenticated trial key is unavailable")
     home = Path(receipt["mavis_home"])
     binding = trial_binding(
         home, receipt["experiment_id"], receipt["arm"], receipt["case_id"]
@@ -453,12 +462,26 @@ def validate_trial_receipt(receipt: dict) -> None:
         path_key = "core_binary" if name == "core" else f"{name}_path"
         if sha256_file(Path(receipt[path_key])) != receipt[f"{name}_sha256"]:
             raise ValueError(f"E1 trial {name} changed after preparation")
+    if receipt.get("trial_auth", False):
+        config = tomllib.loads(Path(receipt["config_path"]).read_text(encoding="utf-8"))
+        if (config.get("model_providers", {}).get("omlx", {}).get("env_key")
+                != "MAVIS_E0_TRIAL_API_KEY"
+                or "MAVIS_E0_TRIAL_API_KEY" not in
+                config.get("shell_environment_policy", {}).get("exclude", [])):
+            raise ValueError("E1 trial authentication is not isolated from shell tools")
+        if (receipt.get("gateway_root") and
+                config.get("mcp_servers", {}).get("model-gateway", {})
+                .get("env", {}).get("MAVIS_E0_TRIAL_API_KEY") != ""):
+            raise ValueError("E1 gateway environment can inherit the trial key")
     if binding["profile_source"] == "e0-bootstrap":
         config = tomllib.loads(Path(receipt["config_path"]).read_text(encoding="utf-8"))
         endpoint = config["model_providers"]["omlx"]["base_url"]
         if receipt.get("model_endpoint") != endpoint or local_base_url(endpoint) != endpoint:
             raise ValueError("E1 bootstrap model endpoint changed")
-        model_path = _inventory_model(inventory(endpoint), receipt["selected_model"]).resolve(strict=True)
+        model_path = _inventory_model(
+            inventory(endpoint, **({"api_key": trial_api_key} if trial_api_key else {})),
+            receipt["selected_model"],
+        ).resolve(strict=True)
         if str(model_path) != profile["model_artifacts"]["model_path"]:
             raise ValueError("E1 bootstrap oMLX inventory model_path changed before launch")
     if receipt.get("core_provenance") == "installed-package" and not receipt.get(
@@ -579,6 +602,7 @@ def run_trial(experiment_id: str, arm: str, case_id: str, task: str) -> Path:
         omlx_binary=Path(
             os.environ.get("MAVIS_OMLX_BIN", Path.home() / ".venvs/omlx-dev/bin/omlx")
         ),
+        api_key=secrets.token_urlsafe(48),
     )
     runtime_home = binding["root"] / "runtime" / arm / case_id
     receipt_path = binding["root"] / "trials" / arm / f"{case_id}.json"
@@ -606,17 +630,19 @@ def run_trial(experiment_id: str, arm: str, case_id: str, task: str) -> Path:
             ):
                 raise ValueError("E1 trial inputs changed during runtime admission")
             binding = refreshed
-            receipt = _prepare_trial_locked(
-                binding,
-                mavis_home=mavis_home,
-                share=share,
-                core_binary=core_binary,
-                base_url=endpoint,
-                records=inventory(endpoint),
-                gateway_root=gateway_root,
-                gateway_env_file=gateway_env_file,
-                package_manifest=package_manifest,
-                heartbeat_monitor=heartbeat.monitor_read_only,
+            receipt = heartbeat.monitor_read_only(
+                lambda: _prepare_trial_locked(
+                    binding,
+                    mavis_home=mavis_home,
+                    share=share,
+                    core_binary=core_binary,
+                    base_url=endpoint,
+                    records=inventory(endpoint, api_key=runtime.api_key, timeout=0.5),
+                    gateway_root=gateway_root,
+                    gateway_env_file=gateway_env_file,
+                    package_manifest=package_manifest,
+                    trial_auth=True,
+                )
             )
             argv = [
                 str(core_binary),
@@ -628,7 +654,11 @@ def run_trial(experiment_id: str, arm: str, case_id: str, task: str) -> Path:
                 "--",
                 task,
             ]
-            if launch_trial(receipt, argv, lease_held=True, heartbeat=heartbeat) != 0:
+            if launch_trial(
+                receipt, argv, lease_held=True, heartbeat=heartbeat,
+                trial_api_key=runtime.api_key,
+                monitor_blocking=heartbeat.monitor_read_only,
+            ) != 0:
                 raise RuntimeError(
                     f"E1 trial did not produce a matching effective-config observation: {receipt}"
                 )

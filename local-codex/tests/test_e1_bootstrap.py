@@ -2,12 +2,10 @@
 """First-profile E1 trials require current installed E0 and independent review."""
 
 import copy
-import json
 from pathlib import Path
 import shutil
 import subprocess
 import sys
-import tempfile
 import unittest
 from unittest.mock import patch
 
@@ -139,7 +137,7 @@ class E1BootstrapTests(unittest.TestCase):
             self.home, "review-job", starter=start_review
         )
         write_json(self.review, {
-            "schema_version": "mavis.e1-bootstrap-review/v2", "verdict": "accepted",
+            "schema_version": "mavis.e1-bootstrap-review/v3", "verdict": "accepted",
             "inspection": bootstrap_inspection(self.home, self.assignment),
             "e0_summary_sha256": sha256_file(self.summary),
             "baseline_sha256": baseline["sha256"],

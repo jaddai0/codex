@@ -9,11 +9,13 @@ import subprocess
 import threading
 import time
 from typing import Any, Callable, Iterator
+from urllib.error import HTTPError
 from urllib.parse import quote
 from uuid import uuid4
 
 from .runtime import (
     RuntimeConfig,
+    clear_trial_auth_settings,
     endpoint_alive,
     inventory,
     load_model,
@@ -35,7 +37,7 @@ LEASE_MINUTES = "90"
 
 def _lease_command(*args: str) -> str:
     result = subprocess.run([str(LEASE), *args], capture_output=True, text=True,
-                            timeout=8 if args[0] == "status" else 15,
+                            timeout=2 if args[0] == "status" else 15,
                             check=False)
     if result.returncode:
         raise RuntimeError(f"GPU lease {args[0]} failed: {(result.stderr or result.stdout).strip()}")
@@ -126,7 +128,10 @@ class _LeaseHeartbeat:
 
 
 def _mavis_status(config: RuntimeConfig) -> dict[str, Any]:
-    status = request_json(config.endpoint, "/api/status", timeout=1)
+    status = request_json(
+        config.endpoint, "/api/status", timeout=1,
+        headers={"Authorization": f"Bearer {config.api_key}"},
+    )
     if (not isinstance(status, dict) or status.get("status") != "ok"
             or any(type(status.get(key)) is not int or status[key] < 0 for key in
                    ("active_requests", "waiting_requests", "models_loading"))):
@@ -142,8 +147,14 @@ def _idle_mavis_server(config: RuntimeConfig) -> None:
 
 
 def _abort_trial(config: RuntimeConfig, state: dict[str, Any], *,
-                 own_loading: bool = False) -> None:
-    if endpoint_alive(config.endpoint, timeout=1):
+                 own_loading: bool = False, emergency: bool = False) -> None:
+    # The server belongs to this trial's unreaped process group. An unsafe
+    # lease or IRIS handoff must stop that exact group without waiting for an
+    # HTTP request that may remain active while the model is loading.
+    if emergency:
+        stop_trial_server(config, state, timeout=1)
+        return
+    if endpoint_alive(config.endpoint, timeout=1, api_key=config.api_key):
         deadline = time.monotonic() + 2.5
         first_zero: float | None = None
         while True:
@@ -166,11 +177,27 @@ def _abort_trial(config: RuntimeConfig, state: dict[str, Any], *,
     stop_trial_server(config, state)
 
 
+def _prove_private_server(config: RuntimeConfig) -> None:
+    """Reject a trial endpoint that accepts an unauthenticated request."""
+    if not config.api_key:
+        raise RuntimeError("E1 trial needs a private server key")
+    try:
+        request_json(config.endpoint, "/api/status", timeout=0.5)
+    except HTTPError as error:
+        error.close()
+        if error.code != 401:
+            raise RuntimeError("E1 unauthenticated probe returned an unexpected status") from error
+    else:
+        raise RuntimeError("E1 trial server accepted a request without its key")
+    _mavis_status(config)
+
+
 def _cleanup_failure(config: RuntimeConfig, purpose: str, error: BaseException,
                      *, gpu_work_stopped: bool, lease_released: bool) -> Path:
     def observed(endpoint: str) -> object:
         try:
-            return inventory(endpoint)
+            return inventory(endpoint, **({"api_key": config.api_key}
+                                         if endpoint == config.endpoint else {}))
         except BaseException as failure:
             return {"inventory_error": str(failure)}
 
@@ -205,14 +232,52 @@ def _monitored_load(config: RuntimeConfig, heartbeat: _LeaseHeartbeat,
         try:
             heartbeat(force=True)
         except BaseException:
-            _abort_trial(config, server_state, own_loading=True)
+            _abort_trial(config, server_state, emergency=True)
             stopped["yes"] = True
             done.wait(10)
             raise
     try:
         heartbeat(force=True)
     except BaseException:
-        _abort_trial(config, server_state)
+        _abort_trial(config, server_state, emergency=True)
+        stopped["yes"] = True
+        raise
+    if failures:
+        raise failures[0]
+
+
+def _monitored_unload(config: RuntimeConfig, heartbeat: _LeaseHeartbeat,
+                      server_state: dict[str, Any], stopped: dict[str, bool]) -> None:
+    """Keep watching admission while oMLX performs a blocking unload."""
+    done = threading.Event()
+    failures: list[BaseException] = []
+
+    def worker() -> None:
+        try:
+            request_json(
+                config.endpoint,
+                f"/v1/models/{quote(config.model, safe='')}/unload",
+                method="POST", timeout=180,
+                headers={"Authorization": f"Bearer {config.api_key}"},
+            )
+        except BaseException as error:
+            failures.append(error)
+        finally:
+            done.set()
+
+    threading.Thread(target=worker, name="mavis-e1-unload", daemon=True).start()
+    while not done.wait(0.2):
+        try:
+            heartbeat(force=True)
+        except BaseException:
+            _abort_trial(config, server_state, emergency=True)
+            stopped["yes"] = True
+            done.wait(10)
+            raise
+    try:
+        heartbeat(force=True)
+    except BaseException:
+        _abort_trial(config, server_state, emergency=True)
         stopped["yes"] = True
         raise
     if failures:
@@ -222,6 +287,8 @@ def _monitored_load(config: RuntimeConfig, heartbeat: _LeaseHeartbeat,
 @contextmanager
 def admitted_e1_model(config: RuntimeConfig, purpose: str) -> Iterator[Callable[[], None]]:
     """Load only on a new trial-owned server; keep IRIS's model untouched."""
+    if not config.api_key:
+        raise ValueError("E1 trial requires a fresh private server key")
     config = replace(config, allow_concurrent_local=True, idle_seconds=900)
     purpose = f"{purpose}:{uuid4().hex}"
     _safe_status(_lease_command("status"))
@@ -232,10 +299,11 @@ def admitted_e1_model(config: RuntimeConfig, purpose: str) -> Iterator[Callable[
     stopped = {"yes": False}
     load_attempted = False
     unsafe_startup = False
+    auth_cleared = False
     primary_error: BaseException | None = None
     try:
         heartbeat(force=True)
-        iris_models = loaded_generation_models(config.iris_endpoint)
+        iris_models = loaded_generation_models(config.iris_endpoint, timeout=0.5)
         if not iris_models:
             raise RuntimeError("IRIS has no loaded generation model to preserve")
         require_idle_iris_handoff(config, expected_models=iris_models)
@@ -246,26 +314,37 @@ def admitted_e1_model(config: RuntimeConfig, purpose: str) -> Iterator[Callable[
         reservation = reserve_empty_mavis_port(config)
         reservation.close()
         try:
-            server_state = start_server(config, require_new=True)
+            server_state = start_server(
+                config, require_new=True, heartbeat=lambda: heartbeat(force=True)
+            )
         except BaseException as error:
             unsafe_startup = bool(getattr(error, "unsafe_gpu_work", False))
             raise
         if read_json(config.state_path) != server_state:
             raise RuntimeError("Mavis trial launch record changed during startup")
-        if not any(row.get("id") == config.model for row in inventory(config.endpoint)):
+        heartbeat(force=True)
+        _prove_private_server(config)
+        heartbeat(force=True)
+        if not any(row.get("id") == config.model for row in
+                   inventory(config.endpoint, api_key=config.api_key,
+                             timeout=0.5)):
             raise RuntimeError("selected Mavis model is absent from the new server")
-        if loaded_generation_models(config.endpoint):
+        heartbeat(force=True)
+        if loaded_generation_models(config.endpoint, api_key=config.api_key,
+                                    timeout=0.5):
             raise RuntimeError("new Mavis server already has a generation model")
+        heartbeat(force=True)
         _idle_mavis_server(config)
         heartbeat(force=True)
         load_attempted = True
         _monitored_load(config, heartbeat, server_state, stopped)
-        if loaded_generation_models(config.iris_endpoint) != iris_models:
+        if loaded_generation_models(config.iris_endpoint, timeout=0.5) != iris_models:
             raise RuntimeError("IRIS changed while Mavis loaded")
+        heartbeat(force=True)
         def abort_idle_server() -> None:
             if stopped["yes"]:
                 return
-            _abort_trial(config, server_state)
+            _abort_trial(config, server_state, emergency=True)
             stopped["yes"] = True
         heartbeat.abort_idle_server = abort_idle_server
         yield heartbeat
@@ -280,57 +359,104 @@ def admitted_e1_model(config: RuntimeConfig, purpose: str) -> Iterator[Callable[
         try:
             _safe_status(_lease_command("status"), purpose=purpose)
             if server_state is not None and not stopped["yes"]:
+                heartbeat(force=True)
                 if read_json(config.state_path) != server_state:
                     raise RuntimeError("Mavis trial launch record changed before cleanup")
-                if load_attempted and endpoint_alive(config.endpoint):
+                if load_attempted and endpoint_alive(config.endpoint, api_key=config.api_key,
+                                                     timeout=0.5):
+                    heartbeat(force=True)
                     status = _mavis_status(config)
+                    heartbeat(force=True)
                     if status["models_loading"]:
                         _abort_trial(config, server_state, own_loading=True)
                         stopped["yes"] = True
                     if not stopped["yes"]:
-                        loaded = loaded_generation_models(config.endpoint)
+                        loaded = loaded_generation_models(config.endpoint, api_key=config.api_key,
+                                                          timeout=0.5)
+                        heartbeat(force=True)
                         if loaded:
                             if loaded != [config.model]:
                                 raise RuntimeError("Mavis generation inventory changed during E1")
                             _idle_mavis_server(config)
                             for attempt in range(2):
                                 try:
-                                    request_json(config.endpoint,
-                                                 f"/v1/models/{quote(config.model, safe='')}/unload",
-                                                 method="POST", timeout=180)
+                                    _monitored_unload(config, heartbeat, server_state,
+                                                      stopped)
                                 except (OSError, RuntimeError) as error:
-                                    if not loaded_generation_models(config.endpoint):
+                                    if stopped["yes"]:
+                                        raise
+                                    if not loaded_generation_models(config.endpoint, api_key=config.api_key,
+                                                                    timeout=0.5):
                                         break
                                     if attempt == 1:
                                         raise RuntimeError("Mavis E1 model unload failed twice") from error
-                                if not loaded_generation_models(config.endpoint):
+                                if not loaded_generation_models(config.endpoint, api_key=config.api_key,
+                                                                timeout=0.5):
                                     break
                             else:
                                 raise RuntimeError("Mavis model remained loaded after E1 cleanup")
                 if not stopped["yes"]:
+                    park_failure: list[BaseException] = []
+                    def park_heartbeat() -> bool:
+                        try:
+                            heartbeat(force=True)
+                        except BaseException as error:
+                            park_failure.append(error)
+                            return False
+                        return True
                     reservation = park_mavis_server(
                         config, expected_pid=int(server_state["pid"]),
-                        expected_state=server_state,
+                        expected_state=server_state, heartbeat=park_heartbeat,
                     )
-                    reservation.close()
-                    if endpoint_alive(config.endpoint):
+                    stopped["yes"] = True
+                    try:
+                        clear_trial_auth_settings(config)
+                        auth_cleared = True
+                    finally:
+                        reservation.close()
+                    if park_failure:
+                        raise park_failure[0]
+                    if endpoint_alive(config.endpoint, api_key=config.api_key,
+                                      timeout=0.5):
                         raise RuntimeError("Mavis server remained live after E1 cleanup")
             gpu_stopped = not unsafe_startup
-            if iris_models is not None and loaded_generation_models(config.iris_endpoint) != iris_models:
+            if iris_models is not None and loaded_generation_models(
+                config.iris_endpoint, timeout=0.5,
+            ) != iris_models:
                 raise RuntimeError("IRIS lost its original generation model during E1")
         except BaseException as error:
             cleanup_error = error
+            gpu_stopped = gpu_stopped or stopped["yes"]
             if server_state is not None and not stopped["yes"]:
                 try:
-                    _abort_trial(config, server_state, own_loading=load_attempted and
-                                 endpoint_alive(config.endpoint) and
-                                 _mavis_status(config)["models_loading"] > 0)
+                    emergency = (primary_error is not None or "GPU lease" in str(error)
+                                 or "IRIS game state" in str(error))
+                    _abort_trial(
+                        config, server_state,
+                        emergency=emergency,
+                        own_loading=(not emergency and load_attempted
+                                     and endpoint_alive(config.endpoint, api_key=config.api_key,
+                                                        timeout=0.5)
+                                     and _mavis_status(config)["models_loading"] > 0),
+                    )
                     stopped["yes"] = True
                     gpu_stopped = True
                 except BaseException as stop_error:
                     cleanup_error = RuntimeError(f"{error}; trial server abort failed: {stop_error}")
         finally:
             if gpu_stopped:
+                try:
+                    if not auth_cleared:
+                        reservation = reserve_empty_mavis_port(config)
+                        try:
+                            clear_trial_auth_settings(config)
+                            auth_cleared = True
+                        finally:
+                            reservation.close()
+                except BaseException as error:
+                    cleanup_error = error if cleanup_error is None else RuntimeError(
+                        f"{cleanup_error}; trial authentication cleanup failed: {error}"
+                    )
                 try:
                     _owned_status(_lease_command("status"), purpose)
                     _lease_command("release", HOLDER)

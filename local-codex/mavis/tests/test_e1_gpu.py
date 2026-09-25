@@ -1,14 +1,19 @@
 """No-GPU fault checks for installed E1 shared GPU admission."""
 
 from pathlib import Path
+from dataclasses import replace
+import os
 import subprocess
 import tempfile
 import threading
 import time
 import unittest
+import io
 from unittest.mock import Mock, patch
+from urllib.error import HTTPError
 
 from mavis import e1_gpu
+from mavis import runtime
 from mavis.runtime import RuntimeConfig
 from mavis.storage import read_json
 
@@ -19,7 +24,8 @@ class E1GPUAdmissionTests(unittest.TestCase):
     def setUp(self):
         self.temp = tempfile.TemporaryDirectory()
         self.addCleanup(self.temp.cleanup)
-        self.config = RuntimeConfig(home=Path(self.temp.name), model="model-a")
+        self.config = RuntimeConfig(home=Path(self.temp.name), model="model-a",
+                                    api_key="fixture-private-key")
         self.state = {"pid": 1234, "command": ["trial-omlx"]}
         self.commands = []
         self.held = False
@@ -74,6 +80,9 @@ class E1GPUAdmissionTests(unittest.TestCase):
 
         def request(endpoint, path, **kwargs):
             if path == "/api/status":
+                if endpoint == self.config.endpoint and not kwargs.get("headers"):
+                    raise HTTPError(endpoint, 401, "authentication required", None,
+                                    io.BytesIO())
                 return {"status": "ok", "active_requests": self.active_requests,
                         "waiting_requests": 0, "models_loading": self.models_loading}
             self.assertEqual(path, "/v1/models/model-a/unload")
@@ -83,21 +92,25 @@ class E1GPUAdmissionTests(unittest.TestCase):
             self.loaded = False
             return {}
 
-        def start(config, *, require_new):
+        def start(config, *, require_new, heartbeat):
             self.assertTrue(require_new)
+            self.assertEqual(config.api_key, "fixture-private-key")
             self.assertFalse(self.server)
+            heartbeat()
             self.server = True
+            heartbeat()
             return self.state
 
-        def park(config, *, expected_pid, expected_state):
+        def park(config, *, expected_pid, expected_state, heartbeat):
             self.assertEqual(expected_pid, 1234)
             self.assertEqual(expected_state, self.state)
             self.assertTrue(self.server)
+            self.assertTrue(heartbeat())
             self.server = False
             self.loaded = False
             return Mock()
 
-        def abort(config, state):
+        def abort(config, state, **kwargs):
             self.assertEqual(state, self.state)
             if self.fail_abort:
                 raise RuntimeError("trial abort failed")
@@ -119,7 +132,7 @@ class E1GPUAdmissionTests(unittest.TestCase):
             patch.object(e1_gpu, "stop_trial_server", side_effect=abort),
             patch.object(e1_gpu, "load_model", side_effect=load),
             patch.object(e1_gpu, "request_json", side_effect=request),
-            patch.object(e1_gpu, "inventory", side_effect=lambda endpoint: (
+            patch.object(e1_gpu, "inventory", side_effect=lambda endpoint, **kwargs: (
                 [{"id": "model-a", "loaded": self.loaded}] if endpoint == self.config.endpoint
                 else [{"id": model, "loaded": True} for model in self.iris])),
         ]
@@ -199,8 +212,53 @@ class E1GPUAdmissionTests(unittest.TestCase):
                 pass
         self.abort.assert_called_once_with(self.config.__class__(
             **{**self.config.__dict__, "allow_concurrent_local": True, "idle_seconds": 900}
-        ), self.state)
+        ), self.state, timeout=1)
         self.assertFalse(self.server)
+        self.assertFalse(self.held)
+
+    def test_game_during_server_startup_stops_before_model_load(self):
+        def start(config, *, require_new, heartbeat):
+            self.server = True
+            self.game = True
+            try:
+                heartbeat()
+            finally:
+                self.server = False  # start_server cleans up its exact child
+
+        self.start.side_effect = start
+        with self.assertRaisesRegex(RuntimeError, "game state is unsafe"):
+            with e1_gpu.admitted_e1_model(self.config, "e1:trial"):
+                pass
+        self.patches[9].assert_not_called()
+        self.assertFalse(self.server)
+        self.assertFalse(self.held)
+
+    def test_real_server_startup_uses_key_and_reaps_its_group_on_game(self):
+        binary = Path(self.temp.name) / "harmless-server"
+        binary.write_text("#!/bin/sh\nsleep 30\n")
+        binary.chmod(0o700)
+        self.config = replace(self.config, omlx_binary=binary)
+        spawned: list[int] = []
+
+        def start(config, *, require_new, heartbeat):
+            def game_heartbeat():
+                if config.state_path.is_file():
+                    spawned.append(runtime.read_json(config.state_path)["pid"])
+                    self.game = True
+                heartbeat()
+            return runtime.start_server(config, require_new=require_new,
+                                        heartbeat=game_heartbeat)
+
+        self.start.side_effect = start
+        with (patch.object(runtime, "endpoint_alive", return_value=False),
+              patch.object(runtime, "port_in_use", return_value=False),
+              self.assertRaisesRegex(RuntimeError, "game state is unsafe")):
+            with e1_gpu.admitted_e1_model(self.config, "e1:trial"):
+                pass
+        self.assertTrue(spawned)
+        self.assertFalse(self.config.state_path.exists())
+        with self.assertRaises(ProcessLookupError):
+            os.kill(spawned[0], 0)
         self.assertFalse(self.held)
 
     def test_live_trial_checks_game_within_one_second_after_prior_heartbeat(self):
@@ -224,19 +282,19 @@ class E1GPUAdmissionTests(unittest.TestCase):
 
     def test_slow_gpu_status_is_bounded_and_fails_closed(self):
         with patch.object(e1_gpu.subprocess, "run", side_effect=subprocess.TimeoutExpired(
-            [str(e1_gpu.LEASE), "status"], 8,
+            [str(e1_gpu.LEASE), "status"], 2,
         )) as run:
             with self.assertRaises(subprocess.TimeoutExpired):
                 RAW_LEASE_COMMAND("status")
-        self.assertEqual(run.call_args.kwargs["timeout"], 8)
+        self.assertEqual(run.call_args.kwargs["timeout"], 2)
 
     def test_game_during_post_load_hash_stops_exact_idle_server(self):
         gate = threading.Event()
         entered = threading.Event()
         original_abort = self.abort.side_effect
 
-        def abort(config, state):
-            original_abort(config, state)
+        def abort(config, state, **kwargs):
+            original_abort(config, state, **kwargs)
             gate.set()
 
         def hashing():
@@ -262,8 +320,8 @@ class E1GPUAdmissionTests(unittest.TestCase):
         original_abort = self.abort.side_effect
         original_command = self.patches[0].side_effect
 
-        def abort(config, state):
-            original_abort(config, state)
+        def abort(config, state, **kwargs):
+            original_abort(config, state, **kwargs)
             gate.set()
 
         def command(*args):
@@ -309,7 +367,7 @@ class E1GPUAdmissionTests(unittest.TestCase):
         self.assertEqual(len(receipts), 1)
         self.assertFalse(read_json(receipts[0])["gpu_work_stopped"])
 
-    def test_native_request_drains_after_disconnect_before_server_stop(self):
+    def test_game_stops_exact_trial_without_waiting_for_active_request(self):
         original_request = self.patches[10].side_effect
         observed = {"active": 0}
 
@@ -322,9 +380,59 @@ class E1GPUAdmissionTests(unittest.TestCase):
         self.patches[10].side_effect = request
         with self.assertRaisesRegex(RuntimeError, "game state is unsafe"):
             with e1_gpu.admitted_e1_model(self.config, "e1:trial"):
+                self.active_requests = 1
                 self.game = True
-        self.assertGreaterEqual(observed["active"], 2)
+        self.assertEqual(observed["active"], 0)
         self.abort.assert_called_once()
+        self.assertFalse(self.server)
+        self.assertFalse(self.held)
+
+    def test_game_during_blocking_unload_stops_private_trial(self):
+        unload_gate = threading.Event()
+        entered = threading.Event()
+        original_request = self.patches[10].side_effect
+        original_abort = self.abort.side_effect
+
+        def request(endpoint, path, **kwargs):
+            if path.endswith("/unload"):
+                self.assertEqual(kwargs["headers"]["Authorization"],
+                                 "Bearer fixture-private-key")
+                entered.set()
+                self.game = True
+                unload_gate.wait(5)
+                return {}
+            return original_request(endpoint, path, **kwargs)
+
+        def abort(config, state, **kwargs):
+            original_abort(config, state, **kwargs)
+            unload_gate.set()
+
+        self.patches[10].side_effect = request
+        self.abort.side_effect = abort
+        started = time.monotonic()
+        with self.assertRaisesRegex(RuntimeError, "game state is unsafe"):
+            with e1_gpu.admitted_e1_model(self.config, "e1:trial"):
+                pass
+        self.assertTrue(entered.is_set())
+        self.assertLess(time.monotonic() - started, 1.5)
+        self.abort.assert_called_once()
+        self.assertFalse(self.server)
+        self.assertFalse(self.held)
+
+    def test_game_during_parking_triggers_exact_group_stop(self):
+        original_abort = self.abort.side_effect
+
+        def park(config, *, expected_pid, expected_state, heartbeat):
+            self.assertEqual(expected_pid, 1234)
+            self.game = True
+            self.assertFalse(heartbeat())
+            original_abort(config, expected_state, timeout=1)
+            return Mock()
+
+        self.park.side_effect = park
+        with self.assertRaisesRegex(RuntimeError, "game state is unsafe"):
+            with e1_gpu.admitted_e1_model(self.config, "e1:trial"):
+                pass
         self.assertFalse(self.server)
         self.assertFalse(self.held)
 

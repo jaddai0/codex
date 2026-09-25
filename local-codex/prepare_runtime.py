@@ -420,12 +420,17 @@ supports_standalone_web_search = false
             "\n[mcp_servers.model-gateway]\n"
             f"command = {json.dumps(str(gateway_script))}\n"
         )
+        if gateway_env_file is not None or trial_auth:
+            profile += "\n[mcp_servers.model-gateway.env]\n"
+            if trial_auth:
+                # The native provider needs the trial key, but this external
+                # helper has no reason to inherit it.
+                profile += 'MAVIS_E0_TRIAL_API_KEY = ""\n'
         if gateway_env_file is not None:
             env_file = gateway_env_file.resolve(strict=True)
             if not env_file.is_file():
                 raise ValueError("gateway environment path must be a regular file")
             profile += (
-                "\n[mcp_servers.model-gateway.env]\n"
                 f"MODEL_GATEWAY_ENV_FILE = {json.dumps(str(env_file))}\n"
             )
     memory_enabled = os.environ.get("MAVIS_MEMORY_MCP_ENABLED", "1").lower() not in {

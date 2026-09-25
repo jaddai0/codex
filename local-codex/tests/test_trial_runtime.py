@@ -195,6 +195,44 @@ class TrialRuntimeTests(unittest.TestCase):
                 trial_runtime.validate_trial_receipt(receipt)
         self.assertEqual(read_json(path)["state"], "prepared")
 
+    def test_private_trial_key_reaches_only_native_provider_environment(self):
+        self.core.write_text(
+            '#!/bin/sh\n[ "$MAVIS_E0_TRIAL_API_KEY" = "test-secret" ] || exit 21\nexit 0\n'
+        )
+        gateway = self.fixture.root / "gateway"
+        (gateway / "bin").mkdir(parents=True)
+        gateway_launcher = gateway / "bin/mcp-server.sh"
+        gateway_launcher.write_text("#!/bin/sh\nexit 0\n")
+        gateway_launcher.chmod(0o700)
+        binding = self._binding("candidate")
+        path = trial_runtime._prepare_trial_locked(
+            binding, mavis_home=self.fixture.home, share=self.share,
+            core_binary=self.core, base_url="http://127.0.0.1:8001/v1",
+            records=self.records, trial_auth=True, gateway_root=gateway,
+        )
+        receipt = read_json(path)
+        config = Path(receipt["config_path"]).read_text()
+        self.assertTrue(receipt["trial_auth"])
+        self.assertIn('env_key = "MAVIS_E0_TRIAL_API_KEY"', config)
+        self.assertIn('exclude = ["MAVIS_E0_TRIAL_API_KEY"]', config)
+        self.assertIn('MAVIS_E0_TRIAL_API_KEY = ""', config)
+        self.assertNotIn("test-secret", path.read_text())
+        monitored = []
+        def monitor(work):
+            monitored.append("checked")
+            return work()
+        with patch.object(trial_runtime, "accepted_main_profile", return_value=self.profile):
+            with self.assertRaisesRegex(ValueError, "key is unavailable"):
+                trial_runtime.validate_trial_receipt(receipt)
+            trial_runtime.validate_trial_receipt(receipt, trial_api_key="test-secret")
+            self.assertEqual(
+                launch_trial(path, receipt["core_argv"], trial_api_key="test-secret",
+                             monitor_blocking=monitor), 2
+            )
+        self.assertEqual(read_json(path)["core_exit_code"], 0)
+        self.assertGreaterEqual(len(monitored), 4)
+        self.assertNotIn("test-secret", path.read_text())
+
     def test_stub_core_cannot_claim_effective_configuration(self):
         binding = self._binding("candidate")
         path = trial_runtime.prepare_trial(
@@ -230,7 +268,7 @@ class TrialRuntimeTests(unittest.TestCase):
         def heartbeat():
             nonlocal calls
             calls += 1
-            if calls >= 2:
+            if calls >= 4:
                 raise RuntimeError("GPU lease was lost")
 
         with patch.object(trial_runtime, "accepted_main_profile", return_value=self.profile):

@@ -365,24 +365,36 @@ def _launch_unlocked(receipt_path: Path | None, argv: list[str]) -> int:
 def launch_trial(
     receipt_path: Path, argv: list[str], *, lease_held: bool = False,
     heartbeat: Callable[[], None] | None = None,
+    trial_api_key: str | None = None,
+    monitor_blocking: Callable[[Callable[[], object]], object] | None = None,
 ) -> int:
     """Run a frozen E1 arm; process exit alone never establishes trial success."""
     if not lease_held:
         receipt = json.loads(receipt_path.read_text(encoding="utf-8"))
         with generation_lease(Path(receipt["mavis_home"]), purpose="e1-trial"):
-            return _launch_trial_unlocked(receipt_path, argv, heartbeat=heartbeat)
-    return _launch_trial_unlocked(receipt_path, argv, heartbeat=heartbeat)
+            return _launch_trial_unlocked(receipt_path, argv, heartbeat=heartbeat,
+                                          trial_api_key=trial_api_key,
+                                          monitor_blocking=monitor_blocking)
+    return _launch_trial_unlocked(receipt_path, argv, heartbeat=heartbeat,
+                                  trial_api_key=trial_api_key,
+                                  monitor_blocking=monitor_blocking)
 
 
 def _launch_trial_unlocked(receipt_path: Path, argv: list[str], *,
-                           heartbeat: Callable[[], None] | None = None) -> int:
+                           heartbeat: Callable[[], None] | None = None,
+                           trial_api_key: str | None = None,
+                           monitor_blocking: Callable[[Callable[[], object]], object] | None = None) -> int:
     with TrialSignalGuard() as guard:
-        return _launch_trial_guarded(receipt_path, argv, guard, heartbeat=heartbeat)
+        return _launch_trial_guarded(receipt_path, argv, guard, heartbeat=heartbeat,
+                                     trial_api_key=trial_api_key,
+                                     monitor_blocking=monitor_blocking)
 
 
 def _launch_trial_guarded(
     receipt_path: Path, argv: list[str], guard: TrialSignalGuard, *,
     heartbeat: Callable[[], None] | None = None,
+    trial_api_key: str | None = None,
+    monitor_blocking: Callable[[Callable[[], object]], object] | None = None,
 ) -> int:
     from trial_runtime import validate_trial_receipt
 
@@ -390,7 +402,23 @@ def _launch_trial_guarded(
         raise ValueError("E1 core command is required")
     check_profile_cli_arguments(argv[1:])
     receipt = json.loads(receipt_path.read_text(encoding="utf-8"))
-    validate_trial_receipt(receipt)
+    if heartbeat is not None:
+        heartbeat()
+
+    def validate() -> None:
+        validate_trial_receipt(receipt, trial_api_key=trial_api_key)
+
+    if monitor_blocking is not None:
+        monitor_blocking(validate)
+    else:
+        validate()
+
+    def watched(work: Callable[[], object]) -> object:
+        if monitor_blocking is not None:
+            return monitor_blocking(work)
+        if heartbeat is not None:
+            heartbeat()
+        return work()
     if argv != receipt["core_argv"]:
         raise ValueError("E1 core command differs from frozen receipt")
     bindings = {
@@ -422,6 +450,12 @@ def _launch_trial_guarded(
             "MAVIS_RAW_OUTPUT_REQUIRED": "1",
         }
     )
+    if receipt.get("trial_auth", False):
+        if not trial_api_key:
+            raise ValueError("E1 authenticated trial key is unavailable")
+        environment["MAVIS_E0_TRIAL_API_KEY"] = trial_api_key
+    else:
+        environment.pop("MAVIS_E0_TRIAL_API_KEY", None)
     share = str(Path(receipt["core_binary"]).parent)
     environment["PYTHONPATH"] = share + (
         os.pathsep + environment["PYTHONPATH"] if environment.get("PYTHONPATH") else ""
@@ -497,17 +531,18 @@ def _launch_trial_guarded(
             "exited_at": datetime.now(timezone.utc).isoformat(),
             "core_exit_code": exit_code,
             "termination_signal": terminated_signal,
-            "stdout_sha256": digest(Path(receipt["stdout_path"])),
-            "stderr_sha256": digest(Path(receipt["stderr_path"])),
+            "stdout_sha256": watched(lambda: digest(Path(receipt["stdout_path"]))),
+            "stderr_sha256": watched(lambda: digest(Path(receipt["stderr_path"]))),
         }
     )
     from mavis.e1 import _git, _source_snapshot, _unmanaged_status
 
     try:
-        receipt["resulting_revision"] = _git(checkout, "rev-parse", "HEAD")
-        receipt["checkout_dirty"] = bool(_unmanaged_status(checkout))
+        receipt["resulting_revision"] = watched(lambda: _git(checkout, "rev-parse", "HEAD"))
+        receipt["checkout_dirty"] = bool(watched(lambda: _unmanaged_status(checkout)))
         snapshot_path = Path(receipt["runtime_home"]) / "post-turn-source.json"
-        atomic_write(snapshot_path, json.dumps(_source_snapshot(checkout), sort_keys=True) + "\n")
+        snapshot = watched(lambda: _source_snapshot(checkout))
+        atomic_write(snapshot_path, json.dumps(snapshot, sort_keys=True) + "\n")
         receipt["post_turn_source_path"] = str(snapshot_path.resolve())
         receipt["post_turn_source_sha256"] = digest(snapshot_path)
     except (OSError, ValueError, subprocess.CalledProcessError) as error:
@@ -533,17 +568,17 @@ def _launch_trial_guarded(
             raise ValueError(
                 "core effective-config observation differs from frozen E1 arm"
             )
-        transcript = matching_trial_transcript(
+        transcript = watched(lambda: matching_trial_transcript(
             Path(event["rollout_path"]),
             Path(receipt["runtime_home"]),
             event["session_id"],
-        )
+        ))
         receipt.update(
             {
                 "observation_status": "matched_startup_config",
                 "observation_sha256": digest(event_path),
                 "transcript_path": str(transcript.resolve()),
-                "transcript_sha256": digest(transcript),
+                "transcript_sha256": watched(lambda: digest(transcript)),
             }
         )
     except (OSError, ValueError, KeyError, TypeError) as error:
