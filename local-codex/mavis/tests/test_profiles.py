@@ -129,7 +129,7 @@ class ProfileStoreTests(unittest.TestCase):
             self.assertTrue(profile_transition.pending(root))
             objective = ObjectiveStore(root)
             objective.create({"schema_version": "mavis.objective/v1", "objective_id": "work-1",
-                              "requirements": [{"id": "implement"}], "acceptance_checks": [{"id": "test"}]})
+                              "requirements": [{"id": "implement"}], "acceptance_checks": [{"id": "test", "command": ["true"]}]})
             with self.assertRaisesRegex(ValueError, "interrupted profile transition"):
                 objective.transition("work-1", "running", "start")
             with self.assertRaisesRegex(ValueError, "interrupted profile transition"):
@@ -258,13 +258,13 @@ class ProfileStoreTests(unittest.TestCase):
                 self.assertTrue(profile_transition.pending(root))
                 objective = ObjectiveStore(root)
                 objective.create({"schema_version": "mavis.objective/v1", "objective_id": "work-1",
-                                  "requirements": [{"id": "implement"}], "acceptance_checks": [{"id": "test"}]})
+                                  "requirements": [{"id": "implement"}], "acceptance_checks": [{"id": "test", "command": ["true"]}]})
                 with self.assertRaisesRegex(ValueError, "interrupted profile transition"):
                     objective.transition("work-1", "running", "start")
                 project_objective = ObjectiveStore(root / "project/.mavis", shared_home=root)
                 project_objective.create({"schema_version": "mavis.objective/v1", "objective_id": "project-work",
                                           "requirements": [{"id": "implement"}],
-                                          "acceptance_checks": [{"id": "test"}]})
+                                          "acceptance_checks": [{"id": "test", "command": ["true"]}]})
                 with self.assertRaisesRegex(ValueError, "interrupted profile transition"):
                     project_objective.transition("project-work", "running", "start")
                 # Simulate a preexisting running objective persisted by an older host.
@@ -287,7 +287,7 @@ class ProfileStoreTests(unittest.TestCase):
             self._promotion_evidence(root, "first-candidate", "improved instructions", promote=False)
             objective = ObjectiveStore(root / "project/.mavis", shared_home=root)
             objective.create({"schema_version": "mavis.objective/v1", "objective_id": "work-1",
-                              "requirements": [{"id": "implement"}], "acceptance_checks": [{"id": "test"}]})
+                              "requirements": [{"id": "implement"}], "acceptance_checks": [{"id": "test", "command": ["true"]}]})
             objective.transition("work-1", "running", "start")
             self.assertEqual(len(list((root / "active-objectives").glob("*.json"))), 1)
             with self.assertRaisesRegex(ValueError, "between objectives"):

@@ -237,7 +237,7 @@ class ObjectiveCliTests(unittest.TestCase):
                     "requirements": [{"id": "r1", "text": "keep failures"}],
                     "dependencies": [],
                     "scope": {},
-                    "acceptance_checks": [{"id": "c1"}],
+                    "acceptance_checks": [{"id": "c1", "command": ["python3", "-c", "print('1 passed')"]}],
                     "unresolved_decisions": ["Choose input format"],
                 }
             )
@@ -299,7 +299,7 @@ class ObjectiveCliTests(unittest.TestCase):
                     "requirements": [{"id": "r1", "text": "check fixture"}],
                     "dependencies": [],
                     "scope": {},
-                    "acceptance_checks": [{"id": "c1"}],
+                    "acceptance_checks": [{"id": "c1", "command": ["python3", "-c", "print('1 passed')"]}],
                     "unresolved_decisions": [],
                 }
             )

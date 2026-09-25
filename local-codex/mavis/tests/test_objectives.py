@@ -3,6 +3,7 @@ import json
 import subprocess
 import tempfile
 import unittest
+from unittest.mock import Mock
 
 from mavis.evidence import run_command
 from mavis.gateway import GatewayUnavailable
@@ -17,13 +18,84 @@ def objective(objective_id="obj-1"):
         "requirements": [{"id": "r1", "text": "prove it"}],
         "dependencies": [],
         "scope": {"paths": ["src"]},
-        "acceptance_checks": [{"id": "c1", "command": ["true"]}],
+        "acceptance_checks": [{"id": "c1", "command": ["python3", "-c", "print('1 passed')"]}],
         "unresolved_decisions": [],
         "state": "queued",
     }
 
 
 class ObjectiveStoreTests(unittest.TestCase):
+    def test_objective_rejects_missing_malformed_and_duplicate_check_commands(self):
+        with tempfile.TemporaryDirectory() as directory:
+            store = ObjectiveStore(Path(directory))
+            for checks in (
+                [{"id": "c1"}],
+                [{"id": "c1", "command": "true"}],
+                [{"id": "c1", "command": ["true", ""]}],
+                [{"id": "c1", "command": ["true"]},
+                 {"id": "c1", "command": ["false"]}],
+            ):
+                with self.subTest(checks=checks), self.assertRaises(ValueError):
+                    store.create({**objective(), "acceptance_checks": checks})
+
+    def test_tagged_receipt_requires_exact_command_for_every_id(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            store = ObjectiveStore(root)
+            spec = objective()
+            spec["acceptance_checks"].append({"id": "c2", "command": ["true"]})
+            store.create(spec)
+            fixture = root / "fixture"
+            fixture.mkdir()
+            subprocess.run(["git", "init", "-q"], cwd=fixture, check=True)
+            subprocess.run(["git", "-c", "user.name=Mavis Test",
+                            "-c", "user.email=test@example.invalid", "commit",
+                            "--allow-empty", "-qm", "fixture"], cwd=fixture, check=True)
+            wrong = run_command(root, "obj-1", ["true"], fixture,
+                                acceptance_check_ids=["c1"])
+            with self.assertRaisesRegex(ValueError, "command does not match"):
+                store.add_receipt("obj-1", wrong)
+            multi = run_command(root, "obj-1", ["python3", "-c", "print('1 passed')"],
+                                fixture, acceptance_check_ids=["c1", "c2"])
+            with self.assertRaisesRegex(ValueError, "command does not match"):
+                store.add_receipt("obj-1", multi)
+            unknown = run_command(root, "obj-1", ["true"], fixture,
+                                  acceptance_check_ids=["unknown"])
+            with self.assertRaisesRegex(ValueError, "unknown acceptance check"):
+                store.add_receipt("obj-1", unknown)
+            self.assertEqual(store.load("obj-1")["evidence_receipts"], [])
+            untagged = run_command(root, "obj-1", ["true"], fixture)
+            store.add_receipt("obj-1", untagged)
+            self.assertEqual(len(store.load("obj-1")["evidence_receipts"]), 1)
+
+    def test_retained_mismatch_blocks_gateway_and_acceptance_before_external_call(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            gateway = Mock()
+            store = ObjectiveStore(root, gateway_status_reader=gateway)
+            store.create(objective())
+            fixture = root / "fixture"
+            fixture.mkdir()
+            subprocess.run(["git", "init", "-q"], cwd=fixture, check=True)
+            subprocess.run(["git", "-c", "user.name=Mavis Test",
+                            "-c", "user.email=test@example.invalid", "commit",
+                            "--allow-empty", "-qm", "fixture"], cwd=fixture, check=True)
+            receipt = run_command(root, "obj-1", ["python3", "-c", "print('1 passed')"],
+                                  fixture, acceptance_check_ids=["c1"])
+            store.add_receipt("obj-1", receipt)
+            record = store.load("obj-1")
+            record["acceptance_checks"][0]["command"] = ["true"]
+            store.save(record)
+            with self.assertRaisesRegex(ValueError, "command does not match"):
+                store.record_gateway_verification("obj-1", "worker-job-1")
+            with self.assertRaisesRegex(ValueError, "command does not match"):
+                store._assert_acceptance(store.load("obj-1"))
+            record["acceptance_checks"][0].pop("command")
+            store.save(record)
+            with self.assertRaisesRegex(ValueError, "requires a non-empty command"):
+                store.record_gateway_verification("obj-1", "worker-job-1")
+            gateway.assert_not_called()
+
     def gateway_status(self, worker_job_id="worker-job-1", mavis_binding=None):
         digest = "a" * 64
         status = {

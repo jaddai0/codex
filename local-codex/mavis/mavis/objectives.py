@@ -87,6 +87,7 @@ class ObjectiveStore:
             raise FileExistsError(path)
         if not payload.get("requirements") or not payload.get("acceptance_checks"):
             raise ValueError("objective requires requirements and acceptance checks")
+        _acceptance_check_commands(payload)
         record = deepcopy(payload)
         record["state"] = "queued"
         record["created_at"] = _now()
@@ -242,6 +243,7 @@ class ObjectiveStore:
         _validate_receipt(receipt, objective_id, resolved)
         with profile_boundary_lock(self.shared_home):
             record = self.load(objective_id)
+            _validate_receipt_check_binding(receipt, _acceptance_check_commands(record))
             record["evidence_receipts"].append(
                 {"path": str(resolved), "sha256": sha256_file(resolved)}
             )
@@ -588,6 +590,7 @@ class ObjectiveStore:
 
     def _validated_receipts(self, record: dict[str, Any]) -> list[dict[str, Any]]:
         receipts = []
+        checks = _acceptance_check_commands(record)
         for retained in record.get("evidence_receipts") or []:
             if not isinstance(retained, dict) or set(retained) != {"path", "sha256"}:
                 raise ValueError("evidence receipt retention record is invalid")
@@ -598,6 +601,7 @@ class ObjectiveStore:
                 )
             receipt = read_json(path)
             _validate_receipt(receipt, str(record["objective_id"]), path)
+            _validate_receipt_check_binding(receipt, checks)
             receipts.append(receipt)
         return receipts
 
@@ -731,6 +735,39 @@ def _owner_identity(owner: object) -> tuple[str, str, str]:
     if any(not value for value in identity):
         raise ValueError("owner identity requires provider, model, and harness")
     return identity
+
+
+def _acceptance_check_commands(record: dict[str, Any]) -> dict[str, list[str]]:
+    checks = record.get("acceptance_checks")
+    if not isinstance(checks, list) or not checks:
+        raise ValueError("objective requires acceptance checks")
+    commands: dict[str, list[str]] = {}
+    for check in checks:
+        if not isinstance(check, dict):
+            raise ValueError("acceptance check must be an object")
+        raw_id = check.get("id")
+        if not isinstance(raw_id, str):
+            raise ValueError("acceptance check id must be a string")
+        check_id = require_safe_id(raw_id, "acceptance check id")
+        command = check.get("command")
+        if not isinstance(command, list) or not command or not all(
+            isinstance(arg, str) and arg for arg in command
+        ):
+            raise ValueError(f"acceptance check {check_id} requires a non-empty command argument list")
+        if check_id in commands:
+            raise ValueError(f"duplicate acceptance check id: {check_id}")
+        commands[check_id] = command
+    return commands
+
+
+def _validate_receipt_check_binding(
+    receipt: dict[str, Any], checks: dict[str, list[str]]
+) -> None:
+    for check_id in receipt["acceptance_check_ids"]:
+        if check_id not in checks:
+            raise ValueError(f"evidence receipt names unknown acceptance check: {check_id}")
+        if receipt["command"] != checks[check_id]:
+            raise ValueError(f"evidence receipt command does not match acceptance check: {check_id}")
 
 
 def _sha256_json(payload: Any) -> str:
@@ -895,7 +932,8 @@ def _validate_receipt(
         raise ValueError("unsupported evidence receipt producer or schema")
     if receipt["objective_id"] != objective_id:
         raise ValueError("evidence receipt objective does not match")
-    if not isinstance(receipt["command"], list) or not receipt["command"]:
+    if (not isinstance(receipt["command"], list) or not receipt["command"]
+            or not all(isinstance(arg, str) and arg for arg in receipt["command"])):
         raise ValueError("evidence receipt command is missing")
     if not isinstance(receipt["exit_status"], int):
         raise ValueError("evidence receipt exit status is invalid")
@@ -906,8 +944,13 @@ def _validate_receipt(
         or len(receipt["changed_revision"]) < 7
     ):
         raise ValueError("evidence receipt must bind a git revision")
-    if not receipt["acceptance_check_ids"]:
-        raise ValueError("evidence receipt must cover an acceptance check")
+    check_ids = receipt["acceptance_check_ids"]
+    if (not isinstance(check_ids, list)
+            or not all(isinstance(check_id, str) for check_id in check_ids)
+            or len(set(check_ids)) != len(check_ids)):
+        raise ValueError("evidence receipt acceptance check ids are invalid")
+    for check_id in check_ids:
+        require_safe_id(check_id, "acceptance check id")
     raw = receipt["raw_output"]
     evidence_dir = receipt_path.parent.resolve()
     if (

@@ -579,7 +579,7 @@ class E0Evaluator:
             "blueprint": "Reject forged completion evidence",
             "requirements": [{"id": "r1", "text": "reject fabricated success"}],
             "dependencies": [], "scope": {},
-            "acceptance_checks": [{"id": "c1"}],
+            "acceptance_checks": [{"id": "c1", "command": ["python3", "-c", "print('1 passed')"]}],
             "unresolved_decisions": [],
         })
         forged = store.root.parent / "evidence" / objective_id / "forged"
@@ -808,7 +808,7 @@ class E0Evaluator:
                 "requirements": [{"id": "r1", "text": "repair"}],
                 "dependencies": [],
                 "scope": {},
-                "acceptance_checks": [{"id": "c1"}],
+                "acceptance_checks": [{"id": "c1", "command": ["python3", "-c", "print('1 passed')"]}],
                 "unresolved_decisions": [],
                 "state": "queued",
             }

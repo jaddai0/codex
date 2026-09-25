@@ -16,6 +16,7 @@ from mavis.evidence import run_command
 from mavis.gateway import GatewayUnavailable
 from mavis.jev import advise
 from mavis.objectives import ObjectiveStore
+from mavis.storage import sha256_file
 
 
 def objective():
@@ -26,7 +27,7 @@ def objective():
         "requirements": [{"id": "r1", "text": "repair the failure"}],
         "dependencies": [],
         "scope": {"paths": ["src"]},
-        "acceptance_checks": [{"id": "c1", "command": ["true"]}],
+        "acceptance_checks": [{"id": "c1", "command": ["python3", "-c", "print('FAILED'); raise SystemExit(1)"]}],
         "unresolved_decisions": [],
     }
 
@@ -179,6 +180,21 @@ class JevWorkflowTests(unittest.TestCase):
         self.assertEqual(result["state"], "escalated")
         self.assertEqual(result["jev_latest_advice"]["reason"],
                          "no_worker_assignment")
+        self.assertEqual(result["jev_advice_events"], [])
+
+    def test_retained_wrong_command_cannot_trigger_paid_advice(self):
+        record = self.store.load("jev-workflow")
+        receipt_path = Path(record["evidence_receipts"][0]["path"])
+        receipt = json.loads(receipt_path.read_text())
+        receipt["command"] = ["true"]
+        receipt_path.write_text(json.dumps(receipt))
+        record["evidence_receipts"][0]["sha256"] = sha256_file(receipt_path)
+        self.store.save(record)
+        with patch("mavis.jev.mavis_jev_decisions") as gateway:
+            result = self.repeat_failure()
+        gateway.assert_not_called()
+        self.assertEqual(result["state"], "escalated")
+        self.assertEqual(result["jev_latest_advice"]["reason"], "invalid_host_evidence")
         self.assertEqual(result["jev_advice_events"], [])
 
     def test_prior_assignment_failure_cannot_authorize_new_paid_advice(self):
