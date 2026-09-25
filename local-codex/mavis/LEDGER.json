@@ -9,7 +9,8 @@
   "rejected_alternatives": [
     "Sharing IRIS port 8000 was rejected by the approved plan.",
     "Flat API substitutions for native tool-using harnesses were rejected.",
-    "Starting a second unbounded MLX workload during the active IRIS session was rejected."
+    "Starting a second unbounded MLX workload during the active IRIS session was rejected.",
+    "Re-applying the rejected heartbeat patch unchanged was rejected: the bounded monitor is kept and the 8 s gpu-lease status path is confined to point-in-time admission checks, so a slow process scan cannot blind a blocked-work safety loop."
   ],
   "requirements": [
     {
@@ -179,6 +180,22 @@
       "id": "workspace-consolidation",
       "requirement": "Consolidate Mavis work folders, retain unique evidence and active work, and remove obsolete checkouts.",
       "status": "pass"
+    },
+    {
+      "artifact": "Mavis/evidence/phase3/canary-e1-heartbeat-20260925/canary-candidate-0dc0d4085.json",
+      "command": "git -C checkouts/hermes log --oneline 93b9eaaf6 89562f917 8bbcfd7eb 9ccc5d7ce 0dc0d4085; PYTHONDONTWRITEBYTECODE=1 PYTHONPATH=local-codex/mavis /opt/homebrew/opt/python@3.14/bin/python3.14 local-codex/mavis/scripts/canary_e1_heartbeat.py --seconds 90 --out Mavis/evidence/phase3/canary-e1-heartbeat-20260925/canary-candidate-0dc0d4085.json; PYTHONDONTWRITEBYTECODE=1 PYTHONPATH=~/.local/share/local-codex /opt/homebrew/opt/python@3.14/bin/python3.14 Mavis/evidence/phase3/canary-e1-heartbeat-20260925/canary_e1_heartbeat.snapshot.py --seconds 5 --checkout checkouts/codex --out Mavis/evidence/phase3/canary-e1-heartbeat-20260925/canary-installed-93b9eaaf6.json; PYTHONDONTWRITEBYTECODE=1 PYTHONPATH=local-codex/mavis /opt/homebrew/opt/python@3.14/bin/python3.14 -m unittest discover -s local-codex/mavis/tests",
+      "evidence": [
+        "Root cause of the aborted paired trial e1-behavior-probes-d37586f50-gw633ed38b (candidate arm checkout-strict-discount): runtime._stop_spawned_process_group signalled a trial-server group whose leader had exited and stayed unreaped, whose only member was a zombie, and macOS answered EPERM. The cleanup retried the same abort and answered EPERM again, so the receipts ~/.local-codex/mavis-service/e1/admission-failures/8fa2b4d60269447db807cf00a2476fcf.json and 3dde7f0f7b964cf08218f7016e2a7ad5.json both record '[Errno 1] Operation not permitted; trial server abort failed: [Errno 1] Operation not permitted' with gpu_work_stopped false and lease_released false. The trial raised 'E1 trial GPU work may still be active' during context entry and never reached a baseline arm.",
+        "The runtime half is fixed and is live in the installed bytes: runtime._signal_spawned_group (commit 93b9eaaf6) tolerates EPERM only when the leader is an exited unreaped child and its group holds no non-zombie worker. Canary run e031a5fe78ae4606a86c407b97c8e87e ran against the installed package (checkout checkouts/codex at 93b9eaaf6) and reproduced the host condition exactly: a direct os.killpg on a zombie-only group answered EPERM, while the repaired stop returned in 0.054 s and reaped the leader; a live leader in its own group was still stopped (SIGTERM, returncode -15).",
+        "The independent REJECT's three findings are closed on this branch. Finding 1 (an 8 s gpu-lease status blocking the load monitor) by _LeaseHeartbeat.monitor in commit 89562f917: every blocked-work loop reads the lease record plus IRIS's own voice-session flag with a 1 s bound, and the slow command runs only on point-in-time admission checks. Finding 2 (an EPERM test that never forced EPERM) by the branch's end-to-end forced-EPERM test and by this host canary. Finding 3 (nothing locked prompt/host receipt-path parity) by the resolved canonical path and its parity test (89562f917) and by the nested inspection task text with the flattened-report error (8bbcfd7eb, ACCEPT under card t_a6d8f001).",
+        "Canary run e0884140b45244269dadd3f38f46b85e exercised candidate revision 0dc0d4085 on a clean worktree under the trial's own interpreter python3.14.7, verdict pass. The monitor ran 235 iterations across a 90 s window at the trial's 0.2 s cadence with zero errors and a 0.104 s maximum against a 1.5 s bound, while gpu-lease status ran concurrently 74 times. With e1_gpu.LEASE pointed at a missing path the monitor still returned in 0.255 s, which shows the safety path does not execute the slow command. A foreign lease purpose, a missing lease, and an unanswerable IRIS each refused with RuntimeError, and the IRIS probe endpoint matched the one gpu-lease itself reads (http://127.0.0.1:8117/status, sessionActive false).",
+        "Host receipt for the candidate source: PYTHONDONTWRITEBYTECODE=1 PYTHONPATH=local-codex/mavis python3.14 -m unittest discover -s local-codex/mavis/tests ran 462 tests, OK (skipped=2), in 239.8 s (Mavis/evidence/phase3/canary-e1-heartbeat-20260925/source-suite-py314.log). The earlier receipt's os.waitid errors came from the python3.12 host interpreter.",
+        "Scope of this row: the repair and its host canary on branch hermes/mavis-finish, plus proof that the runtime half is already live in installed 93b9eaaf6 and that the bounded monitor is absent from it. Installing the candidate (which voids installed E0 run 8cc31578 on 93b9eaaf6), candidate-matched E0, the E1 bootstrap review, the six paired trials, compare-native, promotion and rollback stay open in requirements open-acceptance-gates-2026-09-25 and phase-3, together with independent review of this canary.",
+        "GPU and safety contract kept: gpu-lease status was read before each window ('the GPU is free'), the lease was acquired as codex-mavis only for the 90 s window and released afterwards with the GPU free again; IRIS stayed loaded with Qwen3.8-Flash-Next-Abliterated-MLX-4bit on :8000 and no model was loaded on :8001; checkouts/codex was read only; no other session's process, server or job was touched; no secrets, weights, logs, databases or raw transcripts were written."
+      ],
+      "id": "e1-heartbeat-runtime-repair-canary-2026-09-25",
+      "requirement": "Repair the E1 heartbeat/runtime defect that aborted the paired trial before a valid comparison, close the independent REJECT findings, and canary the repair on the host before any full trial.",
+      "status": "pass"
     }
   ],
   "schema_version": "work-closeout/v1",
@@ -192,6 +209,7 @@
     "Phase 3 E1 has source gates and native assignment plumbing. A real paired comparison, independent promotion, and rollback remain open.",
     "Phase 4 held-out two-package work passed across compaction and restart with independent Terra acceptance. A protected large-project fixture and four challenge seeds are prepared; installed large-project, conflict, flaky-dependency, and tool-discovery runs remain open.",
     "The Rust core suite ran 4,591 tests and had 278 failures from environment and cross-package cases; the Mavis-focused Rust tests passed. The broad suite remains an open gate.",
-    "Hosted Jev returned one typed answer under the local capped ledger; external invoice reconciliation and a local Jev candidate remain open."
+    "Hosted Jev returned one typed answer under the local capped ledger; external invoice reconciliation and a local Jev candidate remain open.",
+    "Reverified live 2026-09-25T20:47Z. The E1 heartbeat/runtime defect is the macOS process-group stop (killpg answering EPERM for an exited, unreaped leader alone in its group); it is fixed in installed 93b9eaaf6 and reproduced-then-tolerated on this host. The bounded monitor, the resolved canonical E0 receipt path, the forced-EPERM test and the bootstrap prompt/schema repair exist only on hermes/mavis-finish (89562f917, 8bbcfd7eb, 9ccc5d7ce, 0dc0d4085) and are not installed. Canary runs e0884140b45244269dadd3f38f46b85e (candidate 0dc0d4085, pass) and e031a5fe78ae4606a86c407b97c8e87e (installed 93b9eaaf6, partial: monitor and IRIS probe absent). Installing the branch voids the passing installed E0 8cc31578, so E1 paired trials stay gated on install plus a fresh E0 and the bootstrap review. The fork push still fails for missing GitHub credentials, so these commits are local."
   ]
 }
