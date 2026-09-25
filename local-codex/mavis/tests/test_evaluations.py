@@ -40,19 +40,21 @@ class E0EvaluationTests(unittest.TestCase):
             }]}
             second = {"id": "second", "status": "completed"}
             with (patch.dict(os.environ, {"MAVIS_E0_SHARED_GPU_LEASE": "codex-mavis",
+                                       "MAVIS_E0_IRIS_GENERATION_MODELS": '["iris-a","iris-b"]',
                                        "MAVIS_E0_TRIAL_API_KEY": "test-secret"}),
                   patch("mavis.evaluations.endpoint_alive", return_value=True),
                   patch("mavis.evaluations.inventory", return_value=[
                       {"id": config.model, "loaded": True}]),
                   patch("mavis.evaluations.subprocess.run", return_value=subprocess.CompletedProcess(
                       ["gpu-lease", "status"], 0, "codex-mavis has the GPU: canary\n")) as lease,
-                  patch("mavis.evaluations.require_idle_iris_handoff"),
+                  patch("mavis.evaluations.require_idle_iris_handoff") as idle,
                   patch("mavis.evaluations.admission", return_value={"allowed": True}),
                   patch("mavis.evaluations._post_json", side_effect=[first, second]) as post,
                   patch("mavis.evaluations.installed_candidate_fingerprint", return_value={
                       "core_sha256": "a" * 64})):
                 self.assertEqual(evaluator.run_case("tool-roundtrip")["status"], "pass")
             self.assertNotIn("MAVIS_E0_TRIAL_API_KEY", lease.call_args.kwargs["env"])
+            idle.assert_called_once_with(config, expected_models=["iris-a", "iris-b"])
             self.assertEqual([call.kwargs["api_key"] for call in post.call_args_list],
                              ["test-secret", "test-secret"])
 
@@ -523,7 +525,8 @@ class E0EvaluationTests(unittest.TestCase):
             }]}
             second = {"id": "second", "status": "completed"}
             with (
-                patch.dict(os.environ, {"MAVIS_E0_SHARED_GPU_LEASE": "codex-mavis"}),
+                patch.dict(os.environ, {"MAVIS_E0_SHARED_GPU_LEASE": "codex-mavis",
+                                     "MAVIS_E0_IRIS_GENERATION_MODELS": '["iris-a","iris-b"]'}),
                 patch("mavis.evaluations.endpoint_alive", return_value=True),
                 patch("mavis.evaluations.inventory", return_value=[
                     {"id": evaluator.config.model, "loaded": True}]),
@@ -538,8 +541,23 @@ class E0EvaluationTests(unittest.TestCase):
                 result = evaluator.run_case("tool-roundtrip")
             self.assertEqual(result["status"], "pass")
             self.assertTrue(admission.call_args.args[0].allow_concurrent_local)
-            idle.assert_called_once_with(evaluator.config)
+            idle.assert_called_once_with(evaluator.config, expected_models=["iris-a", "iris-b"])
             self.assertEqual(request.call_count, 2)
+
+    def test_tool_roundtrip_shared_mode_refuses_missing_iris_snapshot(self):
+        with tempfile.TemporaryDirectory() as directory:
+            evaluator = E0Evaluator(Path(directory), RuntimeConfig(home=Path(directory)))
+            with (
+                patch.dict(os.environ, {"MAVIS_E0_SHARED_GPU_LEASE": "codex-mavis"}, clear=True),
+                patch("mavis.evaluations.endpoint_alive", return_value=True),
+                patch("mavis.evaluations.inventory", return_value=[
+                    {"id": evaluator.config.model, "loaded": True}]),
+                patch("mavis.evaluations._post_json") as request,
+            ):
+                result = evaluator.run_case("tool-roundtrip")
+            self.assertEqual(result["status"], "reject")
+            self.assertIn("snapshot is unavailable", result["evidence"][0])
+            request.assert_not_called()
 
     def test_tool_roundtrip_shared_mode_rejects_another_lease_holder(self):
         with tempfile.TemporaryDirectory() as directory:

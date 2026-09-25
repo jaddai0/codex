@@ -476,6 +476,14 @@ class E0Evaluator:
         if os.environ.get("MAVIS_E0_SHARED_GPU_LEASE"):
             if os.environ["MAVIS_E0_SHARED_GPU_LEASE"] != "codex-mavis":
                 raise ValueError("E0 shared GPU lease holder is invalid")
+            try:
+                expected_iris = json.loads(os.environ["MAVIS_E0_IRIS_GENERATION_MODELS"])
+            except (KeyError, json.JSONDecodeError) as error:
+                raise ValueError("E0 IRIS generation snapshot is unavailable") from error
+            if (not isinstance(expected_iris, list) or not expected_iris
+                    or any(not isinstance(model, str) or not model for model in expected_iris)
+                    or len(expected_iris) != len(set(expected_iris))):
+                raise ValueError("E0 IRIS generation snapshot is invalid")
             lease = subprocess.run(
                 [str(Path.home() / ".local/bin/gpu-lease"), "status"],
                 capture_output=True, text=True, timeout=15, check=False,
@@ -487,7 +495,7 @@ class E0Evaluator:
                     or "IRIS: a game is live" in lease.stdout
                     or "IRIS: not answering" in lease.stdout):
                 raise RuntimeError("E0 shared GPU lease or IRIS game state is unsafe")
-            require_idle_iris_handoff(self.config)
+            require_idle_iris_handoff(self.config, expected_models=expected_iris)
             admission_config = replace(self.config, allow_concurrent_local=True)
         decision = admission(admission_config)
         if not decision["allowed"]:

@@ -55,6 +55,7 @@ def main() -> int:
     try:
         with shared_mavis_model(config, "installed Mavis E0 tool roundtrip") as shared:
             env["MAVIS_E0_SHARED_GPU_LEASE"] = "codex-mavis"
+            env["MAVIS_E0_IRIS_GENERATION_MODELS"] = json.dumps(shared["iris_generation_models"])
             env["MAVIS_E0_TRIAL_API_KEY"] = config.api_key
             with live_log.open("wb") as stream:
                 result["tool_roundtrip_exit"] = run_monitored_observation(
@@ -66,6 +67,7 @@ def main() -> int:
         result["error"] = repr(error)
     finally:
         env.pop("MAVIS_E0_TRIAL_API_KEY", None)
+        env.pop("MAVIS_E0_IRIS_GENERATION_MODELS", None)
         if shared is not None:
             result.update(shared)
         result["candidate_after"] = installed_candidate_fingerprint()
