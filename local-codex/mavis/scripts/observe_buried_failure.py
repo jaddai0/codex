@@ -10,7 +10,7 @@ import subprocess
 import sys
 import uuid
 
-from mavis.evaluations import installed_candidate_fingerprint
+from mavis.evaluations import E0Evaluator, installed_candidate_fingerprint
 from mavis.runtime import (RuntimeConfig, endpoint_alive, handoff_lease_fd,
                            inventory, loaded_generation_models,
                            require_installed_selected_model, with_mavis_handoff_lease)
@@ -100,8 +100,16 @@ def main() -> int:
             result["iris_loaded"] = shared.get("iris_stayed_loaded")
         result["candidate_after"] = installed_candidate_fingerprint()
         write_json(task / "result.json", result)
+    try:
+        verdict = E0Evaluator(service, config)._buried_failure(
+            task / "result.json", record=False)
+        result["host_case_status"] = verdict["status"]
+    except BaseException as exc:
+        result["host_case_error"] = repr(exc)
+    write_json(task / "result.json", result)
     print(task / "result.json")
     return 0 if (result.get("mavis_exit") == 0 and result.get("rollout")
+                 and result.get("host_case_status") == "pass"
                  and result.get("iris_loaded") is True
                  and result.get("mavis_loaded") is False
                  and result.get("gpu_lease_released") is True

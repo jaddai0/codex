@@ -264,6 +264,42 @@ class RuntimeTests(unittest.TestCase):
                     pass
                 child.wait()
 
+    def test_exited_unreaped_leader_with_empty_group_is_stopped_despite_macos_eperm(self):
+        # Measured on macOS 2026-09-25: killpg answers EPERM for a group whose only
+        # member is an exited, unreaped leader. That group has no GPU work left.
+        child = subprocess.Popen([sys.executable, "-c", "raise SystemExit(0)"],
+                                 start_new_session=True)
+        try:
+            deadline = time.monotonic() + 5
+            while runtime._child_exit_unreaped(child) is None and time.monotonic() < deadline:
+                time.sleep(0.02)
+            self.assertIsNotNone(runtime._child_exit_unreaped(child))
+            self.assertFalse(runtime._process_group_workers(child.pid))
+            runtime._stop_spawned_process_group(child, timeout=1)
+            self.assertEqual(child.returncode, 0)
+        finally:
+            if child.returncode is None:
+                child.wait()
+
+    def test_eperm_is_not_accepted_while_leader_runs_or_workers_remain(self):
+        for exited, workers in ((None, set()), (Mock(si_status=0), {4321})):
+            process = FakeProcess()
+            with self.subTest(exited=exited, workers=workers), \
+                    patch("mavis.runtime._child_exit_unreaped", return_value=exited), \
+                    patch("mavis.runtime.os.getpgid", return_value=1234), \
+                    patch("mavis.runtime._process_group_workers", return_value=workers), \
+                    patch("mavis.runtime.os.killpg", side_effect=PermissionError(1, "denied")):
+                with self.assertRaises(PermissionError):
+                    runtime._stop_spawned_process_group(process, timeout=0.2)
+
+    def test_eperm_is_accepted_only_for_exited_leader_with_empty_group(self):
+        process = FakeProcess()
+        with patch("mavis.runtime._child_exit_unreaped", return_value=Mock(si_status=0)), \
+                patch("mavis.runtime._process_group_workers", return_value=set()), \
+                patch("mavis.runtime.os.killpg", side_effect=PermissionError(1, "denied")) as kill:
+            runtime._signal_spawned_group(process, process.pid, signal.SIGTERM)
+        kill.assert_called_once_with(process.pid, signal.SIGTERM)
+
     def test_reaped_leader_never_signals_numeric_group(self):
         process = FakeProcess()
         process.returncode = 7

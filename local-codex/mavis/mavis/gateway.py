@@ -74,11 +74,14 @@ def _send(process: subprocess.Popen[str], payload: dict[str, Any]) -> None:
 
 
 def _gateway_tool(name: str, arguments: dict[str, Any], timeout: float,
-                  *, require_success: bool = True) -> dict[str, Any]:
+                  *, require_success: bool = True,
+                  environment_overrides: dict[str, str] | None = None) -> dict[str, Any]:
     """Call one tool on the trusted Mavis gateway without a provider fallback."""
     command, configured_env = _configured_gateway()
     environment = os.environ.copy()
     environment.update(configured_env)
+    if environment_overrides:
+        environment.update(environment_overrides)
     try:
         process = subprocess.Popen(
             command,
@@ -149,9 +152,15 @@ def harness_job_status(job_id: str, timeout: float = 10.0) -> dict[str, Any]:
     return payload["status"]
 
 
-def harness_assignment_start(assignment: dict[str, Any], timeout: float = 15.0) -> dict[str, Any]:
+def harness_assignment_start(assignment: dict[str, Any], timeout: float = 15.0, *,
+                             opencode_policy: str | None = None) -> dict[str, Any]:
     """Start a Mavis-bound native assignment through the configured gateway."""
-    return _gateway_tool("harness_assignment_start", assignment, timeout)
+    return _gateway_tool(
+        "harness_assignment_start", assignment, timeout,
+        environment_overrides=(
+            {"OPENCODE_CONFIG_CONTENT": opencode_policy}
+            if opencode_policy is not None else None),
+    )
 
 
 def harness_job_complete(job_id: str, check_results: dict[str, Any], timeout: float = 15.0) -> dict[str, Any]:

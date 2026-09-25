@@ -444,7 +444,10 @@ def _gateway_arguments(
             "package_tree_sha256, checked_file, checked_sha256, source_excerpt} using "
             "local-codex/mavis/mavis/e1_bootstrap.py; e0_cases with one {case, receipt_path, "
             "receipt_sha256, observed_status, cited_evidence} for every mandatory case in "
-            "order; model {model_id, weights_fingerprint, cited_file, cited_sha256, "
+            "order, where receipt_path is the absolute path "
+            f"{Path(assignment_path).resolve().parents[2] / 'evaluations/e0'}/<case>.json, "
+            "not a per-run copy; "
+            "model {model_id, weights_fingerprint, cited_file, cited_sha256, "
             "config_sha256, observed_architecture, observed_quantization_sha256} "
             "citing a weight shard and the actual config.json; compute the "
             "quantization SHA-256 from the actual config value using canonical "
@@ -476,6 +479,24 @@ def _gateway_arguments(
 
 
 
+def _review_opencode_policy(assignment: dict[str, Any], assignment_path: Path) -> str:
+    """Allow the native reviewer to read its frozen external evidence."""
+    home = assignment_path.resolve().parents[2]
+    model = Path(assignment["model_artifacts"]["model_path"]).resolve()
+    installed = Path(assignment["package_manifest"]["path"]).resolve().parent
+    baseline = Path(assignment["baseline"]["path"]).resolve().parent
+    external = {"*": "deny"}
+    for directory in (home / "e1/bootstrap", home / "evaluations/e0",
+                      baseline, installed, model):
+        external[str(directory / "*")] = "allow"
+    external[str(home / "evaluations/e0/runs/*")] = "deny"
+    return json.dumps({"permission": {
+        "external_directory": external,
+        "read": {"*": "allow", "*.env": "deny", "*.env.*": "deny"},
+        "edit": "deny",
+    }}, sort_keys=True, separators=(",", ":"))
+
+
 def dispatch_bootstrap_review(
     home: Path,
     job_id: str,
@@ -489,7 +510,9 @@ def dispatch_bootstrap_review(
     if dispatch_path.exists() or review_path.exists():
         raise FileExistsError("E1 bootstrap review was already dispatched or recorded")
     arguments = _gateway_arguments(assignment, assignment_path, job_id)
-    started = (starter or harness_assignment_start)(arguments)
+    policy = _review_opencode_policy(assignment, assignment_path)
+    started = (starter(arguments) if starter is not None else
+               harness_assignment_start(arguments, opencode_policy=policy))
     job_dir = (
         Path(started.get("job_dir", "")) if isinstance(started, dict) else Path("")
     )
@@ -531,6 +554,7 @@ def dispatch_bootstrap_review(
         "packet_path": str(assignment_path),
         "packet_sha256": sha256_file(assignment_path),
         "arguments_digest": _digest(arguments),
+        "review_policy_sha256": hashlib.sha256(policy.encode()).hexdigest(),
         "gateway_assignment_path": str(gateway_assignment),
         "gateway_assignment_sha256": sha256_file(gateway_assignment),
         "report_path": str(report),
@@ -549,6 +573,8 @@ def _dispatch(
     gateway_assignment_path = Path(dispatch.get("gateway_assignment_path") or "")
     gateway_assignment = read_json(gateway_assignment_path)
     expected = _gateway_arguments(assignment, assignment_path, job_id)
+    policy_sha256 = hashlib.sha256(
+        _review_opencode_policy(assignment, assignment_path).encode()).hexdigest()
     job_dir = Path(dispatch.get("job_dir") or "")
     report = Path(dispatch.get("report_path") or "")
     if (
@@ -557,6 +583,7 @@ def _dispatch(
         or dispatch.get("packet_path") != str(assignment_path)
         or dispatch.get("packet_sha256") != sha256_file(assignment_path)
         or dispatch.get("arguments_digest") != _digest(expected)
+        or dispatch.get("review_policy_sha256") != policy_sha256
         or dispatch.get("gateway_assignment_sha256")
         != sha256_file(gateway_assignment_path)
         or any(

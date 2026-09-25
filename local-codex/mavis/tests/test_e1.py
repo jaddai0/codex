@@ -10,7 +10,7 @@ import tempfile
 import unittest
 from unittest.mock import patch
 
-from mavis import e1, e1_bootstrap, e1_bootstrap_gateway, e1_review, e1_review_gateway
+from mavis import e1, e1_bootstrap, e1_bootstrap_gateway, e1_review, e1_review_gateway, gateway
 from mavis.e1 import E1Runner
 from mavis.evaluations import E0_CASES
 from mavis.experiments import (
@@ -1317,6 +1317,45 @@ class E1RunnerTests(unittest.TestCase):
                 ):
                     with self.assertRaises(ValueError):
                         e1_bootstrap.validate_bootstrap(self.home)
+
+    def test_bootstrap_review_task_names_the_exact_e0_receipt_path(self):
+        assignment_path = self.home / "e1/bootstrap/review-assignment.json"
+        assignment_path.parent.mkdir(parents=True, exist_ok=True)
+        write_json(assignment_path, {"schema_version": "test-assignment"})
+        packet = {
+            "owner": {"provider": "minimax", "harness": "opencode",
+                      "model": "minimax/MiniMax-M3"},
+            "cwd": str(self.root), "starting_revision": "a" * 40,
+            "owned_paths": [str(self.home / "verifications/e1-bootstrap/main.json")],
+            "required_checks": ["independent-bootstrap-review"],
+            "requirements": [],
+            "objective_id": "e1-bootstrap-main",
+        }
+        task = e1_bootstrap._gateway_arguments(packet, assignment_path, "review-job")["task"]
+        expected = str((self.home / "evaluations/e0").resolve()) + "/<case>.json"
+        self.assertIn(expected, task)
+        self.assertIn("not a per-run copy", task)
+
+    def test_bootstrap_native_review_gets_scoped_read_only_opencode_policy(self):
+        assignment_path = self.home / "e1/bootstrap/review-assignment.json"
+        assignment = {
+            "baseline": {"path": str(self.home / "experiments/snapshots/base.json")},
+            "package_manifest": {"path": str(self.root / "installed/install-manifest.json")},
+            "model_artifacts": {"model_path": str(self.root / "models/exact-model")},
+        }
+        policy = e1_bootstrap._review_opencode_policy(assignment, assignment_path)
+        permissions = json.loads(policy)["permission"]
+        external = permissions["external_directory"]
+        self.assertEqual(permissions["edit"], "deny")
+        self.assertEqual(external["*"], "deny")
+        self.assertEqual(external[str(self.home / "evaluations/e0/*")], "allow")
+        self.assertEqual(external[str(self.home / "evaluations/e0/runs/*")], "deny")
+        self.assertEqual(external[str(self.root / "models/exact-model/*")], "allow")
+        with patch("mavis.gateway._gateway_tool", return_value={"success": True}) as call:
+            gateway.harness_assignment_start({"job_id": "review-job"},
+                                             opencode_policy=policy)
+        self.assertEqual(call.call_args.kwargs["environment_overrides"],
+                         {"OPENCODE_CONFIG_CONTENT": policy})
 
     def test_bootstrap_gateway_completion_and_terra_contract(self):
         """Exercise the canonical gateway's real receipt and acceptance rules."""

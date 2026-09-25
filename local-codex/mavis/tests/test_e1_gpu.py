@@ -179,6 +179,30 @@ class E1GPUAdmissionTests(unittest.TestCase):
         self.abort.assert_not_called()
         self.assertFalse(self.held)
 
+    def test_residual_auth_from_prior_trial_is_preserved_and_original_error_survives(self):
+        failure = RuntimeError("residual Mavis trial authentication requires recovery")
+        failure.residual_trial_auth = True
+        self.start.side_effect = failure
+        with patch.object(e1_gpu, "clear_trial_auth_settings") as clear:
+            with self.assertRaisesRegex(RuntimeError, "residual Mavis trial authentication") as caught:
+                with e1_gpu.admitted_e1_model(self.config, "e1:trial"):
+                    pass
+        self.assertIs(caught.exception, failure)
+        clear.assert_not_called()
+        self.patches[9].assert_not_called()
+        self.abort.assert_not_called()
+        self.assertFalse(self.held)
+
+    def test_failed_start_after_own_auth_write_clears_only_its_trial_key(self):
+        self.start.side_effect = RuntimeError("owned startup failed")
+        with patch.object(e1_gpu, "clear_trial_auth_settings") as clear:
+            with self.assertRaisesRegex(RuntimeError, "owned startup failed"):
+                with e1_gpu.admitted_e1_model(self.config, "e1:trial"):
+                    pass
+        clear.assert_called_once()
+        self.assertEqual(clear.call_args.args[0].api_key, self.config.api_key)
+        self.assertFalse(self.held)
+
     def test_game_or_unknown_game_state_refuses_before_acquire(self):
         for attribute in ("game", "unavailable"):
             setattr(self, attribute, True)
@@ -286,7 +310,9 @@ class E1GPUAdmissionTests(unittest.TestCase):
         )) as run:
             with self.assertRaises(subprocess.TimeoutExpired):
                 RAW_LEASE_COMMAND("status")
-        self.assertEqual(run.call_args.kwargs["timeout"], 2)
+        # gpu-lease status can spend up to 1 s asking IRIS and 5 s scanning
+        # processes; during a large model load it measured 3.5 s (2026-09-25).
+        self.assertEqual(run.call_args.kwargs["timeout"], 8)
 
     def test_game_during_post_load_hash_stops_exact_idle_server(self):
         gate = threading.Event()

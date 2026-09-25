@@ -25,7 +25,7 @@ from urllib.parse import urlparse
 from urllib.request import Request, urlopen
 
 from .evidence import run_command
-from .objectives import ObjectiveStore
+from .objectives import ObjectiveStore, _acceptance_check_commands
 from .project_evidence import project_home
 from .runtime import RuntimeConfig, _listener_pids, admission, endpoint_alive, inventory, loaded_generation_models, omlx_live_process_binding, omlx_runtime_fingerprint, require_idle_iris_handoff
 from .storage import sha256_file, write_json
@@ -397,6 +397,13 @@ class E0Evaluator:
             record = json.loads(path.read_text())
             if record.get("state") != "accepted":
                 continue
+            try:
+                _acceptance_check_commands(record)
+            except ValueError:
+                # Historical accepted objectives predate exact command binding.
+                # They cannot satisfy current E0, but must not hide a later
+                # valid accepted worker or turn this case into an exception.
+                continue
             store._assert_acceptance(record)
             retained = record["gateway_verifications"][-1]
             gateway_receipt = json.loads(Path(retained["path"]).read_text())
@@ -626,12 +633,26 @@ class E0Evaluator:
             ])
         raise RuntimeError("forged verifier JSON moved objective to accepted")
 
-    def _buried_failure(self) -> dict[str, Any]:
-        for result_path in sorted(
-            self.root.glob("buried-live-*/result.json"),
-            key=lambda path: path.stat().st_mtime,
-            reverse=True,
-        ):
+    def _buried_failure(self, exact_result_path: Path | None = None, *,
+                        record: bool = True) -> dict[str, Any]:
+        """Validate one host run or search prior runs; only E0 writes a case receipt."""
+        if exact_result_path is not None:
+            path = Path(exact_result_path).resolve(strict=True)
+            if (path.name != "result.json" or not path.parent.name.startswith("buried-live-")
+                    or path.parent.parent != self.root.resolve()):
+                raise ValueError("buried observer result is outside the E0 run root")
+            paths = [path]
+        else:
+            paths = sorted(
+                self.root.glob("buried-live-*/result.json"),
+                key=lambda path: path.stat().st_mtime,
+                reverse=True,
+            )
+        def verdict(status: str, evidence: list[str], **extra: Any) -> dict[str, Any]:
+            return (self._receipt("buried-failure", status, evidence, **extra)
+                    if record else {"case": "buried-failure", "status": status,
+                                    "evidence": evidence, **extra})
+        for result_path in paths:
             result = json.loads(result_path.read_text())
             if result.get("candidate") != installed_candidate_fingerprint():
                 continue
@@ -714,12 +735,12 @@ class E0Evaluator:
                 continue
             if marker in primary:
                 continue
-            return self._receipt("buried-failure", "pass", [
+            return verdict("pass", [
                 f"Installed Mavis command ran once and reported exit 1 in {rollout}",
                 f"Complete {len(content)}-byte raw output at {raw} contained the buried marker; final answer matched",
                 f"IRIS remained loaded and Mavis unloaded in {result_path}",
             ], installed_candidate=result["candidate"], raw_sha256=sha256_file(raw))
-        return self._receipt("buried-failure", "blocked", [
+        return verdict("blocked", [
             "No candidate-matched installed harness run retained the full raw output and identified its buried failure."
         ])
 

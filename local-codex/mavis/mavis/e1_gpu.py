@@ -36,8 +36,12 @@ LEASE_MINUTES = "90"
 
 
 def _lease_command(*args: str) -> str:
+    # status can spend up to 1 s asking IRIS and 5 s scanning processes, the
+    # bound the shared observer helper already uses. During a large model load
+    # `gpu-lease status` measured 3.5 s (2026-09-25); a 2 s limit made the
+    # heartbeat abort a healthy trial.
     result = subprocess.run([str(LEASE), *args], capture_output=True, text=True,
-                            timeout=2 if args[0] == "status" else 15,
+                            timeout=8 if args[0] == "status" else 15,
                             check=False)
     if result.returncode:
         raise RuntimeError(f"GPU lease {args[0]} failed: {(result.stderr or result.stdout).strip()}")
@@ -299,6 +303,8 @@ def admitted_e1_model(config: RuntimeConfig, purpose: str) -> Iterator[Callable[
     stopped = {"yes": False}
     load_attempted = False
     unsafe_startup = False
+    start_attempted = False
+    residual_auth = False
     auth_cleared = False
     primary_error: BaseException | None = None
     try:
@@ -314,11 +320,13 @@ def admitted_e1_model(config: RuntimeConfig, purpose: str) -> Iterator[Callable[
         reservation = reserve_empty_mavis_port(config)
         reservation.close()
         try:
+            start_attempted = True
             server_state = start_server(
                 config, require_new=True, heartbeat=lambda: heartbeat(force=True)
             )
         except BaseException as error:
             unsafe_startup = bool(getattr(error, "unsafe_gpu_work", False))
+            residual_auth = bool(getattr(error, "residual_trial_auth", False))
             raise
         if read_json(config.state_path) != server_state:
             raise RuntimeError("Mavis trial launch record changed during startup")
@@ -446,7 +454,7 @@ def admitted_e1_model(config: RuntimeConfig, purpose: str) -> Iterator[Callable[
         finally:
             if gpu_stopped:
                 try:
-                    if not auth_cleared:
+                    if not auth_cleared and start_attempted and not residual_auth:
                         reservation = reserve_empty_mavis_port(config)
                         try:
                             clear_trial_auth_settings(config)

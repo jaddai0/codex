@@ -18,6 +18,38 @@ from mavis.storage import sha256_file, write_json
 
 
 class E0EvaluationTests(unittest.TestCase):
+    def test_external_harness_skips_legacy_objective_without_command_binding(self):
+        with tempfile.TemporaryDirectory() as directory:
+            home = Path(directory)
+            objectives = home / "objectives"
+            objectives.mkdir()
+            gateway = home / "gateway-receipt.json"
+            write_json(gateway, {"gateway_status": {
+                "job_id": "worker-valid", "acceptance": {"verifier_job_id": "terra-valid"}}})
+            valid = objectives / "e0-gateway-bound-valid.json"
+            write_json(valid, {
+                "objective_id": "e0-gateway-bound-valid", "state": "accepted",
+                "acceptance_checks": [{"id": "check", "command": ["python3", "-m", "unittest"]}],
+                "gateway_verifications": [{"path": str(gateway)}],
+            })
+            legacy = objectives / "e0-gateway-bound-legacy.json"
+            write_json(legacy, {
+                "objective_id": "e0-gateway-bound-legacy", "state": "accepted",
+                "acceptance_checks": [{"id": "check", "description": "old text-only check"}],
+                "gateway_verifications": [],
+            })
+            os.utime(legacy, (valid.stat().st_mtime + 10, valid.stat().st_mtime + 10))
+            evaluator = E0Evaluator(home, RuntimeConfig(home=home))
+            with patch("mavis.evaluations.ObjectiveStore._assert_acceptance") as verify:
+                self.assertEqual(evaluator._external_harness()["status"], "pass")
+            self.assertEqual(verify.call_count, 1)
+            self.assertEqual(verify.call_args.args[0]["objective_id"],
+                             "e0-gateway-bound-valid")
+            valid.unlink()
+            with patch("mavis.evaluations.ObjectiveStore._assert_acceptance") as verify:
+                self.assertEqual(evaluator._external_harness()["status"], "blocked")
+            verify.assert_not_called()
+
     def test_trial_post_sends_bearer_key_only_in_request_header(self):
         response = Mock()
         response.__enter__ = Mock(return_value=io.BytesIO(b'{"status":"completed"}'))
@@ -429,6 +461,19 @@ class E0EvaluationTests(unittest.TestCase):
                 self.assertEqual(evaluator.run_case("buried-failure")["status"], "blocked")
                 raw.write_bytes(complete)
                 self.assertEqual(evaluator.run_case("buried-failure")["status"], "pass")
+                accepted_receipt = (evaluator.root / "buried-failure.json").read_bytes()
+                newer = evaluator.root / "buried-live-newer"
+                newer.mkdir()
+                write_json(newer / "result.json", {
+                    "candidate": {"core_sha256": "test"},
+                    "candidate_after": {"core_sha256": "test"},
+                    "rollout": str(newer / "missing.jsonl"), "repo": str(repo),
+                    "mavis_exit": 0, "iris_loaded": True, "mavis_loaded": False,
+                })
+                self.assertEqual(evaluator._buried_failure(
+                    newer / "result.json", record=False)["status"], "blocked")
+                self.assertEqual((evaluator.root / "buried-failure.json").read_bytes(),
+                                 accepted_receipt)
                 events[2]["payload"]["call_id"] = "other"
                 rollout.write_text("".join(json.dumps(event) + "\n" for event in events))
                 self.assertEqual(evaluator.run_case("buried-failure")["status"], "blocked")
