@@ -280,9 +280,15 @@ def main() -> int:
     lease_holder, lease_released = None, False
     monitor_present = receipt["host"]["has_monitor"]
     try:
-        receipt["parts"]["iris_parity"] = part_iris_parity()
-        if not receipt["parts"]["iris_parity"]["pass"]:
-            raise RuntimeError("IRIS parity failed; refusing to canary the monitor")
+        if hasattr(runtime, "iris_voice_session_active"):
+            receipt["parts"]["iris_parity"] = part_iris_parity()
+            if not receipt["parts"]["iris_parity"]["pass"]:
+                raise RuntimeError("IRIS parity failed; refusing to canary the monitor")
+        else:
+            receipt["parts"]["iris_parity"] = {
+                "status": "skipped",
+                "reason": "this revision has no iris_voice_session_active probe",
+            }
         receipt["parts"]["eperm_stop"] = part_eperm_stop()
 
         if not monitor_present:
@@ -332,24 +338,22 @@ def main() -> int:
         receipt["finished_epoch"] = time.time()
 
     parts = receipt["parts"]
-    proven = (
-        parts.get("iris_parity", {}).get("pass")
-        and parts.get("eperm_stop", {}).get("pass")
-    )
-    full = (
-        proven
-        and parts.get("missing_lease", {}).get("raised")
-        and parts.get("fail_closed", {}).get("pass")
-        and parts.get("sustained_monitor", {}).get("pass")
-    )
-    if receipt.get("error"):
+
+    def outcome(part: dict) -> str:
+        if part.get("status") == "skipped":
+            return "skipped"
+        if part.get("pass") is True or part.get("raised") is True:
+            return "pass"
+        return "fail"
+
+    outcomes = {name: outcome(part) for name, part in parts.items()}
+    receipt["part_outcomes"] = outcomes
+    if receipt.get("error") or "fail" in outcomes.values():
         receipt["verdict"] = "fail"
-    elif full:
-        receipt["verdict"] = "pass"
-    elif proven and not monitor_present:
-        receipt["verdict"] = "partial-no-monitor"
+    elif "skipped" in outcomes.values():
+        receipt["verdict"] = "partial"
     else:
-        receipt["verdict"] = "fail"
+        receipt["verdict"] = "pass"
     out = Path(args.out)
     out.parent.mkdir(parents=True, exist_ok=True)
     out.write_text(json.dumps(receipt, indent=1, sort_keys=True) + "\n")
