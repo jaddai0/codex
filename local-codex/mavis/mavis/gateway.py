@@ -12,12 +12,21 @@ import tomllib
 from typing import Any
 
 
+# The gateway's independent verifier: GLM 5.3 in the Codex CLI harness,
+# started through the gateway's bin/glm-codex.sh launcher.
+VERIFIER = "glm-codex"
+VERIFIER_MODEL = "z-ai/glm-5.3"
+VERIFIER_JOB_SUFFIX = "-glm"
+VERIFIER_EVIDENCE_SCHEMA = "model-gateway-verifier-evidence/v2"
+GLM_LAUNCHER_NAME = "glm-codex.sh"
+
+
 class GatewayUnavailable(RuntimeError):
     """The trusted gateway cannot provide a status receipt."""
 
 
-def _configured_gateway() -> tuple[list[str], dict[str, str]]:
-    codex_home = os.environ.get("CODEX_HOME")
+def _configured_gateway(codex_home: str | None = None) -> tuple[list[str], dict[str, str]]:
+    codex_home = codex_home or os.environ.get("CODEX_HOME")
     if not codex_home:
         raise GatewayUnavailable("CODEX_HOME is required for the configured gateway")
     config_path = Path(codex_home).expanduser() / "config.toml"
@@ -40,6 +49,30 @@ def _configured_gateway() -> tuple[list[str], dict[str, str]]:
     ):
         raise GatewayUnavailable("configured model gateway environment is invalid")
     return [str(executable)], dict(configured_env)
+
+
+def _review_codex_home() -> str:
+    """CODEX_HOME, else Mavis's own isolated Codex home (as run_final_e0_with_handoff sets)."""
+    return os.environ.get("CODEX_HOME") or str(Path.home() / ".local-codex")
+
+
+def glm_review_launcher() -> Path:
+    """The configured gateway's GLM 5.3 reviewer launcher, beside its server launcher."""
+    command, _ = _configured_gateway(_review_codex_home())
+    launcher = Path(command[0]).parent / GLM_LAUNCHER_NAME
+    if not launcher.is_file() or not os.access(launcher, os.X_OK):
+        raise GatewayUnavailable("configured gateway has no GLM reviewer launcher")
+    return launcher
+
+
+def glm_review_environment() -> dict[str, str]:
+    """Minimal environment for a direct GLM review: the env-file path, never its contents."""
+    _, configured_env = _configured_gateway(_review_codex_home())
+    environment = {name: os.environ[name] for name in ("PATH", "HOME", "TMPDIR", "LANG", "OPENROUTER_API_KEY")
+                   if name in os.environ}
+    if "MODEL_GATEWAY_ENV_FILE" in configured_env:
+        environment["MODEL_GATEWAY_ENV_FILE"] = configured_env["MODEL_GATEWAY_ENV_FILE"]
+    return environment
 
 
 def _read_response(process: subprocess.Popen[str], request_id: int, deadline: float) -> dict[str, Any]:
@@ -172,7 +205,7 @@ def harness_job_complete(job_id: str, check_results: dict[str, Any], timeout: fl
 
 
 def harness_verifier_start(job_id: str, verifier_job_id: str, timeout: float = 15.0) -> dict[str, Any]:
-    """Start the gateway's independent Terra verifier for one worker."""
+    """Start the gateway's independent GLM 5.3 verifier for one worker."""
     return _gateway_tool("harness_verifier_start", {
         "job_id": job_id, "verifier_job_id": verifier_job_id,
     }, timeout)
@@ -180,9 +213,9 @@ def harness_verifier_start(job_id: str, verifier_job_id: str, timeout: float = 1
 
 def harness_job_verify(job_id: str, verifier_job_id: str, report_sha256: str,
                        timeout: float = 15.0) -> dict[str, Any]:
-    """Ask the gateway to bind Terra's verdict to the exact worker report."""
+    """Ask the gateway to bind the GLM verifier's verdict to the exact worker report."""
     return _gateway_tool("harness_job_verify", {
-        "job_id": job_id, "verifier": "terra", "verdict": "accepted",
+        "job_id": job_id, "verifier": VERIFIER, "verdict": "accepted",
         "evidence_sha256": report_sha256, "verifier_job_id": verifier_job_id,
     }, timeout)
 

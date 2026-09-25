@@ -10,16 +10,24 @@ import tempfile
 import unittest
 from unittest.mock import patch
 
-from mavis.e2_tasks import (CATALOG_TEST, FULL_TEST, codex_terra_review_completed,
+from mavis.e2_tasks import (CATALOG_TEST, FULL_TEST, codex_review_completed,
                             first_task_prompt, fixture_state, matching_first_rollout,
                             prepare_heldout, resume_task_prompt, run_host_check,
                             task_launch_commands,
-                            terra_review_command, terra_review_prompt, verify_heldout)
+                            independent_review_command, independent_review_prompt, verify_heldout)
 from mavis.runtime import DEFAULT_MODEL
 from mavis.storage import sha256_file, write_json
 
 
+GLM_LAUNCHER = Path("/gateway/bin/glm-codex.sh")
+
+
 class E2HeldoutTests(unittest.TestCase):
+    def setUp(self) -> None:
+        launcher = patch("mavis.e2_tasks.glm_review_launcher", return_value=GLM_LAUNCHER)
+        launcher.start()
+        self.addCleanup(launcher.stop)
+
     def _fixture(self, root: Path) -> tuple[Path, Path, Path]:
         manifest = prepare_heldout(root)
         task = manifest.parent
@@ -80,17 +88,17 @@ class E2HeldoutTests(unittest.TestCase):
         ])
         rollout = task / "rollout-selected.jsonl"
         rollout.write_bytes(b"".join(json.dumps(event).encode() + b"\n" for event in events))
-        review_log = task / "terra-review.jsonl"
+        review_log = task / "glm-review.jsonl"
         review_events = [
-            {"type": "thread.started", "thread_id": "terra-thread-e2"},
+            {"type": "thread.started", "thread_id": "glm-thread-e2"},
             {"type": "turn.started"},
             {"type": "item.completed", "item": {"type": "agent_message", "text": "ACCEPT: verified both packages and files"}},
             {"type": "turn.completed"},
         ]
         review_log.write_text("".join(json.dumps(row) + "\n" for row in review_events))
-        review_stderr = task / "terra-review.stderr.log"
+        review_stderr = task / "glm-review.stderr.log"
         review_stderr.write_text("")
-        review_text = task / "terra-review.txt"
+        review_text = task / "glm-review.txt"
         review_text.write_text("ACCEPT: verified both packages and files")
         e0_summary = task / "e0-summary.json"
         write_json(e0_summary, {"model_id": DEFAULT_MODEL})
@@ -113,8 +121,8 @@ class E2HeldoutTests(unittest.TestCase):
             "first_rollout_bytes": len(prefix), "first_rollout_events": first_count,
             "first_rollout_sha256": hashlib.sha256(prefix).hexdigest(),
             "review_exit": 0,
-            "review_argv": terra_review_command(repo, review_text, terra_review_prompt(manifest, rollout)),
-            "review_thread_id": "terra-thread-e2",
+            "review_argv": independent_review_command(repo, review_text, independent_review_prompt(manifest, rollout)),
+            "review_thread_id": "glm-thread-e2",
             "review_log_sha256": sha256_file(review_log),
             "review_stderr_sha256": sha256_file(review_stderr),
             "review_text_sha256": sha256_file(review_text),
@@ -230,29 +238,35 @@ class E2HeldoutTests(unittest.TestCase):
                     verify_heldout(manifest)
         with tempfile.TemporaryDirectory() as directory:
             manifest, task, _repo, result = self._observed(Path(directory))
-            (task / "terra-review.txt").write_text("REJECT: failed review")
-            result["review_text_sha256"] = sha256_file(task / "terra-review.txt")
+            (task / "glm-review.txt").write_text("REJECT: failed review")
+            result["review_text_sha256"] = sha256_file(task / "glm-review.txt")
             write_json(task / "result.json", result)
             with patch("mavis.e2_tasks.installed_candidate_fingerprint", return_value={"core_sha256": "candidate"}), patch(
                     "mavis.e2_tasks.current_e0_summary", return_value=(task / "e0-summary.json", {"model_id": DEFAULT_MODEL})):
                 with self.assertRaises(ValueError):
                     verify_heldout(manifest)
 
-    def test_native_terra_review_requires_exact_final_message_and_completion(self):
+    def test_review_command_runs_glm_read_only_through_the_gateway_launcher(self):
+        command = independent_review_command(Path("/repo"), Path("/task/glm-review.txt"), "review it")
+        self.assertEqual(command, [str(GLM_LAUNCHER), "exec", "--model", "z-ai/glm-5.3",
+                                   "--sandbox", "read-only", "-C", "/repo", "--json",
+                                   "--output-last-message", "/task/glm-review.txt", "review it"])
+
+    def test_native_glm_review_requires_exact_final_message_and_completion(self):
         events = [
-            {"type": "thread.started", "thread_id": "terra-thread-e2"},
+            {"type": "thread.started", "thread_id": "glm-thread-e2"},
             {"type": "turn.started"},
             {"type": "item.completed", "item": {"type": "agent_message", "text": "ACCEPT: checked"}},
             {"type": "turn.completed"},
         ]
         log = "".join(json.dumps(row) + "\n" for row in events)
-        self.assertEqual(codex_terra_review_completed(log, "ACCEPT: checked"), "terra-thread-e2")
+        self.assertEqual(codex_review_completed(log, "ACCEPT: checked"), "glm-thread-e2")
         with self.assertRaises(ValueError):
-            codex_terra_review_completed(log, "ACCEPT: different")
+            codex_review_completed(log, "ACCEPT: different")
         with self.assertRaises(ValueError):
-            codex_terra_review_completed(log.removesuffix(json.dumps(events[-1]) + "\n"), "ACCEPT: checked")
+            codex_review_completed(log.removesuffix(json.dumps(events[-1]) + "\n"), "ACCEPT: checked")
         with self.assertRaises(ValueError):
-            codex_terra_review_completed(log, "REJECT: checked")
+            codex_review_completed(log, "REJECT: checked")
 
 
 if __name__ == "__main__":

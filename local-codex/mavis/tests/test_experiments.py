@@ -19,7 +19,7 @@ class ExperimentLifecycleTests(unittest.TestCase):
         self.temporary = tempfile.TemporaryDirectory()
         self.addCleanup(self.temporary.cleanup)
         self.home = Path(self.temporary.name)
-        self.gateway_verifier = "terra-2"
+        self.gateway_verifier = "glm-2"
         self.store = ExperimentStore(self.home, gateway_status_reader=self._gateway_status)
         self.store.seed_active("main", BASE)
         self.candidate = deepcopy(BASE)
@@ -34,13 +34,13 @@ class ExperimentLifecycleTests(unittest.TestCase):
         candidate = worker_job_id == "candidate-worker-1"
         requirements = (candidate_assignment_requirements(record) if candidate
                         else review_assignment_requirements(record))
-        verifier = "terra-candidate-1" if candidate else self.gateway_verifier
+        verifier = "glm-candidate-1" if candidate else self.gateway_verifier
         review_report = self.home / "verifications" / "experiments" / "fix-1.json"
         return {"job_id": worker_job_id, "state": "completed", "exit_code": 0,
                 "accepted": True,
                 "receipt": {"job_id": worker_job_id, "exit_code": 0},
                 "acceptance": {"accepted": True, "job_id": worker_job_id,
-                               "verifier": "terra", "verifier_job_id": verifier,
+                               "verifier": "glm-codex", "verifier_job_id": verifier,
                                "target_sha256": "a" * 64, "evidence_sha256": "b" * 64,
                                "report_sha256_on_disk": "c" * 64,
                                "verifier_verdict_sha256": "d" * 64},
@@ -64,7 +64,7 @@ class ExperimentLifecycleTests(unittest.TestCase):
         return self.store.compare("fix-1", baseline_result=self._result("baseline", 0.3, mandatory=False),
                                   candidate_result=self._result("candidate", 0.8))
 
-    def _review(self, *, verifier="terra-2", candidate_job="candidate-worker-1", verdict="accepted"):
+    def _review(self, *, verifier="glm-2", candidate_job="candidate-worker-1", verdict="accepted"):
         record = self.store.load("fix-1")
         path = self.home / "verifications" / "experiments" / "fix-1.json"
         write_json(path, {"schema_version": "mavis.experiment-review/v1", "experiment_id": "fix-1",
@@ -162,12 +162,12 @@ class ExperimentLifecycleTests(unittest.TestCase):
     def test_gateway_review_revocation_blocks_stage_and_promotion(self):
         self._compare()
         self.store.review("fix-1", self._review())
-        self.gateway_verifier = "different-terra-job"
+        self.gateway_verifier = "different-glm-job"
         with self.assertRaisesRegex(ValueError, "status changed"):
             self.store.stage("fix-1")
-        self.gateway_verifier = "terra-2"
+        self.gateway_verifier = "glm-2"
         self.store.stage("fix-1")
-        self.gateway_verifier = "different-terra-job"
+        self.gateway_verifier = "different-glm-job"
         with self.assertRaisesRegex(ValueError, "status changed"):
             self.store.promote("fix-1", between_objectives=True)
         self.assertEqual(self.store.active("main")["configuration"], self.record["baseline"])

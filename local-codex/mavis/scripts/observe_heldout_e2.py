@@ -24,10 +24,11 @@ import uuid
 from typing import Callable
 
 from mavis.e2_tasks import (CATALOG_TEST, FULL_TEST, _completed_prompt_turn,
-                            _user_turn, codex_terra_review_completed, first_task_prompt,
+                            _user_turn, codex_review_completed, first_task_prompt,
                             fixture_state, matching_first_rollout, prepare_heldout,
                             resume_task_prompt, run_host_check, task_launch_commands,
-                            terra_review_command, terra_review_prompt, verify_heldout)
+                            independent_review_command, independent_review_prompt, verify_heldout)
+from mavis.gateway import glm_review_environment, glm_review_launcher
 from mavis.e1_bootstrap import _summary as current_e0_summary
 from mavis.evaluations import installed_candidate_fingerprint
 from mavis.runtime import (RuntimeConfig, endpoint_alive, handoff_lease_fd,
@@ -185,6 +186,9 @@ def _run_tui(command: list[str], *, repo: Path, env: dict[str, str],
 
 @with_mavis_handoff_lease("observe_heldout_e2")
 def main() -> int:
+    # The GLM review runs after the GPU task; fail before spending the GPU turn.
+    glm_review_launcher()
+    glm_review_environment()
     service = Path.home() / ".local-codex" / "mavis-service"
     config = RuntimeConfig(home=service, allow_concurrent_local=True,
                            api_key=secrets.token_urlsafe(48))
@@ -297,26 +301,26 @@ def main() -> int:
             or result.get("gpu_lease_released") is not True):
         print(task / "result.json", flush=True)
         return 1
-    review_text = task / "terra-review.txt"
-    review_argv = terra_review_command(
-        repo, review_text, terra_review_prompt(manifest_path, Path(result["rollout"])))
+    review_text = task / "glm-review.txt"
+    review_argv = independent_review_command(
+        repo, review_text, independent_review_prompt(manifest_path, Path(result["rollout"])))
     before_review = fixture_state(manifest_path, stage="complete")
-    with (task / "terra-review.jsonl").open("wb") as log, (task / "terra-review.stderr.log").open("wb") as err:
+    with (task / "glm-review.jsonl").open("wb") as log, (task / "glm-review.stderr.log").open("wb") as err:
         review = subprocess.run(review_argv, cwd=repo, stdin=subprocess.DEVNULL,
                                 stdout=log, stderr=err,
-                                env={**os.environ, "PYTHONDONTWRITEBYTECODE": "1"}, timeout=900)
+                                env={**glm_review_environment(), "PYTHONDONTWRITEBYTECODE": "1"}, timeout=900)
     if fixture_state(manifest_path, stage="complete") != before_review:
-        raise RuntimeError("Terra review changed the fixture")
+        raise RuntimeError("GLM review changed the fixture")
     thread_id = None
     try:
-        thread_id = codex_terra_review_completed(
-            (task / "terra-review.jsonl").read_text(), review_text.read_text())
+        thread_id = codex_review_completed(
+            (task / "glm-review.jsonl").read_text(), review_text.read_text())
     except (ValueError, FileNotFoundError) as exc:
         result["review_parse_error"] = repr(exc)
     result.update({"review_exit": review.returncode,
                    "review_argv": review_argv, "review_thread_id": thread_id,
-                   "review_log_sha256": sha256_file(task / "terra-review.jsonl"),
-                   "review_stderr_sha256": sha256_file(task / "terra-review.stderr.log"),
+                   "review_log_sha256": sha256_file(task / "glm-review.jsonl"),
+                   "review_stderr_sha256": sha256_file(task / "glm-review.stderr.log"),
                    "review_text_sha256": sha256_file(review_text) if review_text.is_file() else None})
     write_json(task / "result.json", result)
     try:

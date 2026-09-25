@@ -11,7 +11,8 @@ import subprocess
 from typing import Any, Callable
 
 from .evaluations import E0_CASES, installed_candidate_fingerprint
-from .gateway import harness_assignment_start, harness_job_status
+from .gateway import (VERIFIER, VERIFIER_EVIDENCE_SCHEMA, VERIFIER_JOB_SUFFIX, VERIFIER_MODEL,
+                      harness_assignment_start, harness_job_status)
 from .objectives import _validate_gateway_status
 from .package_provenance import package_tree_sha256
 from .runtime import inventory
@@ -233,20 +234,23 @@ def _check_review_inspection(home: Path, assignment: dict[str, Any], review: dic
         raise ValueError("E1 bootstrap review cannot accept unresolved inspection issues")
 
 
-def _check_terra_evidence(status: dict[str, Any], dispatch: dict[str, Any],
+def _check_verifier_evidence(status: dict[str, Any], dispatch: dict[str, Any],
                           review: dict[str, Any], report_path: Path,
                           required_checks: list[str]) -> None:
     evidence = status.get("verifier_evidence")
     if (not isinstance(evidence, dict)
-            or set(evidence) != {"schema_version", "verifier_job_id", "verdict",
+            or set(evidence) != {"schema_version", "verifier", "verifier_model",
+                                 "verifier_job_id", "verdict",
                                  "target_sha256", "worker_report_sha256", "report_path",
                                  "report_sha256", "findings"}
-            or evidence["schema_version"] != "model-gateway-terra-verifier-evidence/v1"
+            or evidence["schema_version"] != VERIFIER_EVIDENCE_SCHEMA
+            or evidence["verifier"] != VERIFIER
+            or evidence["verifier_model"] != VERIFIER_MODEL
             or evidence["verifier_job_id"] != review["verifier_job_id"]
             or evidence["verdict"] != "accepted"
             or evidence["target_sha256"] != status["acceptance"]["target_sha256"]
             or evidence["worker_report_sha256"] != sha256_file(report_path)):
-        raise ValueError("E1 bootstrap lacks bound Terra verifier evidence")
+        raise ValueError("E1 bootstrap lacks bound GLM verifier evidence")
     path = Path(evidence["report_path"]) if isinstance(evidence["report_path"], str) else Path("")
     worker_dir = Path(dispatch["job_dir"]).resolve(strict=True)
     if (not path.is_absolute() or path.name != "report.md" or path.is_symlink()
@@ -255,19 +259,19 @@ def _check_terra_evidence(status: dict[str, Any], dispatch: dict[str, Any],
             or path.parent.parent.resolve() != worker_dir.parent
             or evidence["report_sha256"] != sha256_file(path)
             or evidence["report_sha256"] != status["acceptance"]["verifier_verdict_sha256"]):
-        raise ValueError("E1 bootstrap Terra report bytes differ from gateway acceptance")
+        raise ValueError("E1 bootstrap GLM verifier report bytes differ from gateway acceptance")
     verdict = read_json(path)
     if (not isinstance(verdict, dict)
             or set(verdict) != {"target_sha256", "verdict", "findings"}
             or verdict != {key: evidence[key] for key in verdict}):
-        raise ValueError("E1 bootstrap Terra report differs from gateway status")
+        raise ValueError("E1 bootstrap GLM verifier report differs from gateway status")
     findings = evidence["findings"]
     expected = {"assignment", "report", "receipt"} | {
         f"check:{name}" for name in required_checks
     }
     if (not isinstance(findings, list) or len(findings) != len(expected)
             or {item.get("evidence_ref") for item in findings if isinstance(item, dict)} != expected):
-        raise ValueError("E1 bootstrap Terra findings omit required evidence")
+        raise ValueError("E1 bootstrap GLM verifier findings omit required evidence")
     for item in findings:
         if (not isinstance(item, dict)
                 or set(item) != {"evidence_ref", "sha256", "assessment", "observation"}
@@ -277,7 +281,7 @@ def _check_terra_evidence(status: dict[str, Any], dispatch: dict[str, Any],
                 or not isinstance(item["observation"], str)
                 or len(item["observation"].strip()) < 40
                 or len(item["observation"].split()) < 8):
-            raise ValueError("E1 bootstrap Terra finding is incomplete")
+            raise ValueError("E1 bootstrap GLM verifier finding is incomplete")
 
 
 def _git_revision(checkout: Path) -> str:
@@ -437,7 +441,7 @@ def _gateway_arguments(
     packet: dict[str, Any], assignment_path: Path, job_id: str
 ) -> dict[str, Any]:
     require_safe_id(job_id, "bootstrap review job id")
-    require_safe_id(f"{job_id}-terra", "bootstrap verifier job id")
+    require_safe_id(f"{job_id}{VERIFIER_JOB_SUFFIX}", "bootstrap verifier job id")
     owner = packet["owner"]
     if (owner["provider"], owner["harness"]) != ("minimax", "opencode"):
         raise ValueError("E1 bootstrap reviewer requires a model-selected MiniMax harness")
@@ -476,7 +480,7 @@ def _gateway_arguments(
             "installed_candidate_digest, model_identity_digest, assignment_sha256 "
             "(SHA-256 of the raw review-assignment.json file bytes, for example "
             "with shasum -a 256; do not hash parsed or re-serialized JSON), "
-            f"gateway_worker_job_id ({job_id}), and verifier_job_id ({job_id}-terra). "
+            f"gateway_worker_job_id ({job_id}), and verifier_job_id ({job_id}{VERIFIER_JOB_SUFFIX}). "
             "This names the planned separate verifier; it does not claim that verifier ran. "
             "Use the frozen packet's exact hashes. Keep cited_evidence to "
             "one short verbatim evidence string per case. Return one complete "
@@ -568,7 +572,7 @@ def dispatch_bootstrap_review(
     dispatch = {
         "schema_version": "mavis.e1-bootstrap-dispatch/v1",
         "job_id": job_id,
-        "verifier_job_id": f"{job_id}-terra",
+        "verifier_job_id": f"{job_id}{VERIFIER_JOB_SUFFIX}",
         "packet_path": str(assignment_path),
         "packet_sha256": sha256_file(assignment_path),
         "arguments_digest": _digest(arguments),
@@ -597,7 +601,7 @@ def _dispatch(
     report = Path(dispatch.get("report_path") or "")
     if (
         dispatch.get("schema_version") != "mavis.e1-bootstrap-dispatch/v1"
-        or dispatch.get("verifier_job_id") != f"{job_id}-terra"
+        or dispatch.get("verifier_job_id") != f"{job_id}{VERIFIER_JOB_SUFFIX}"
         or dispatch.get("packet_path") != str(assignment_path)
         or dispatch.get("packet_sha256") != sha256_file(assignment_path)
         or dispatch.get("arguments_digest") != _digest(expected)
@@ -811,7 +815,7 @@ def _review(home: Path, receipt: dict[str, Any], status_reader: Callable[[str], 
             or acceptance.get("target_sha256") != binding.get("target_sha256")
             or status.get("accepted") is not True):
         raise ValueError("E1 bootstrap review lacks exact independent gateway acceptance")
-    _check_terra_evidence(status, dispatch, review, path, assignment["required_checks"])
+    _check_verifier_evidence(status, dispatch, review, path, assignment["required_checks"])
 
 
 def validate_bootstrap(

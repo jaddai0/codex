@@ -18,7 +18,7 @@ import os
 from pathlib import Path
 from typing import Any, Callable, Iterator
 
-from .gateway import harness_job_status
+from .gateway import VERIFIER as GATEWAY_VERIFIER, harness_job_status
 from .maintenance import MaintenanceQueue
 from .objectives import _validate_gateway_status
 from .profile_transition import commit as commit_profile_transition
@@ -369,7 +369,7 @@ class ExperimentStore:
         if (status.get("job_id") != worker_job_id or status.get("state") != "completed"
                 or status.get("exit_code") != 0 or status.get("accepted") is not True
                 or not isinstance(acceptance, dict) or acceptance.get("accepted") is not True
-                or acceptance.get("job_id") != worker_job_id or acceptance.get("verifier") != "terra"
+                or acceptance.get("job_id") != worker_job_id or acceptance.get("verifier") != GATEWAY_VERIFIER
                 or not acceptance.get("verifier_job_id") or acceptance["verifier_job_id"] == worker_job_id
                 or not isinstance(binding, dict) or binding.get("objective_id") != record["experiment_id"]
                 or not isinstance(requirements, list)

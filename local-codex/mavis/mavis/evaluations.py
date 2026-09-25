@@ -308,9 +308,9 @@ class E0Evaluator:
         )
 
     def _small_repository(self, case: str) -> dict[str, Any]:
-        """Recheck an installed Mavis repair and its separate native Terra review."""
+        """Recheck an installed Mavis repair and its separate native GLM review."""
         from .e0_tasks import small_repository_review_prompt
-        from .e2_tasks import codex_terra_review_completed, terra_review_command
+        from .e2_tasks import codex_review_completed, independent_review_command
 
         candidates = sorted(
             (self.root / "tasks").glob("*/manifest.json"),
@@ -320,22 +320,23 @@ class E0Evaluator:
         for manifest_path in candidates:
             task_root = manifest_path.parent
             mavis_log = task_root / "installed-mavis-repair.jsonl"
-            terra_log = task_root / "terra-review.jsonl"
-            terra_stderr = task_root / "terra-review.stderr.log"
-            terra_result = task_root / "terra-review.txt"
+            review_log = task_root / "glm-review.jsonl"
+            review_stderr = task_root / "glm-review.stderr.log"
+            review_result = task_root / "glm-review.txt"
             installed_run = task_root / "installed-run.json"
-            if not all(path.is_file() for path in (mavis_log, terra_log, terra_stderr,
-                                                   terra_result, installed_run)):
+            if not all(path.is_file() for path in (mavis_log, review_log, review_stderr,
+                                                   review_result, installed_run)):
                 continue
             observed_run = json.loads(installed_run.read_text())
-            if observed_run.get("candidate") != installed_candidate_fingerprint():
+            if (observed_run.get("schema_version") != "mavis.e0-installed-run/v2"
+                    or observed_run.get("candidate") != installed_candidate_fingerprint()):
                 continue
-            if observed_run.get("mavis_log_sha256") != sha256_file(mavis_log) or observed_run.get("terra_log_sha256") != sha256_file(terra_log):
+            if observed_run.get("mavis_log_sha256") != sha256_file(mavis_log) or observed_run.get("review_log_sha256") != sha256_file(review_log):
                 raise ValueError("E0 installed task logs changed after observation")
-            if (observed_run.get("terra_stderr_sha256") != sha256_file(terra_stderr)
-                    or observed_run.get("terra_text_sha256") != sha256_file(terra_result)
+            if (observed_run.get("review_stderr_sha256") != sha256_file(review_stderr)
+                    or observed_run.get("review_text_sha256") != sha256_file(review_result)
                     or observed_run.get("review_exit") != 0):
-                raise ValueError("E0 Terra review output or exit changed")
+                raise ValueError("E0 GLM review output or exit changed")
             manifest = json.loads(manifest_path.read_text())
             repo = Path(manifest["repo"]).resolve()
             if repo != (task_root / "repo").resolve() or not repo.is_dir():
@@ -354,25 +355,25 @@ class E0Evaluator:
             if subprocess.check_output(["git", "-C", str(repo), "ls-files", "--others", "--exclude-standard"], text=True).strip():
                 raise ValueError("E0 task contains unexpected untracked files")
             mavis_events = [json.loads(line) for line in mavis_log.read_text().splitlines() if line.startswith("{")]
-            terra_output = terra_log.read_text()
+            review_output = review_log.read_text()
             mavis_finished = any(event.get("type") == "turn.completed" for event in mavis_events)
-            review_argv = terra_review_command(
-                repo, terra_result, small_repository_review_prompt(manifest_path))
+            review_argv = independent_review_command(
+                repo, review_result, small_repository_review_prompt(manifest_path))
             if observed_run.get("review_argv") != review_argv:
-                raise ValueError("E0 Terra review command changed")
+                raise ValueError("E0 GLM review command changed")
             try:
-                terra_finished = observed_run.get("review_thread_id") == codex_terra_review_completed(
-                    terra_output, terra_result.read_text())
+                review_finished = observed_run.get("review_thread_id") == codex_review_completed(
+                    review_output, review_result.read_text())
             except ValueError:
-                terra_finished = False
+                review_finished = False
             patch_seen = any(
                 event.get("type") == "item.completed"
                 and event.get("item", {}).get("type") == "file_change"
                 and any(Path(change.get("path", "")).resolve() == repo / "package" / "pricing.py" for change in event["item"].get("changes", []))
                 for event in mavis_events
             )
-            if not (mavis_finished and terra_finished and patch_seen):
-                raise ValueError("E0 installed repair or independent Terra review is incomplete")
+            if not (mavis_finished and review_finished and patch_seen):
+                raise ValueError("E0 installed repair or independent GLM review is incomplete")
             tests = subprocess.run(
                 manifest["test_command"], cwd=repo, capture_output=True, text=True,
                 env={**os.environ, "PYTHONDONTWRITEBYTECODE": "1"}, check=False,
@@ -381,12 +382,12 @@ class E0Evaluator:
                 raise ValueError("E0 seeded repair tests failed")
             return self._receipt(case, "pass", [
                 f"Installed Mavis repaired {repo / 'package' / 'pricing.py'}; exact tests passed and protected note hash held",
-                f"Separate native Terra review accepted; logs sha256 {sha256_file(mavis_log)} and {sha256_file(terra_log)}",
-            ], manifest=str(manifest_path), review=str(terra_result))
-        return self._receipt(case, "blocked", ["No complete installed Mavis repair and independent Terra review found"])
+                f"Separate native GLM 5.3 review accepted; logs sha256 {sha256_file(mavis_log)} and {sha256_file(review_log)}",
+            ], manifest=str(manifest_path), review=str(review_result))
+        return self._receipt(case, "blocked", ["No complete installed Mavis repair and independent GLM review found"])
 
     def _external_harness(self) -> dict[str, Any]:
-        """Revalidate a native gateway worker and distinct Terra closure."""
+        """Revalidate a native gateway worker and distinct GLM verifier closure."""
         store = ObjectiveStore(self.home)
         paths = sorted(
             store.root.glob("e0-gateway-bound-*.json"),
@@ -404,12 +405,18 @@ class E0Evaluator:
                 # They cannot satisfy current E0, but must not hide a later
                 # valid accepted worker or turn this case into an exception.
                 continue
-            store._assert_acceptance(record)
+            try:
+                store._assert_acceptance(record)
+            except ValueError:
+                # Objectives accepted by an earlier verifier (Terra) no longer
+                # bind to the live gateway's GLM verifier. Skip them like the
+                # pre-binding records above; none valid means blocked.
+                continue
             retained = record["gateway_verifications"][-1]
             gateway_receipt = json.loads(Path(retained["path"]).read_text())
             status = gateway_receipt["gateway_status"]
             return self._receipt("external-harness", "pass", [
-                f"Native worker {status['job_id']} completed with host receipt and an accepted separate Terra job {status['acceptance']['verifier_job_id']}",
+                f"Native worker {status['job_id']} completed with host receipt and an accepted separate GLM verifier job {status['acceptance']['verifier_job_id']}",
                 f"Mavis objective {record['objective_id']} revalidated against the live configured gateway and exact host evidence",
             ], objective_id=record["objective_id"], gateway_receipt=retained["path"])
         return self._receipt("external-harness", "blocked", ["No accepted native gateway worker bound to a Mavis objective was found"])
@@ -629,7 +636,7 @@ class E0Evaluator:
         except ValueError:
             return self._receipt("fabricated-success-rejection", "pass", [
                 "Incomplete in-root receipt was rejected",
-                "A host test receipt plus model-supplied accepted verifier JSON could not authorize acceptance without a bound native gateway/Terra receipt",
+                "A host test receipt plus model-supplied accepted verifier JSON could not authorize acceptance without a bound native gateway/GLM verifier receipt",
             ])
         raise RuntimeError("forged verifier JSON moved objective to accepted")
 

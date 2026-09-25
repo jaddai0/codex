@@ -1,4 +1,4 @@
-"""Run the installed E0 repair with the shared GPU, then native Terra review."""
+"""Run the installed E0 repair with the shared GPU, then a native GLM 5.3 review."""
 
 from __future__ import annotations
 
@@ -10,7 +10,8 @@ import subprocess
 import sys
 
 from mavis.e0_tasks import prepare_small_repository, small_repository_review_prompt
-from mavis.e2_tasks import codex_terra_review_completed, terra_review_command
+from mavis.e2_tasks import codex_review_completed, independent_review_command
+from mavis.gateway import glm_review_environment, glm_review_launcher
 from mavis.evaluations import installed_candidate_fingerprint
 from mavis.runtime import (RuntimeConfig, endpoint_alive, handoff_lease_fd,
                            inventory, loaded_generation_models,
@@ -21,6 +22,9 @@ from shared_gpu_observation import shared_mavis_model
 
 @with_mavis_handoff_lease("observe_small_repository")
 def main() -> int:
+    # The GLM review runs after the GPU repair; fail before spending the GPU turn.
+    glm_review_launcher()
+    glm_review_environment()
     home = Path.home()
     service = home / ".local-codex" / "mavis-service"
     config = RuntimeConfig(home=service, allow_concurrent_local=True,
@@ -74,27 +78,27 @@ def main() -> int:
         print(task / "handoff-summary.json")
         return 1
 
-    review_text = task / "terra-review.txt"
-    review_argv = terra_review_command(
+    review_text = task / "glm-review.txt"
+    review_argv = independent_review_command(
         repo, review_text, small_repository_review_prompt(manifest_path))
-    with (task / "terra-review.jsonl").open("wb") as log, \
-            (task / "terra-review.stderr.log").open("wb") as stderr:
+    with (task / "glm-review.jsonl").open("wb") as log, \
+            (task / "glm-review.stderr.log").open("wb") as stderr:
         review = subprocess.run(review_argv, cwd=repo, stdin=subprocess.DEVNULL,
                                 stdout=log, stderr=stderr,
-                                env={**os.environ, "PYTHONDONTWRITEBYTECODE": "1"},
+                                env={**glm_review_environment(), "PYTHONDONTWRITEBYTECODE": "1"},
                                 timeout=900)
-    review_log = (task / "terra-review.jsonl").read_text()
+    review_log = (task / "glm-review.jsonl").read_text()
     response = review_text.read_text() if review_text.is_file() else ""
     try:
-        review_thread_id = codex_terra_review_completed(review_log, response)
+        review_thread_id = codex_review_completed(review_log, response)
     except ValueError:
         review_thread_id = None
     write_json(task / "installed-run.json", {
-        "schema_version": "mavis.e0-installed-run/v1", "candidate": candidate,
+        "schema_version": "mavis.e0-installed-run/v2", "candidate": candidate,
         "mavis_log_sha256": sha256_file(task / "installed-mavis-repair.jsonl"),
-        "terra_log_sha256": sha256_file(task / "terra-review.jsonl"),
-        "terra_stderr_sha256": sha256_file(task / "terra-review.stderr.log"),
-        "terra_text_sha256": sha256_file(review_text) if review_text.is_file() else None,
+        "review_log_sha256": sha256_file(task / "glm-review.jsonl"),
+        "review_stderr_sha256": sha256_file(task / "glm-review.stderr.log"),
+        "review_text_sha256": sha256_file(review_text) if review_text.is_file() else None,
         "review_argv": review_argv, "review_exit": review.returncode,
         "review_thread_id": review_thread_id,
     })

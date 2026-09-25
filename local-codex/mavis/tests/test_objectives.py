@@ -107,8 +107,8 @@ class ObjectiveStoreTests(unittest.TestCase):
             "acceptance": {
                 "job_id": worker_job_id,
                 "accepted": True,
-                "verifier": "terra",
-                "verifier_job_id": "terra-job-1",
+                "verifier": "glm-codex",
+                "verifier_job_id": "glm-job-1",
                 "target_sha256": digest,
                 "evidence_sha256": "b" * 64,
                 "report_sha256_on_disk": "c" * 64,
@@ -236,7 +236,7 @@ class ObjectiveStoreTests(unittest.TestCase):
             with self.assertRaisesRegex(ValueError, "Mavis host gateway verification"):
                 store.transition("obj-1", "accepted", "forged verifier JSON")
 
-    def test_accepts_host_gateway_receipt_bound_to_terra_verifier(self):
+    def test_accepts_host_gateway_receipt_bound_to_glm_verifier(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             gateway_available = True
@@ -280,7 +280,7 @@ class ObjectiveStoreTests(unittest.TestCase):
             record = store.transition("obj-1", "accepted", "verified")
             self.assertEqual(record["state"], "accepted")
 
-    def test_gateway_receipt_rejects_same_job_as_terra_verifier(self):
+    def test_gateway_receipt_rejects_same_job_as_glm_verifier(self):
         status = self.gateway_status()
         status["acceptance"]["verifier_job_id"] = "worker-job-1"
         with tempfile.TemporaryDirectory() as directory:
@@ -297,7 +297,7 @@ class ObjectiveStoreTests(unittest.TestCase):
             subprocess.run(["git", "commit", "-qm", "fixture"], cwd=fixture, check=True)
             receipt = run_command(root, "obj-1", ["python3", "-c", "print('1 passed')"], fixture, acceptance_check_ids=["c1"])
             store.add_receipt("obj-1", receipt)
-            with self.assertRaisesRegex(ValueError, "distinct Terra"):
+            with self.assertRaisesRegex(ValueError, "distinct GLM"):
                 store.record_gateway_verification("obj-1", "worker-job-1")
 
     def test_gateway_binding_rejects_an_accepted_job_for_another_objective(self):

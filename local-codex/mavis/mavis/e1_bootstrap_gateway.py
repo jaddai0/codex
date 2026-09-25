@@ -1,4 +1,4 @@
-"""Drive the gateway's real completion and independent Terra acceptance chain."""
+"""Drive the gateway's real completion and independent GLM verifier acceptance chain."""
 
 from __future__ import annotations
 
@@ -67,7 +67,7 @@ def complete_bootstrap_review(
 def start_bootstrap_verifier(
     home: Path, *, starter: Callable[[str, str], dict[str, Any]] | None = None,
 ) -> dict[str, Any]:
-    """Start a separate Terra job only after the worker check is recorded."""
+    """Start a separate GLM verifier job only after the worker check is recorded."""
     home = Path(home).resolve()
     assignment_path, assignment, _ = _assignment(home)
     dispatch = _dispatch(home, assignment_path, assignment)
@@ -84,12 +84,12 @@ def start_bootstrap_verifier(
         raise ValueError("E1 bootstrap gateway completion changed")
     path = home / "e1/bootstrap/review-verifier-dispatch.json"
     if path.exists():
-        raise FileExistsError("E1 bootstrap Terra verifier was already started")
+        raise FileExistsError("E1 bootstrap GLM verifier was already started")
     result = (starter or harness_verifier_start)(dispatch["job_id"], dispatch["verifier_job_id"])
     if (not isinstance(result, dict) or result.get("success") is not True
             or result.get("started") is not True or result.get("accepted") is not False
             or result.get("job_id") != dispatch["verifier_job_id"]):
-        raise ValueError("E1 bootstrap gateway did not start the exact Terra verifier")
+        raise ValueError("E1 bootstrap gateway did not start the exact GLM verifier")
     record = {"schema_version": "mavis.e1-bootstrap-verifier-dispatch/v1",
               "job_id": dispatch["job_id"], "verifier_job_id": dispatch["verifier_job_id"],
               "completion_sha256": sha256_file(completion_path)}
@@ -101,7 +101,7 @@ def verify_and_import_bootstrap_review(
     home: Path, *, status_reader: Callable[[str], dict[str, Any]] | None = None,
     verifier: Callable[[str, str, str], dict[str, Any]] | None = None,
 ) -> dict[str, Any]:
-    """Require Terra's terminal verdict and accepted gateway status before import."""
+    """Require the GLM verifier's terminal verdict and accepted gateway status before import."""
     home = Path(home).resolve()
     assignment_path, assignment, _ = _assignment(home)
     dispatch = _dispatch(home, assignment_path, assignment)
@@ -111,7 +111,7 @@ def verify_and_import_bootstrap_review(
             or verifier_dispatch.get("verifier_job_id") != dispatch["verifier_job_id"]
             or verifier_dispatch.get("completion_sha256") != sha256_file(
                 home / "e1/bootstrap/review-completion.json")):
-        raise ValueError("E1 bootstrap Terra dispatch changed")
+        raise ValueError("E1 bootstrap GLM verifier dispatch changed")
     read_status = status_reader or harness_job_status
     _terminal_status(read_status(dispatch["verifier_job_id"]), dispatch["verifier_job_id"])
     report_sha = sha256_file(Path(dispatch["report_path"]))
@@ -123,7 +123,7 @@ def verify_and_import_bootstrap_review(
             or not isinstance(acceptance, dict) or acceptance.get("accepted") is not True
             or acceptance.get("verifier_job_id") != dispatch["verifier_job_id"]
             or acceptance.get("evidence_sha256") != report_sha):
-        raise ValueError("E1 bootstrap Terra verdict was not accepted by the gateway")
+        raise ValueError("E1 bootstrap GLM verifier verdict was not accepted by the gateway")
     _validate_gateway_status(read_status(dispatch["job_id"]), dispatch["job_id"])
     path = import_bootstrap_review_report(home, status_reader=read_status)
     return {"review": str(path), "review_sha256": sha256_file(path),

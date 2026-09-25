@@ -12,12 +12,18 @@ from mavis.evaluations import (E0_CASES, E0Evaluator, _safe_buried_inspection,
                                _post_json, installed_candidate_fingerprint,
                                native_review_completed)
 from mavis.e0_tasks import prepare_small_repository, small_repository_review_prompt
-from mavis.e2_tasks import terra_review_command
+from mavis.e2_tasks import independent_review_command
 from mavis.runtime import RuntimeConfig
 from mavis.storage import sha256_file, write_json
 
 
 class E0EvaluationTests(unittest.TestCase):
+    def setUp(self) -> None:
+        launcher = patch("mavis.e2_tasks.glm_review_launcher",
+                         return_value=Path("/gateway/bin/glm-codex.sh"))
+        launcher.start()
+        self.addCleanup(launcher.stop)
+
     def test_external_harness_skips_legacy_objective_without_command_binding(self):
         with tempfile.TemporaryDirectory() as directory:
             home = Path(directory)
@@ -25,7 +31,7 @@ class E0EvaluationTests(unittest.TestCase):
             objectives.mkdir()
             gateway = home / "gateway-receipt.json"
             write_json(gateway, {"gateway_status": {
-                "job_id": "worker-valid", "acceptance": {"verifier_job_id": "terra-valid"}}})
+                "job_id": "worker-valid", "acceptance": {"verifier_job_id": "glm-valid"}}})
             valid = objectives / "e0-gateway-bound-valid.json"
             write_json(valid, {
                 "objective_id": "e0-gateway-bound-valid", "state": "accepted",
@@ -49,6 +55,40 @@ class E0EvaluationTests(unittest.TestCase):
             with patch("mavis.evaluations.ObjectiveStore._assert_acceptance") as verify:
                 self.assertEqual(evaluator._external_harness()["status"], "blocked")
             verify.assert_not_called()
+
+    def test_external_harness_skips_objective_accepted_by_a_retired_verifier(self):
+        with tempfile.TemporaryDirectory() as directory:
+            home = Path(directory)
+            objectives = home / "objectives"
+            objectives.mkdir()
+            gateway = home / "gateway-receipt.json"
+            write_json(gateway, {"gateway_status": {
+                "job_id": "worker-glm", "acceptance": {"verifier_job_id": "worker-glm-glm"}}})
+            checks = [{"id": "check", "command": ["python3", "-m", "unittest"]}]
+            valid = objectives / "e0-gateway-bound-glm.json"
+            write_json(valid, {"objective_id": "e0-gateway-bound-glm", "state": "accepted",
+                               "acceptance_checks": checks,
+                               "gateway_verifications": [{"path": str(gateway)}]})
+            retired = objectives / "e0-gateway-bound-terra.json"
+            write_json(retired, {"objective_id": "e0-gateway-bound-terra", "state": "accepted",
+                                 "acceptance_checks": checks,
+                                 "gateway_verifications": [{"path": str(gateway)}]})
+            os.utime(retired, (valid.stat().st_mtime + 10, valid.stat().st_mtime + 10))
+            evaluator = E0Evaluator(home, RuntimeConfig(home=home))
+
+            def assert_acceptance(record):
+                if record["objective_id"] == "e0-gateway-bound-terra":
+                    raise ValueError("gateway acceptance requires a distinct GLM verifier job")
+
+            with patch("mavis.evaluations.ObjectiveStore._assert_acceptance",
+                       side_effect=assert_acceptance):
+                result = evaluator._external_harness()
+            self.assertEqual(result["status"], "pass")
+            self.assertEqual(result["objective_id"], "e0-gateway-bound-glm")
+            valid.unlink()
+            with patch("mavis.evaluations.ObjectiveStore._assert_acceptance",
+                       side_effect=assert_acceptance):
+                self.assertEqual(evaluator._external_harness()["status"], "blocked")
 
     def test_trial_post_sends_bearer_key_only_in_request_header(self):
         response = Mock()
@@ -335,7 +375,7 @@ class E0EvaluationTests(unittest.TestCase):
             self.assertNotEqual(result.returncode, 0)
             self.assertIn("test_discount_reduces_price", result.stderr)
 
-    def test_small_repository_requires_bound_native_terra_acceptance(self):
+    def test_small_repository_requires_bound_native_glm_acceptance(self):
         with tempfile.TemporaryDirectory() as directory:
             home = Path(directory)
             evaluator = E0Evaluator(home, RuntimeConfig(home=home))
@@ -351,31 +391,36 @@ class E0EvaluationTests(unittest.TestCase):
                     {"path": str(repo / "package" / "pricing.py")}]}}) + "\n")
             verdict = "ACCEPT: both tests pass and user notes are intact."
             events = [
-                {"type": "thread.started", "thread_id": "native-terra"},
+                {"type": "thread.started", "thread_id": "native-glm"},
                 {"type": "turn.started"},
                 {"type": "item.completed", "item": {"type": "agent_message", "text": verdict}},
                 {"type": "turn.completed"},
             ]
-            terra_log = task / "terra-review.jsonl"
-            terra_log.write_text("".join(json.dumps(event) + "\n" for event in events))
-            stderr = task / "terra-review.stderr.log"
+            review_log = task / "glm-review.jsonl"
+            review_log.write_text("".join(json.dumps(event) + "\n" for event in events))
+            stderr = task / "glm-review.stderr.log"
             stderr.write_text("")
-            review_text = task / "terra-review.txt"
+            review_text = task / "glm-review.txt"
             review_text.write_text(verdict)
             observed = {
+                "schema_version": "mavis.e0-installed-run/v2",
                 "candidate": {"core_sha256": "a" * 64},
                 "mavis_log_sha256": sha256_file(mavis_log),
-                "terra_log_sha256": sha256_file(terra_log),
-                "terra_stderr_sha256": sha256_file(stderr),
-                "terra_text_sha256": sha256_file(review_text),
-                "review_argv": terra_review_command(
+                "review_log_sha256": sha256_file(review_log),
+                "review_stderr_sha256": sha256_file(stderr),
+                "review_text_sha256": sha256_file(review_text),
+                "review_argv": independent_review_command(
                     repo, review_text, small_repository_review_prompt(manifest_path)),
-                "review_exit": 0, "review_thread_id": "native-terra",
+                "review_exit": 0, "review_thread_id": "native-glm",
             }
             (task / "installed-run.json").write_text(json.dumps(observed))
             with patch("mavis.evaluations.installed_candidate_fingerprint",
                        return_value=observed["candidate"]):
                 self.assertEqual(evaluator._small_repository("small-repository")["status"], "pass")
+                observed["schema_version"] = "mavis.e0-installed-run/v1"
+                (task / "installed-run.json").write_text(json.dumps(observed))
+                self.assertEqual(evaluator._small_repository("small-repository")["status"], "blocked")
+                observed["schema_version"] = "mavis.e0-installed-run/v2"
                 observed["review_argv"][3] = "another-model"
                 (task / "installed-run.json").write_text(json.dumps(observed))
                 with self.assertRaisesRegex(ValueError, "command changed"):
