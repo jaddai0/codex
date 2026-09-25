@@ -6,6 +6,7 @@ from copy import deepcopy
 from datetime import datetime, timezone
 import hashlib
 import json
+import math
 import os
 from pathlib import Path
 from typing import Any, Callable
@@ -63,11 +64,13 @@ class ObjectiveStore:
         home: Path,
         gateway_status_reader: Callable[[str], dict[str, Any]] | None = None,
         shared_home: Path | None = None,
+        advice_hook: Callable[..., dict[str, Any]] | None = None,
     ):
         self.home = Path(home)
         self.shared_home = Path(shared_home) if shared_home is not None else self.home
         self.root = self.home / "objectives"
         self.gateway_status_reader = gateway_status_reader or harness_job_status
+        self.advice_hook = advice_hook
 
     def _path(self, objective_id: str) -> Path:
         return self.root / f"{require_safe_id(objective_id, 'objective id')}.json"
@@ -92,6 +95,8 @@ class ObjectiveStore:
         record["evidence_receipts"] = []
         record["verifications"] = []
         record["gateway_verifications"] = []
+        record["jev_advice_receipts"] = []
+        record["jev_advice_events"] = []
         write_json(path, record)
         return record
 
@@ -191,6 +196,9 @@ class ObjectiveStore:
 
     def save(self, record: dict[str, Any]) -> None:
         with profile_boundary_lock(self.shared_home):
+            current = self.load(str(record["objective_id"]))
+            if current.get("updated_at") != record.get("updated_at"):
+                raise ValueError("objective changed since it was loaded")
             self._save_under_boundary(record)
 
     def transition(self, objective_id: str, state: str, reason: str) -> dict[str, Any]:
@@ -214,13 +222,15 @@ class ObjectiveStore:
         self, objective_id: str, assignment: dict[str, Any]
     ) -> dict[str, Any]:
         _validate_assignment(assignment, objective_id)
-        record = self.load(objective_id)
-        record["assignments"].append(deepcopy(assignment))
-        self.save(record)
+        with profile_boundary_lock(self.shared_home):
+            record = self.load(objective_id)
+            stored = deepcopy(assignment)
+            stored["assigned_at"] = _now()
+            record["assignments"].append(stored)
+            self._save_under_boundary(record)
         return record
 
     def add_receipt(self, objective_id: str, receipt_path: Path) -> dict[str, Any]:
-        record = self.load(objective_id)
         resolved = Path(receipt_path).resolve()
         evidence_root = (self.root.parent / "evidence" / objective_id).resolve()
         if evidence_root not in resolved.parents:
@@ -229,10 +239,12 @@ class ObjectiveStore:
             )
         receipt = read_json(resolved)
         _validate_receipt(receipt, objective_id, resolved)
-        record["evidence_receipts"].append(
-            {"path": str(resolved), "sha256": sha256_file(resolved)}
-        )
-        self.save(record)
+        with profile_boundary_lock(self.shared_home):
+            record = self.load(objective_id)
+            record["evidence_receipts"].append(
+                {"path": str(resolved), "sha256": sha256_file(resolved)}
+            )
+            self._save_under_boundary(record)
         return record
 
     def record_attempt(
@@ -242,39 +254,254 @@ class ObjectiveStore:
         evidence: list[str],
         approach: str,
     ) -> dict[str, Any]:
-        record = self.load(objective_id)
-        attempts = record["attempts"]
-        attempts.append(
-            {
+        intent = None
+        with profile_boundary_lock(self.shared_home):
+            record = self.load(objective_id)
+            prior_state = record["state"]
+            if prior_state in {"accepted", "cancelled"}:
+                raise ValueError("closed objectives cannot record repair attempts")
+            attempts = record["attempts"]
+            attempt_id = uuid4().hex
+            attempts.append({
+                "attempt_id": attempt_id,
                 "failure_fingerprint": failure_fingerprint,
                 "evidence": evidence,
                 "approach": approach,
                 "at": _now(),
+            })
+            newly_escalated = False
+            if len(attempts) >= 2:
+                previous = attempts[-2]
+                if previous["failure_fingerprint"] == failure_fingerprint and not evidence:
+                    newly_escalated = prior_state != "escalated"
+                    record["state"] = "escalated"
+                    record["escalation_reason"] = "same failure repeated without new evidence"
+            if newly_escalated and self.advice_hook is not None:
+                reason = self._advice_ineligibility(record, prior_state)
+                if reason is None:
+                    assignment = record["assignments"][-1]
+                    intent = {
+                        "event_id": uuid4().hex,
+                        "attempt_id": attempt_id,
+                        "attempt_number": len(attempts),
+                        "assignment_id": assignment["assignment_id"],
+                        "starting_revision": assignment["starting_revision"],
+                        "host_receipts_sha256": _sha256_json(record["evidence_receipts"]),
+                        "status": "pending",
+                        "created_at": _now(),
+                    }
+                    record.setdefault("jev_advice_events", []).append(intent)
+                    record["jev_latest_advice"] = {
+                        "event_id": intent["event_id"], "status": "pending",
+                        "deterministic_disposition": "escalated",
+                    }
+                else:
+                    record["jev_latest_advice"] = {
+                        "status": "not_requested", "reason": reason,
+                        "deterministic_disposition": "escalated",
+                    }
+            self._save_under_boundary(record)
+        if intent is not None:
+            return self._record_escalation_advice(record, intent)
+        return record
+
+    def _advice_ineligibility(self, record: dict[str, Any], prior_state: str) -> str | None:
+        if prior_state not in {"running", "needs repair"}:
+            return "no_active_repair"
+        if not record.get("assignments"):
+            return "no_worker_assignment"
+        try:
+            receipts = self._validated_receipts(record)
+            assignment = record["assignments"][-1]
+            checkout = Path(str(assignment["checkout"]["path"])).resolve()
+            required_checks = {str(check["id"]) for check in record["acceptance_checks"]}
+            assigned_at = datetime.fromisoformat(assignment["assigned_at"])
+        except (ValueError, OSError, KeyError, TypeError):
+            return "invalid_host_evidence"
+        current_failure = False
+        for receipt in receipts:
+            try:
+                started_at = datetime.fromisoformat(receipt["started_at"])
+                matches = (receipt["verdict"] == "fail"
+                           and Path(str(receipt["cwd"])).resolve() == checkout
+                           and bool(set(receipt["acceptance_check_ids"]) & required_checks)
+                           and started_at >= assigned_at)
+            except (ValueError, OSError, KeyError, TypeError):
+                return "invalid_host_evidence"
+            current_failure = current_failure or matches
+        if not current_failure:
+            return "no_failed_host_check"
+        return None
+
+    def _record_escalation_advice(self, record: dict[str, Any],
+                                  intent: dict[str, Any]) -> dict[str, Any]:
+        """Finish one durable intent after releasing the objective lock."""
+        objective_id = str(record["objective_id"])
+        attempt_number = intent["attempt_number"]
+        signals = {
+            "retry_count": attempt_number,
+            "unresolved_count": len(record.get("unresolved_decisions") or []),
+            "verifier_accepted": False,
+        }
+        outcome: dict[str, Any] = {"status": "blocked", "reason": "unknown"}
+        try:
+            advice = self.advice_hook(self.shared_home, self.home.parent,
+                                      "escalation", signals, 0.01,
+                                      event_id=intent["event_id"])
+            if (not isinstance(advice, dict)
+                    or advice.get("advisory") is not True
+                    or advice.get("binding") is not False
+                    or advice.get("grants_permission") is not False
+                    or not isinstance(advice.get("success"), bool)
+                    or not isinstance(advice.get("decision"), str)):
+                raise ValueError("Jev advice claimed authority or was malformed")
+            advice_path = Path(advice["receipt"]).resolve(strict=True)
+            if not advice_path.is_relative_to((self.shared_home / "jev").resolve()):
+                raise ValueError("Jev receipt is outside the service home")
+            receipt = read_json(advice_path)
+            gateway_response = receipt.get("gateway_response")
+            if (receipt.get("schema_version") != "mavis.jev-advice/v1"
+                    or receipt.get("event_id") != intent["event_id"]
+                    or receipt.get("purpose") != "escalation"
+                    or receipt.get("signals_sha256") != _jev_digest(signals)
+                    or receipt.get("project_root_sha256") != _jev_digest(str(self.home.parent.resolve()))
+                    or receipt.get("estimated_cost_usd") != 0.01
+                    or receipt.get("advisory") is not True
+                    or receipt.get("binding") is not False
+                    or receipt.get("grants_permission") is not False
+                    or receipt.get("decision") != advice["decision"]
+                    or not isinstance(gateway_response, dict)
+                    or gateway_response.get("success") is not advice["success"]
+                    or (advice["success"] and gateway_response.get("answers") != advice.get("answers"))):
+                raise ValueError("Jev receipt does not bind to the objective event")
+            probability = None
+            if advice["success"]:
+                answer = (advice.get("answers") or {}).get("decision")
+                if not isinstance(answer, dict) or answer.get("type") != "noul":
+                    raise ValueError("Jev escalation answer is malformed")
+                probability = answer.get("noul")
+                if (type(probability) not in (int, float)
+                        or not math.isfinite(probability)
+                        or not 0 <= probability <= 1):
+                    raise ValueError("Jev escalation probability is malformed")
+            outcome = {
+                "status": "answered" if advice["success"] else "refused",
+                "decision": advice["decision"],
+                "advice_receipt": str(advice_path),
+                "advice_receipt_sha256": sha256_file(advice_path),
             }
-        )
-        if len(attempts) >= 2:
-            previous = attempts[-2]
-            if previous["failure_fingerprint"] == failure_fingerprint and not evidence:
-                record["state"] = "escalated"
-                record["escalation_reason"] = (
-                    "same failure repeated without new evidence"
-                )
-        self.save(record)
+            if probability is not None:
+                outcome["consider_escalation_probability"] = float(probability)
+        except (GatewayUnavailable, ValueError, OSError, KeyError, TypeError) as error:
+            outcome = {"status": "blocked", "reason": type(error).__name__}
+        failure_hash = hashlib.sha256(
+            str(record["attempts"][-1]["failure_fingerprint"]).encode()
+        ).hexdigest()
+        event = {
+            "schema_version": "mavis.objective-jev-advice/v1",
+            "event_id": intent["event_id"],
+            "objective_id": objective_id,
+            "attempt_number": attempt_number,
+            "attempt_id": intent["attempt_id"],
+            "failure_fingerprint_sha256": failure_hash,
+            "assignment_id": intent["assignment_id"],
+            "starting_revision": intent["starting_revision"],
+            "host_receipts_sha256": intent["host_receipts_sha256"],
+            "signals_sha256": _jev_digest(signals),
+            "deterministic_disposition": "escalated",
+            "outcome": outcome,
+            "recorded_at": _now(),
+        }
+        path = (self.home / "evidence" / objective_id / "jev"
+                / f"{intent['event_id']}.json")
+        with profile_boundary_lock(self.shared_home):
+            latest = self.load(objective_id)
+            pending = next((item for item in latest.get("jev_advice_events", [])
+                            if item.get("event_id") == intent["event_id"]), None)
+            if pending is None or pending.get("status") != "pending":
+                raise ValueError("Jev advice intent changed before retention")
+            current = (
+                len(latest["attempts"]) == attempt_number
+                and latest["attempts"][-1].get("attempt_id") == intent["attempt_id"]
+                and latest["state"] == "escalated"
+                and bool(latest.get("assignments"))
+                and latest["assignments"][-1].get("assignment_id") == intent["assignment_id"]
+                and latest["assignments"][-1].get("starting_revision") == intent["starting_revision"]
+                and _sha256_json(latest["evidence_receipts"]) == intent["host_receipts_sha256"]
+            )
+            event["applicability"] = "current" if current else "superseded"
+            write_json(path, event)
+            pending["status"] = outcome["status"]
+            pending["event_receipt"] = {"path": str(path.resolve()), "sha256": sha256_file(path)}
+            latest.setdefault("jev_advice_receipts", []).append(
+                {"path": str(path.resolve()), "sha256": sha256_file(path)}
+            )
+            if current:
+                latest["jev_latest_advice"] = {
+                    "event_id": intent["event_id"],
+                    "attempt_number": attempt_number,
+                    "status": outcome["status"],
+                    "consider_escalation_probability": outcome.get(
+                        "consider_escalation_probability"),
+                    "deterministic_disposition": "escalated",
+                }
+            elif latest.get("jev_latest_advice", {}).get("event_id") == intent["event_id"]:
+                latest["jev_latest_advice"] = {
+                    "event_id": intent["event_id"],
+                    "attempt_number": attempt_number,
+                    "status": "superseded",
+                    "deterministic_disposition": "escalated",
+                }
+            self._save_under_boundary(latest)
+        return latest
+
+    def reconcile_pending_advice(self, objective_id: str) -> dict[str, Any]:
+        """Close abandoned intents as unknown; never repeat a possibly paid call."""
+        with profile_boundary_lock(self.shared_home):
+            record = self.load(objective_id)
+            changed = False
+            for intent in record.get("jev_advice_events", []):
+                if intent.get("status") != "pending":
+                    continue
+                created = datetime.fromisoformat(intent["created_at"])
+                if (datetime.now(timezone.utc) - created).total_seconds() < 60:
+                    continue
+                intent["status"] = "unknown"
+                intent["reconciled_at"] = _now()
+                event_path = (self.home / "evidence" / objective_id / "jev"
+                              / f"{intent['event_id']}.json")
+                if event_path.is_file():
+                    event = read_json(event_path)
+                    if (event.get("schema_version") == "mavis.objective-jev-advice/v1"
+                            and event.get("event_id") == intent["event_id"]
+                            and event.get("objective_id") == objective_id
+                            and event.get("attempt_id") == intent["attempt_id"]):
+                        intent["orphaned_event_receipt"] = {
+                            "path": str(event_path.resolve()),
+                            "sha256": sha256_file(event_path),
+                        }
+                if record.get("jev_latest_advice", {}).get("event_id") == intent["event_id"]:
+                    record["jev_latest_advice"]["status"] = "unknown"
+                    record["jev_latest_advice"].pop("consider_escalation_probability", None)
+                changed = True
+            if changed:
+                self._save_under_boundary(record)
         return record
 
     def add_verification(
         self, objective_id: str, verification: dict[str, Any]
     ) -> dict[str, Any]:
-        record = self.load(objective_id)
         _validate_verification(verification, objective_id)
-        worker_owners = {
-            _owner_identity(item.get("owner", {})) for item in record["assignments"]
-        }
-        verifier = _owner_identity(verification.get("verifier", {}))
-        if verifier in worker_owners:
-            raise ValueError("verifier must be independent from implementation owners")
-        record["verifications"].append(deepcopy(verification))
-        self.save(record)
+        with profile_boundary_lock(self.shared_home):
+            record = self.load(objective_id)
+            worker_owners = {
+                _owner_identity(item.get("owner", {})) for item in record["assignments"]
+            }
+            verifier = _owner_identity(verification.get("verifier", {}))
+            if verifier in worker_owners:
+                raise ValueError("verifier must be independent from implementation owners")
+            record["verifications"].append(deepcopy(verification))
+            self._save_under_boundary(record)
         return record
 
     def record_gateway_verification(
@@ -312,11 +539,16 @@ class ObjectiveStore:
             "producer": "mavis-host-gateway/v1",
         }
         write_json(path, payload)
-        record.setdefault("gateway_verifications", []).append(
-            {"path": str(path.resolve()), "sha256": sha256_file(path)}
-        )
-        self.save(record)
-        return record
+        with profile_boundary_lock(self.shared_home):
+            latest = self.load(objective_id)
+            if (latest["evidence_receipts"] != payload["host_receipts"]
+                    or latest["assignments"] != record["assignments"]):
+                raise ValueError("objective changed during gateway verification")
+            latest.setdefault("gateway_verifications", []).append(
+                {"path": str(path.resolve()), "sha256": sha256_file(path)}
+            )
+            self._save_under_boundary(latest)
+        return latest
 
     def _validated_receipts(self, record: dict[str, Any]) -> list[dict[str, Any]]:
         receipts = []
@@ -465,9 +697,16 @@ def _owner_identity(owner: object) -> tuple[str, str, str]:
     return identity
 
 
-def _sha256_json(payload: dict[str, Any]) -> str:
+def _sha256_json(payload: Any) -> str:
     return hashlib.sha256(
         json.dumps(payload, sort_keys=True, separators=(",", ":")).encode("utf-8")
+    ).hexdigest()
+
+
+def _jev_digest(payload: Any) -> str:
+    return hashlib.sha256(
+        json.dumps(payload, sort_keys=True, separators=(",", ":"),
+                   ensure_ascii=False).encode("utf-8")
     ).hexdigest()
 
 

@@ -11,7 +11,7 @@ from typing import Any
 from uuid import uuid4
 
 from .gateway import mavis_jev_decisions
-from .storage import write_json
+from .storage import require_safe_id, write_json
 
 
 PURPOSES = frozenset({
@@ -36,10 +36,12 @@ def _digest(value: Any) -> str:
 
 def advise(service_home: Path, project_root: Path, purpose: str,
            signals: dict[str, Any],
-           estimated_cost_usd: float) -> dict[str, Any]:
+           estimated_cost_usd: float, *, event_id: str | None = None) -> dict[str, Any]:
     """Keep a local receipt; Jev's answer cannot change permissions or completion."""
     if purpose not in PURPOSES:
         raise ValueError("unknown Jev advisory purpose")
+    if event_id is not None:
+        require_safe_id(event_id, "Jev event id")
     if not isinstance(signals, dict) or not signals or len(signals) > 10:
         raise ValueError("Jev signals must be a nonempty small object")
     if set(signals) - SIGNAL_KEYS:
@@ -95,6 +97,8 @@ def advise(service_home: Path, project_root: Path, purpose: str,
         "decision": decision,
         "gateway_response": retained_response,
     }
+    if event_id is not None:
+        record["event_id"] = event_id
     receipt = Path(service_home) / "jev" / f"{uuid4().hex}.json"
     write_json(receipt, record)
     return {"success": response["success"], "decision": decision,

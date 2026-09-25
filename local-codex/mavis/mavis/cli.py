@@ -29,6 +29,7 @@ from .e2_tasks import prepare_heldout, verify_heldout
 from .evaluations import E0_CASES, E0Evaluator
 from .maintenance import MaintenanceQueue
 from .maintenance_runtime import tick as maintenance_tick
+from .jev import advise
 from .objectives import ObjectiveStore
 from .librarian_route import LibrarianAskError, ask as librarian_ask
 from .output_inspection import inspect_output
@@ -113,6 +114,8 @@ def build_parser() -> argparse.ArgumentParser:
     create.add_argument("path", type=Path)
     show = objective_sub.add_parser("show")
     show.add_argument("objective_id")
+    reconcile_advice = objective_sub.add_parser("jev-reconcile")
+    reconcile_advice.add_argument("objective_id")
     bind_session = objective_sub.add_parser("bind-session")
     bind_session.add_argument("objective_id")
     bind_session.add_argument("session_id")
@@ -507,11 +510,13 @@ def main(argv: list[str] | None = None) -> int:
         evidence_home = active_project_home(home, create=args.objective_command == "create")
         if args.objective_command != "create":
             evidence_home = objective_home(home, evidence_home, args.objective_id)
-        store = ObjectiveStore(evidence_home, shared_home=home)
+        store = ObjectiveStore(evidence_home, shared_home=home, advice_hook=advise)
         if args.objective_command == "create":
             print_json(store.create(read_json(args.path)))
         elif args.objective_command == "show":
             print_json(store.load(args.objective_id))
+        elif args.objective_command == "jev-reconcile":
+            print_json(store.reconcile_pending_advice(args.objective_id))
         elif args.objective_command == "assign":
             print_json(store.add_assignment(args.objective_id, read_json(args.path)))
         elif args.objective_command == "bind-session":
