@@ -38,6 +38,7 @@ from .project_evidence import (active_project_home, legacy_home_for_record,
                                migrate_legacy_objective, objective_home, project_root)
 from .retrieval import ProjectIndex
 from .runtime import (
+    DEFAULT_MODEL,
     RuntimeConfig,
     admission,
     ensure_runtime,
@@ -98,9 +99,7 @@ def build_parser() -> argparse.ArgumentParser:
         command = runtime_sub.add_parser(name)
         command.add_argument("--endpoint", default="http://127.0.0.1:8001/v1")
         command.add_argument("--iris-endpoint", default="http://127.0.0.1:8000/v1")
-        command.add_argument(
-            "--model", default="Qwen3.8-Flash-Next-Abliterated-MLX-4bit"
-        )
+        command.add_argument("--model", default=DEFAULT_MODEL)
         command.add_argument("--model-dir", default="/Users/dustinpainter/models/vlms")
         command.add_argument(
             "--omlx-binary", default="/Users/dustinpainter/.venvs/omlx-dev/bin/omlx"
@@ -242,7 +241,7 @@ def build_parser() -> argparse.ArgumentParser:
     e0.add_argument("--case", choices=E0_CASES)
     e0.add_argument("--endpoint", default="http://127.0.0.1:8001/v1")
     e0.add_argument("--iris-endpoint", default="http://127.0.0.1:8000/v1")
-    e0.add_argument("--model", default="Qwen3.8-Flash-Next-Abliterated-MLX-4bit")
+    e0.add_argument("--model", default=DEFAULT_MODEL)
     e0.add_argument("--model-dir", default="/Users/dustinpainter/models/vlms")
     e0.add_argument(
         "--omlx-binary", default="/Users/dustinpainter/.venvs/omlx-dev/bin/omlx"

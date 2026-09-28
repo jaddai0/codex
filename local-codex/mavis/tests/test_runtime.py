@@ -803,6 +803,29 @@ class RuntimeTests(unittest.TestCase):
             self.assertEqual(settings["model"]["model_dirs"], [str(config.model_dir)])
             self.assertEqual(settings["cache"]["ssd_cache_dir"], str(config.base_path / "cache"))
 
+    def test_mimo_startup_preserves_operator_context_and_output_limits(self):
+        with tempfile.TemporaryDirectory() as directory:
+            config = RuntimeConfig(home=Path(directory))
+            path = config.base_path / "model_settings.json"
+            ensure_isolated_settings(config)
+            defaults = runtime.read_json(path)["models"][config.model]
+            self.assertEqual(defaults["max_context_window"], 1_048_576)
+            self.assertEqual(defaults["max_tokens"], 131_072)
+            write_json(path, {"version": 1, "models": {
+                config.model: {"temperature": 0.2,
+                               "max_context_window": 65536,
+                               "max_tokens": 8192},
+                "another-model": {"max_context_window": 65536},
+            }})
+            ensure_isolated_settings(config)
+            settings = runtime.read_json(path)["models"]
+            self.assertEqual(settings[config.model], {
+                "temperature": 0.2,
+                "max_context_window": 65536,
+                "max_tokens": 8192,
+            })
+            self.assertEqual(settings["another-model"], {"max_context_window": 65536})
+
     def test_isolated_runtime_refuses_distributed_deployment_registry(self):
         with tempfile.TemporaryDirectory() as directory:
             config = RuntimeConfig(home=Path(directory))

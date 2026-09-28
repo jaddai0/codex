@@ -4,7 +4,7 @@ This fork keeps Codex's local coding harness and sends model traffic only to a l
 
 The disabled update setting also suppresses `doctor` network probes for GitHub and the installed ChatGPT desktop update feed. `doctor` still tests the active oMLX endpoint.
 
-The launcher reads the live oMLX inventory every time it starts. It selects the loaded default model, writes an isolated runtime config and accurate context metadata, and exposes the model picker without hardcoding a model name. Set `LOCAL_CODEX_MODEL` for a one-session default or use Codex's `--model` option.
+The launcher reads the live oMLX inventory every time it starts and writes an isolated runtime config with the served context limit. MiMo-V2.6-Flash-RL-UNCENSORED-MLX-oQ4 is the default Mavis model. Its isolated oMLX settings default to the model's 1,048,576-token context and 131,072-token maximum output; explicit per-model settings remain in control. Set `LOCAL_CODEX_MODEL` for a one-session alternative or use Codex's `--model` option. The full limits describe the configured capacity, not a completed million-token local inference test.
 
 The normal Codex shell, patch, planning, skills, MCP, and multi-agent surfaces
 remain available. OpenAI's remote app and curated-plugin catalogs are disabled

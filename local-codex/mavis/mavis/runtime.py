@@ -27,7 +27,10 @@ from urllib.request import Request, urlopen
 from .storage import read_json, write_json
 
 
-DEFAULT_MODEL = "Qwen3.8-Flash-Next-Abliterated-MLX-4bit"
+MIMO_MODEL = "MiMo-V2.6-Flash-RL-UNCENSORED-MLX-oQ4"
+DEFAULT_MODEL = MIMO_MODEL
+MIMO_CONTEXT_WINDOW = 1_048_576
+MIMO_MAX_OUTPUT_TOKENS = 131_072
 _HANDOFF_LEASE_FD: ContextVar[int | None] = ContextVar("mavis_handoff_lease_fd", default=None)
 _TRIAL_PROCESSES: dict[int, subprocess.Popen[Any]] = {}
 
@@ -517,6 +520,23 @@ def ensure_isolated_settings(config: RuntimeConfig) -> None:
         raise ValueError("Mavis oMLX cache settings must be an object")
     cache.update({"enabled": True, "ssd_cache_dir": str(config.base_path / "cache")})
     write_json(settings_path, settings)
+    if config.model == MIMO_MODEL:
+        model_settings_path = config.base_path / "model_settings.json"
+        if model_settings_path.is_symlink():
+            raise RuntimeError("Mavis MiMo model settings cannot be a symbolic link")
+        model_settings = (
+            read_json(model_settings_path) if model_settings_path.exists()
+            else {"version": 1, "models": {}}
+        )
+        models = model_settings.get("models")
+        if model_settings.get("version") != 1 or not isinstance(models, dict):
+            raise ValueError("Mavis oMLX per-model settings are invalid")
+        mimo_settings = models.setdefault(MIMO_MODEL, {})
+        if not isinstance(mimo_settings, dict):
+            raise ValueError("Mavis MiMo model settings must be an object")
+        mimo_settings.setdefault("max_context_window", MIMO_CONTEXT_WINDOW)
+        mimo_settings.setdefault("max_tokens", MIMO_MAX_OUTPUT_TOKENS)
+        write_json(model_settings_path, model_settings)
 
 
 def clear_trial_auth_settings(config: RuntimeConfig) -> None:

@@ -17,6 +17,9 @@ from urllib.parse import urlparse
 from urllib.request import Request, urlopen
 
 
+DEFAULT_MODEL = "MiMo-V2.6-Flash-RL-UNCENSORED-MLX-oQ4"
+
+
 ALLOWED_HOSTS = {"127.0.0.1", "localhost", "::1"}
 SUPPORTED_MODEL_TYPES = {"llm", "vlm"}
 MAVIS_ARCHIVE_COMMAND = "python3 -m mavis pre-compact"
@@ -197,6 +200,11 @@ def model_info(
 ) -> dict[str, object]:
     model_id = str(record["id"])
     context_window = int(record.get("model_context_length") or 32768)
+    served_context_window = record.get("max_context_window")
+    if served_context_window is not None:
+        if type(served_context_window) is not int or served_context_window <= 0:
+            raise ValueError(f"oMLX reported an invalid context limit for {model_id}")
+        context_window = min(context_window, served_context_window)
     is_vlm = record.get("model_type") == "vlm" or record.get("engine_type") == "vlm"
     levels = reasoning_levels(record)
     default_effort = record.get("reasoning_effort_default")
@@ -515,11 +523,12 @@ def main() -> int:
     args = parser.parse_args()
 
     accepted = accepted_main_profile(args.mavis_home) if args.mavis_home else None
+    requested_model = args.model or os.environ.get("LOCAL_CODEX_MODEL") or None
     accepted_model = accepted["model_identity"]["model_id"] if accepted else None
-    if args.model and accepted_model and args.model != accepted_model:
+    if requested_model and accepted_model and requested_model != accepted_model:
         raise ValueError("explicit model conflicts with accepted main profile")
     if args.resolve_model:
-        print(accepted_model or args.model or "Qwen3.8-Flash-Next-Abliterated-MLX-4bit")
+        print(accepted_model or requested_model or DEFAULT_MODEL)
         return 0
     if not all((args.home, args.base_url, args.persona_template, args.instructions_template)):
         parser.error("--home, --base-url, --persona-template, and --instructions-template are required")
@@ -541,7 +550,7 @@ def main() -> int:
         custom_system = accepted["prompts"].get("system", "")
         if custom_system:
             base_instructions = base_instructions.rstrip() + "\n\n" + custom_system + "\n"
-    catalog, selected = prepare_catalog(records, accepted_model or args.model, base_instructions)
+    catalog, selected = prepare_catalog(records, accepted_model or requested_model, base_instructions)
     args.home.mkdir(parents=True, exist_ok=True)
     accepted_instructions_path = args.home / "accepted-model-instructions.md" if accepted else None
     if accepted_instructions_path is not None:

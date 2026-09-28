@@ -1,6 +1,7 @@
 import importlib.util
 import io
 import json
+from contextlib import redirect_stdout
 from pathlib import Path
 import tempfile
 import tomllib
@@ -25,6 +26,48 @@ SPEC.loader.exec_module(prepare_runtime)
 
 
 class PrepareRuntimeTests(unittest.TestCase):
+    def test_catalog_respects_live_server_context_cap_for_mimo(self):
+        record = {
+            "id": "MiMo-V2.6-Flash-RL-UNCENSORED-MLX-oQ4",
+            "model_type": "vlm",
+            "loaded": True,
+            "model_context_length": 1048576,
+            "max_context_window": 8192,
+        }
+        catalog, selected = prepare_runtime.prepare_catalog([record], record["id"], "Base")
+        model = catalog["models"][0]
+        self.assertEqual(selected, record["id"])
+        self.assertEqual(model["context_window"], 8192)
+        self.assertEqual(model["max_context_window"], 8192)
+        self.assertEqual(model["auto_compact_token_limit"], int(8192 * 0.85))
+        record["max_context_window"] = 1_048_576
+        catalog, _ = prepare_runtime.prepare_catalog([record], record["id"], "Base")
+        self.assertEqual(catalog["models"][0]["context_window"], 1_048_576)
+
+    def test_resolve_model_uses_mimo_default_and_explicit_environment_selection(self):
+        from mavis.cli import build_parser
+        from mavis.runtime import DEFAULT_MODEL
+
+        argv = ["prepare_runtime.py", "--resolve-model"]
+        with (patch.object(sys, "argv", argv),
+              patch.dict(os.environ, {"LOCAL_CODEX_MODEL": ""})):
+            output = io.StringIO()
+            with redirect_stdout(output):
+                self.assertEqual(prepare_runtime.main(), 0)
+            self.assertEqual(output.getvalue().strip(), DEFAULT_MODEL)
+            self.assertEqual(DEFAULT_MODEL, "MiMo-V2.6-Flash-RL-UNCENSORED-MLX-oQ4")
+            self.assertEqual(build_parser().parse_args(["runtime", "ensure"]).model,
+                             DEFAULT_MODEL)
+            self.assertEqual(build_parser().parse_args(["eval", "e0"]).model,
+                             DEFAULT_MODEL)
+
+        with (patch.object(sys, "argv", argv),
+              patch.dict(os.environ, {"LOCAL_CODEX_MODEL": "alternate-model"})):
+            output = io.StringIO()
+            with redirect_stdout(output):
+                self.assertEqual(prepare_runtime.main(), 0)
+            self.assertEqual(output.getvalue().strip(), "alternate-model")
+
     def test_launcher_git_probe_does_not_inherit_trial_key(self):
         import launch_core
 
