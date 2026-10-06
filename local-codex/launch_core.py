@@ -220,6 +220,10 @@ def managed_launch(args: argparse.Namespace, argv: list[str]) -> int:
     """Hold the host lease through model preparation and the whole core session."""
     if not argv:
         raise ValueError("core binary is required")
+    if (len(argv) == 2 and argv[1] in ("--help", "-h", "--version", "-V")) or (
+        len(argv) == 3 and argv[1] == "exec" and argv[2] in ("--help", "-h")
+    ):
+        return _launch_unlocked(None, argv)
     bind_project_root(argv)
     needed = (
         "share_dir", "home", "mavis_home", "base_url", "iris_endpoint",
